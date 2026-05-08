@@ -1,0 +1,7 @@
+target_mhz,result,notes
+25,PASS,baseline (no PLL)
+100,PASS,
+125,PASS,last clean pass — recommended Fmax
+131,MARGINAL,fail rate slightly below 50% — actual silicon timing boundary
+137,FAIL,
+150,FAIL,

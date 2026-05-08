@@ -1,0 +1,31 @@
+# =============================================================================
+# pipe.lpf — Production PIPE constraints for Colorlight 5A-75B v8.0 (ECP5-25F)
+# =============================================================================
+#
+# Hard rules:
+#   - The 25 MHz crystal (P6) is NOT mapped. The pin is left floating.
+#     The crystal is physically on the PCB but no wire reaches the design.
+#   - Exactly ONE bidirectional IO pin (pipe_pad).
+#   - LED is permitted only as a liveness indicator, driven from a divider
+#     off enclave_clk — NOT a separate clock domain.
+#
+# Reference for board pinout:
+#   https://github.com/q3k/chubby75/blob/master/5a-75b/hardware_V8.0.md
+#
+# Specific PIPE wire pin TBD. Candidate pins to consider during Phase D:
+#   - any LVCMOS33 IO with PULLMODE=NONE configurability
+#   - one free pin from the J4 HUB75 connector for easy probing
+#
+# =============================================================================
+
+# PIPE wire — single bidirectional IO (pin TBD in Phase D)
+# LOCATE COMP "pipe_pad" SITE "<TBD>";
+# IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+
+# Liveness LED (optional — drives off enclave_clk divider)
+# LOCATE COMP "led" SITE "T6";
+# IOBUF PORT "led" IO_TYPE=LVCMOS33;
+
+# DELIBERATELY OMITTED:
+#   - "clk" / SITE "P6"  → no external clock input in PIPE
+#   - "btn" / SITE "R7"  → no reset input; POR is internal CFGPOR + counter

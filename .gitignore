@@ -1,0 +1,34 @@
+# Build artifacts
+build/
+build_*/
+*.json
+*.config
+*.bit
+*.svf
+*.log
+
+# Yosys / nextpnr / ecppack scratch
+*.history
+*.ys
+
+# Simulation
+*.vcd
+*.vvp
+*.fst
+sim/work/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Phase-B measurement output is committed (it's data, not artifact)
+!phase_b_results.csv

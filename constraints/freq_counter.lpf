@@ -1,0 +1,47 @@
+# top_extclk.v constraints — Colorlight 5A-75B v8.0
+# Pin map matches the spirix project (NTSC on C4/D4, OLED on E4/D3 if added).
+# Adds ext_clk (E16) and osc_drive (F15) for the RC-oscillator clock path.
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 25 MHz;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "btn" SITE "R7";
+IOBUF PORT "btn" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "ntsc_sync" SITE "C4";
+IOBUF PORT "ntsc_sync" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "ntsc_vid" SITE "D4";
+IOBUF PORT "ntsc_vid" IO_TYPE=LVCMOS33;
+
+# RC oscillator I/O — pot wired between these two pins.
+# Polarity swapped: input on F15, drive on E16 (cap moves to high-Z side).
+# External 33 Ω at the source pin handles reflections, so back to FAST/full drive.
+LOCATE COMP "ext_clk" SITE "F15";
+IOBUF PORT "ext_clk" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+
+LOCATE COMP "osc_drive" SITE "E16";
+IOBUF PORT "osc_drive" IO_TYPE=LVCMOS33 DRIVE=4 SLEWRATE=SLOW;
+
+# OLED I2C (current physical wiring on the spirix board)
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+# Dozenal keypad — same matrix as the calculator. ter (p44+p62) = up, teror (p44+p49) = down.
+LOCATE COMP "p27" SITE "H14"; IOBUF PORT "p27" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p28" SITE "H15"; IOBUF PORT "p28" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p44" SITE "N14"; IOBUF PORT "p44" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p49" SITE "P12"; IOBUF PORT "p49" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p50" SITE "P13"; IOBUF PORT "p50" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p51" SITE "P14"; IOBUF PORT "p51" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p56" SITE "R13"; IOBUF PORT "p56" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p57" SITE "R14"; IOBUF PORT "p57" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p62" SITE "T13"; IOBUF PORT "p62" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "p63" SITE "T14"; IOBUF PORT "p63" IO_TYPE=LVCMOS33 PULLMODE=UP;
