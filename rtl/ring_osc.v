@@ -2,57 +2,63 @@
 // ring_osc.v — Ungoverned ring oscillator (the only clock source in PIPE)
 // =============================================================================
 //
-// Single-inverter topology: stage 0 is a NOT (LUT4 INIT=G#5555 → Z=~A);
-// stages 1..N-1 are BUFs (LUT4 INIT=G#AAAA → Z=A). One inversion per loop,
-// so any N ≥ 1 oscillates regardless of parity. Period scales linearly with
-// N — each LUT contributes ~A#340 ps of fabric delay on ECP5.
+// Single-inverter ring oscillator with on-chip DCCA buffering.
 //
-// (* keep *) on every LUT4 prevents yosys from optimizing the BUFs away
-// (Z = A reduces to a wire) or collapsing the loop to a constant.
-// (* noglobal *) on ring_q wires keeps the oscillator loop direct-routed
-// through the LUT fabric (no DCCA buffer inserted, which would slow the
-// loop by 3-5 ns per insertion).
+// Loop topology: stage 0 is a NOT (LUT4 INIT=G#5555 → Z=~A); stages 1..N-1
+// are BUFs (LUT4 INIT=G#AAAA → Z=A). One inversion per loop, so any STAGES ≥ 1
+// oscillates. Period scales linearly with STAGES — each LUT contributes
+// ~A#340 ps of fabric delay on ECP5 (measured Phase B).
 //
-// CRITICAL: clk_raw is direct-routed through fabric. It must NOT be used
-// to clock more than a few flip-flops. For distributing the clock to the
-// rest of the enclave (blake3, FSM, accumulators, ~thousands of FFs), an
-// explicit DCCA buffer must be instantiated downstream — see top.v's
-// enclave_clk distribution. Without that buffer, fabric routing skew across
-// the chip causes setup/hold violations even at frequencies far below
-// silicon Fmax (lesson learned during Phase D bringup on the spirix harness).
+// ATTRIBUTES (DO NOT REMOVE):
+//   (* keep *) on each LUT4 — prevents yosys from optimizing the buffers away
+//                              (Z=A reduces to a wire) or collapsing the loop
+//                              to a constant.
+//   (* noglobal *) on ring_q — keeps the oscillator loop direct-routed in the
+//                              fabric (no DCCA inserted into the loop, which
+//                              would slow it by 3-5 ns per insertion).
 //
-// Stage count is chosen during Phase D from Phase B (ring frequency vs N
-// curve) and Phase C (blake3 silicon Fmax) measurements. Current data:
-//   Phase B: 32 stages = 46.22 MHz on ECP5-25F speed-6 (Colorlight 5A-75B v8)
-//   Phase C: blake3 stable Fmax = 125 MHz, marginal = 131 MHz
-// Combined: 12 stages (~123 MHz) is the empirical max before blake3 fails;
-// for production we want comfortable margin (e.g., 5 stages + /N divider —
-// see ring sizing decision in PIPE.md / phase_d_results.csv).
+// DISTRIBUTION: clk_out is taken from the loop and routed through an explicit
+// DCCA primitive onto the global clock network. Without this, fabric routing
+// skew across the chip causes setup/hold violations even at ring frequencies
+// far below silicon Fmax (lesson from Phase D bringup — see commit history).
 //
-// Hard rule: this module is the ONLY clock-producing module in pipe/rtl/.
+// SIMULATION: this module instantiates ECP5-specific primitives (LUT4, DCCA)
+// that iverilog cannot model. Testbenches must NOT include this module —
+// downstream modules' TBs supply a behavioral clock generator instead. The
+// ring_osc.v itself is validated only on real silicon (Phase B/D measurements).
+//
+// PHASE D PARAMETERS (per design notes section 3):
+//   STAGES = 5    raw ring frequency ≈ 290 MHz on ECP5-25F speed-6
+//                 (placement-dependent ±10 MHz observed across seeds)
+//   The ring output is divided externally (in top.v) — typically /8 lands
+//   enclave_clk near 30-40 MHz, comfortably below blake3's 125 MHz Fmax.
+//
+// PATENT INVARIANT: this is the ONLY clock-producing module in pipe/rtl/.
 // netlist_assertions.py::test_no_clock_primitives enforces zero EHXPLLL,
-// EHXPLLL_CORE, OSCG, PLLREFCS instances in the synthesized netlist.
+// EHXPLLL_CORE, OSCG, PLLREFCS instances in the synthesized netlist. DCCA
+// is permitted (it's a buffer, not a clock source).
 //
 // =============================================================================
 
 `timescale 1ns / 1ps
 
 module ring_osc #(
-    parameter integer STAGES = 5   // chosen in Phase D — see header above
+    parameter integer STAGES = 5   // chosen Phase D — see header
 ) (
-    output wire clk_raw            // raw ring oscillator output (DIRECT-ROUTED;
-                                   // must be DCCA-buffered downstream before
-                                   // driving multi-FF loads — see top.v)
+    output wire clk_out            // DCCA-buffered, on global clock network
 );
 
+    // Internal loop wires — direct-routed (no DCCA inside the loop).
     (* noglobal *) wire [STAGES-1:0] ring_q;
 
+    // Stage 0 — the inverter. LUT4 INIT=h5555 implements Z = ~A.
     (* keep *) LUT4 #(.INIT(16'h5555)) ring_inv (
         .A(ring_q[STAGES-1]),
         .B(1'b0), .C(1'b0), .D(1'b0),
         .Z(ring_q[0])
     );
 
+    // Stages 1..STAGES-1 — buffers. LUT4 INIT=hAAAA implements Z = A.
     genvar ri;
     generate
         for (ri = 1; ri < STAGES; ri = ri + 1) begin : ring_buf_stage
@@ -64,6 +70,12 @@ module ring_osc #(
         end
     endgenerate
 
-    assign clk_raw = ring_q[0];
+    // Distribution buffer onto global clock network. Without this, downstream
+    // FFs see uncontrolled skew and the design fails far below Fmax.
+    DCCA dcca_clk_out (
+        .CLKI(ring_q[0]),
+        .CE  (1'b1),
+        .CLKO(clk_out)
+    );
 
 endmodule

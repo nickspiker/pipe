@@ -1,0 +1,37 @@
+# Colorlight 5A-75B v8.0 constraints for the BLAKE3 dual-CE bench.
+# Reference: https://github.com/q3k/chubby75/blob/master/5a-75b/hardware_V8.0.md
+#
+# This is a measurement bitstream — uses the 25 MHz crystal as a measurement
+# reference for the freq counter. NOT the production PIPE bitstream.
+
+# 25 MHz reference crystal (display + freq counter window only — does NOT
+# drive sys_clk in RING mode; in RING mode sys_clk = internal ring oscillator).
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 25 MHz;
+
+# On-board LED (T6, active-low) — geiger random toggle = "loop is alive"
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
+
+# External keypad LED (T2, J4 pin 6) — solid ON when (gold_reg == test_reg) = pass
+LOCATE COMP "ext_led" SITE "T2";
+IOBUF PORT "ext_led" IO_TYPE=LVCMOS33;
+
+# NTSC composite output pins (held low when -DNO_NTSC; tied off in code)
+LOCATE COMP "ntsc_sync" SITE "C4";
+IOBUF PORT "ntsc_sync" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "ntsc_vid" SITE "D4";
+IOBUF PORT "ntsc_vid" IO_TYPE=LVCMOS33;
+
+# OLED I2C
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+# Reset button (active-low, internal pull-up)
+LOCATE COMP "btn" SITE "R7";
+IOBUF PORT "btn" IO_TYPE=LVCMOS33 PULLMODE=UP;
