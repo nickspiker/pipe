@@ -20,7 +20,7 @@
 //!
 //! # Why this works after BLAKE3 frosting
 //!
-//! BLAKE3 keyed mode provides cryptographic uniformity (avalanche, no statistical artifacts in the final MAC). The chaos amp doesn't need a beautiful output distribution; it just needs the path-and-loss bounds to hold. BLAKE3 cleans up after.
+//! BLAKE3 keyed mode provides cryptographic uniformity (avalanche, no statistical artifacts in the final ragu). The chaos amp doesn't need a beautiful output distribution; it just needs the path-and-loss bounds to hold. BLAKE3 cleans up after.
 //!
 //! # Round constants derivation
 //!

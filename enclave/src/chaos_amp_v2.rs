@@ -8,7 +8,7 @@
 //!
 //! Input absorption (64 bytes → 16 × 24 bits): each bucket consumes 4 input bytes; the top byte is XOR-folded into the bottom byte before truncation to 24 bits, so all 512 input bits affect the initial state.
 //!
-//! Output extraction: each bucket's low 24 bits → 3 bytes, total 48 bytes, fed to `BLAKE3_keyed(key, state_bytes)` for the MAC. BLAKE3 accepts arbitrary-length input so the 48-byte handoff is fine.
+//! Output extraction: each bucket's low 24 bits → 3 bytes, total 48 bytes, fed to `BLAKE3_keyed(key, state_bytes || input)` for the ragu. BLAKE3 accepts arbitrary-length input so the 48 + 64 = 112 byte handoff is fine.
 //!
 //! # Round structure (2 phases per round)
 //!
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(ROUND_CONSTS, expected);
     }
 
-    /// Bit-flip-absorption smoke test. Some absorption is inherent in v2's data-dependent op-selection design: different op_idx values for two inputs (differing by 1 bit in op-select bits) can produce the same output for specific (val, secondary) pairs, and the lossy ops (POPCNT, PARITY, SQUEEZE, etc.) raise this rate further. The MAC pipeline `BLAKE3_keyed(key, chaos_amp(input))` provides collision-resistance via BLAKE3's well-validated cryptographic uniformity, so chaos_amp's job is path-explosion + bit-destruction, not bijection.
+    /// Bit-flip-absorption smoke test. Some absorption is inherent in v2's data-dependent op-selection design: different op_idx values for two inputs (differing by 1 bit in op-select bits) can produce the same output for specific (val, secondary) pairs, and the lossy ops (POPCNT, PARITY, SQUEEZE, etc.) raise this rate further. The ragu pipeline `BLAKE3_keyed(key, chaos_amp(input) || input)` provides collision-resistance via BLAKE3's well-validated cryptographic uniformity AND defense-in-depth via the input append, so chaos_amp's job is path-explosion + bit-destruction, not bijection.
     ///
     /// v0 had ~20% absorption (broken — concentrated by structural design flaw); v2 measures around 2%. Threshold set at 3% with sampling margin.
     #[test]

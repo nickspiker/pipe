@@ -44,7 +44,7 @@ DERIVE_KEY_CONTEXT  = G#20
 DERIVE_KEY_MATERIAL = G#40
 ```
 
-PIPE uses **keyed hash mode exclusively**. The 256-bit chaining value `i_chain` is the key (loaded from `key_register.v`), and `i_dflags` always has `KEYED_HASH` set during MAC computation.
+PIPE uses **keyed hash mode exclusively**. The 256-bit chaining value `i_chain` is the key (loaded from `key_register.v`), and `i_dflags` always has `KEYED_HASH` set during ragu computation.
 
 ## Endian convention
 
@@ -54,7 +54,7 @@ Message words and chaining-value words are **little-endian per BLAKE3 spec**. Wo
 
 PIPE may, in the future:
 
-- Trim `o_hash` from 512 bits down to 256 bits (low half only — that's the actual MAC).
+- Trim `o_hash` from 512 bits down to 256 bits (low half only — that's the actual ragu).
 - Add a keyed-mode wrapper that hard-wires `i_dflags[4]` and exposes a smaller port surface.
 - Pipeline more aggressively if Phase C silicon Fmax is below the chosen `enclave_clk`.
 

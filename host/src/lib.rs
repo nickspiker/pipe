@@ -1,6 +1,6 @@
 //! PIPE host-side library.
 //!
-//! Mirror-XOR codec (matches `rtl/codec.v` bit-for-bit) plus future home for FT232H bit-bang driver and MAC verification helpers.
+//! Mirror-XOR codec (matches `rtl/codec.v` bit-for-bit) plus future home for FT232H bit-bang driver and ragu verification helpers.
 //!
 //! See `../../PROTOCOL.md` for the line-code spec. The codec here implements the same encode/decode rules as the Verilog module; both sides build against the same spec, so round-trip traffic between this code and the FPGA codec must agree by construction.
 

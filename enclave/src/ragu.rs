@@ -1,31 +1,26 @@
-//! PIPE MAC pipeline.
+//! PIPE ragu pipeline — the silicon's keyed authentication primitive.
 //!
 //! PIPE silicon is a *primitive*, not a protocol. It computes:
 //!
 //! ```text
-//! mac = BLAKE3_keyed(key, chaos_amp(input) || input)
+//! ragu = BLAKE3_keyed(key, chaos_amp(input) || input)
 //! ```
 //!
 //! where `input` is a 64-byte block supplied by the caller. The semantics of the input — what it represents, how it's layered, what domain it belongs to — is the kernel's responsibility.
+//!
+//! "Ragu" rather than "MAC" because the construction is more than a textbook Message Authentication Code: it's a chaos-amplified, defense-in-depth, silicon-bound oracle output that happens to satisfy the MAC properties. Naming-by-metaphor (chaos amp = the slow-cooked sauce; ragu = the finished dish) keeps the construction's identity clear and parallels `ihi::spaghettify`.
 //!
 //! This matches BLAKE3's own design: `keyed_hash(key, msg)` doesn't take domain-tag arguments. The caller prefixes context. PIPE follows the same convention. Domain separation is *policy*, policy belongs in software (mutable), not silicon (immutable).
 //!
 //! # Defense in depth
 //!
-//! The MAC hashes `chaos_amp(input) || input` (chaos output **concatenated with the original input**), not just the chaos output. This is the spaghettify pattern: if chaos_amp has a structural weakness — e.g., the v2 design exhibits ~2% single-bit-flip absorption from data-dependent op selection — the original input is still mixed into the BLAKE3 call directly, and BLAKE3's collision-resistance applies to the full `(chaos_output, input)` tuple. Even if `chaos_amp(a) == chaos_amp(b)`, as long as `a != b`, the MACs differ.
+//! The ragu hashes `chaos_amp(input) || input` (chaos output **concatenated with the original input**), not just the chaos output. This is the spaghettify pattern: if chaos_amp has a structural weakness — e.g., the v2 design exhibits ~2% single-bit-flip absorption from data-dependent op selection — the original input is still mixed into the BLAKE3 call directly, and BLAKE3's collision-resistance applies to the full `(chaos_output, input)` tuple. Even if `chaos_amp(a) == chaos_amp(b)`, as long as `a != b`, the ragus differ.
 //!
-//! Two stacked security properties: chaos_amp's path-explosion + bit-destruction (structural, audit-by-counting), and BLAKE3's cryptographic uniformity (empirical, well-validated). Both must fall to break the MAC.
+//! Two stacked security properties: chaos_amp's path-explosion + bit-destruction (structural, audit-by-counting), and BLAKE3's cryptographic uniformity (empirical, well-validated). Both must fall to forge a ragu.
 //!
 //! # Caller responsibility
 //!
-//! The caller MUST ensure that `input` for distinct purposes never collides. Typical layout for an oracle attestation request:
-//!
-//! ```text
-//! input[0..32]   = domain tag chosen by kernel (e.g., per-use-case ID, per-capability ID, whatever distinguishes this request)
-//! input[32..64]  = challenge bytes
-//! ```
-//!
-//! Other use cases (signatures, derive-key, attestation chains) get their own tag conventions. PIPE silicon doesn't care — it just hashes.
+//! The caller hands the silicon 64 bytes of challenge. The silicon doesn't interpret them — silicon-identity is implicit in the key (eFuse-derived, possibly mixed with boot_nonce). If the kernel wants per-purpose domain separation it can prepend a tag itself; absent that, the input is whatever the kernel wants attested.
 
 use crate::chaos_amp_v2::{chaos_amp_v2, state_to_bytes_v2};
 
@@ -34,7 +29,7 @@ use crate::chaos_amp_v2::{chaos_amp_v2, state_to_bytes_v2};
 /// `key` is the 256-bit secret in the silicon's key register (write-once). `input` is a 64-byte caller-prepared block (kernel layers semantics here). Returns 256 bits.
 ///
 /// Computes `BLAKE3_keyed(key, chaos_amp_v2(input) || input)` — the chaos output (48 bytes) and the original input (64 bytes) are concatenated and fed to BLAKE3 keyed-hash, totalling 112 bytes of message.
-pub fn pipe_mac(key: &[u8; 32], input: &[u8; 64]) -> [u8; 32] {
+pub fn ragu(key: &[u8; 32], input: &[u8; 64]) -> [u8; 32] {
     let chaos_state = chaos_amp_v2(input);
     let chaos_bytes = state_to_bytes_v2(&chaos_state);
 
@@ -49,33 +44,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mac_deterministic() {
+    fn ragu_deterministic() {
         let key = [0xAA; 32];
         let input = [0xBB; 64];
-        assert_eq!(pipe_mac(&key, &input), pipe_mac(&key, &input));
+        assert_eq!(ragu(&key, &input), ragu(&key, &input));
     }
 
     #[test]
-    fn mac_changes_with_key() {
+    fn ragu_changes_with_key() {
         let input = [0u8; 64];
-        let m1 = pipe_mac(&[0; 32], &input);
-        let m2 = pipe_mac(&[1; 32], &input);
-        assert_ne!(m1, m2);
+        let r1 = ragu(&[0; 32], &input);
+        let r2 = ragu(&[1; 32], &input);
+        assert_ne!(r1, r2);
     }
 
     #[test]
-    fn mac_changes_with_input() {
+    fn ragu_changes_with_input() {
         let key = [0u8; 32];
         let mut a = [0u8; 64];
         let mut b = [0u8; 64];
         b[0] = 1;
-        assert_ne!(pipe_mac(&key, &a), pipe_mac(&key, &b));
+        assert_ne!(ragu(&key, &a), ragu(&key, &b));
         a[0] = 1; // suppress unused_mut warning
     }
 
-    /// Avalanche on the full MAC: 1-bit input flip → ~50% output bit flips. With the input-append defense-in-depth pattern, even if chaos_amp_v2 absorbs a bit flip, BLAKE3 still sees the input difference directly, so MAC avalanche reflects BLAKE3's well-validated 50% target. Loose tolerance: 45-55%.
+    /// Avalanche on the full ragu: 1-bit input flip → ~50% output bit flips. With the input-append defense-in-depth pattern, even if chaos_amp_v2 absorbs a bit flip, BLAKE3 still sees the input difference directly, so ragu avalanche reflects BLAKE3's well-validated 50% target. Loose tolerance: 45-55%.
     #[test]
-    fn mac_avalanche() {
+    fn ragu_avalanche() {
         const TRIALS: usize = 200;
         let key = [0x42; 32];
 
@@ -92,12 +87,12 @@ mod tests {
             let bit_pos = trial % 512;
             input_flipped[bit_pos / 8] ^= 1 << (bit_pos % 8);
 
-            let m1 = pipe_mac(&key, &input);
-            let m2 = pipe_mac(&key, &input_flipped);
+            let r1 = ragu(&key, &input);
+            let r2 = ragu(&key, &input_flipped);
 
-            let diff: u32 = m1
+            let diff: u32 = r1
                 .iter()
-                .zip(m2.iter())
+                .zip(r2.iter())
                 .map(|(a, b)| (a ^ b).count_ones())
                 .sum();
             total_diff += diff as u64;
@@ -106,23 +101,23 @@ mod tests {
 
         let avalanche_pct = 100.0 * total_diff as f64 / total_bits as f64;
         eprintln!(
-            "MAC avalanche: {} / {} bits flipped ({:.2}%)",
+            "ragu avalanche: {} / {} bits flipped ({:.2}%)",
             total_diff, total_bits, avalanche_pct
         );
         assert!(
             avalanche_pct > 45.0 && avalanche_pct < 55.0,
-            "MAC avalanche outside 45-55%: {:.2}%",
+            "ragu avalanche outside 45-55%: {:.2}%",
             avalanche_pct
         );
     }
 
-    /// Defense-in-depth check: even if chaos_amp_v2 absorbs a bit flip (≤3% of cases per the absorption test), the MAC must still differ because BLAKE3 sees the input directly.
+    /// Defense-in-depth check: even if chaos_amp_v2 absorbs a bit flip (≤3% of cases per the absorption test), the ragu must still differ because BLAKE3 sees the input directly.
     #[test]
-    fn mac_avalanche_survives_chaos_absorption() {
+    fn ragu_avalanche_survives_chaos_absorption() {
         const TRIALS: usize = 1000;
         let key = [0x42; 32];
 
-        let mut mac_collisions = 0;
+        let mut ragu_collisions = 0;
 
         for trial in 0..TRIALS {
             let h = blake3::hash(&trial.to_le_bytes());
@@ -134,15 +129,15 @@ mod tests {
             let bit_pos = trial % 512;
             input_flipped[bit_pos / 8] ^= 1 << (bit_pos % 8);
 
-            if pipe_mac(&key, &input) == pipe_mac(&key, &input_flipped) {
-                mac_collisions += 1;
+            if ragu(&key, &input) == ragu(&key, &input_flipped) {
+                ragu_collisions += 1;
             }
         }
 
-        eprintln!("MAC collisions on 1-bit flips: {} / {}", mac_collisions, TRIALS);
+        eprintln!("ragu collisions on 1-bit flips: {} / {}", ragu_collisions, TRIALS);
         assert_eq!(
-            mac_collisions, 0,
-            "MAC must produce different output for any 1-bit input flip — defense-in-depth pattern broken"
+            ragu_collisions, 0,
+            "ragu must produce different output for any 1-bit input flip — defense-in-depth pattern broken"
         );
     }
 }

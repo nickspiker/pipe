@@ -178,8 +178,8 @@ Mirror-XOR is a stream code; it does not impose framing. For attestation, the co
 
 - **Idle:** both data streams = 0.
 - **Host attestation request:** stream `1` (start bit) || 256 challenge bits || `0…`.
-- **Enclave response (when host's start bit is detected):** capture next 256 bits as challenge, compute `mac = pipe_mac(key, kernel_layered_input(challenge))`, stream `1` (start bit) || 256 MAC bits || `0…`.
-- **Host (when enclave's start bit is detected):** capture next 256 bits as MAC, verify.
+- **Enclave response (when host's start bit is detected):** capture next 256 bits as challenge, compute `r = ragu(key, kernel_layered_input(challenge))`, stream `1` (start bit) || 256 ragu bits || `0…`.
+- **Host (when enclave's start bit is detected):** capture next 256 bits as ragu, verify.
 
 Total transaction = 257 bits each direction = 514 slots. At a 1 MHz slot rate, ~514 µs. Both directions can stream concurrently — host is allowed to begin its 257-bit request while the enclave is still finishing a previous response, and vice versa.
 
@@ -282,5 +282,5 @@ Total RTL footprint for the wire layer: < 50 LUT4. The protocol's complexity liv
 
 - **No power-saving deep-idle.** Both sides drive constantly. Power cost: negligible at 1 MHz on a 3.3 V signal through a 430 Ω series resistor.
 - **No flow control.** Both sides assume the other is keeping up. For attestation this is fine — transactions are bounded length, both sides know the schedule.
-- **No error correction.** Single-bit flips silently corrupt one data bit. The MAC layer detects corruption end-to-end (a corrupted MAC won't verify against the expected MAC), so the attestation protocol is naturally fail-safe — corrupted = retry.
+- **No error correction.** Single-bit flips silently corrupt one data bit. The ragu layer detects corruption end-to-end (a corrupted ragu won't verify against the expected ragu), so the attestation protocol is naturally fail-safe — corrupted = retry.
 - **No crypto in line code.** Mirror-XOR is purely a balanced framing primitive. The attestation primitive (chaos_amp + BLAKE3 keyed) is the security layer; the line code just gets bits across cleanly.

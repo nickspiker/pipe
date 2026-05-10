@@ -3,7 +3,7 @@ name = "pipe-enclave"
 version = "0.0.0"
 edition = "2021"
 authors = ["Nick Spiker <fractaldecoder@proton.me>"]
-description = "PIPE enclave-side reference: chaos amp + keyed-BLAKE3 MAC. Bit-exact spec for the silicon."
+description = "PIPE enclave-side reference: chaos amp + keyed-BLAKE3 ragu. Bit-exact spec for the silicon."
 license = "TBD"
 publish = false
 

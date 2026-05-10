@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "PIPE host-side: mirror-XOR codec, FT232H bit-bang, MAC verifier."
+description = "PIPE host-side: mirror-XOR codec, FT232H bit-bang, ragu verifier."
 
 [lib]
 name = "pipe_host"

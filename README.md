@@ -1,10 +1,10 @@
 # PIPE — Physically Isolated Processing Enclave
 
-Single-wire authenticated channel between an FPGA enclave and a host. Idle is a continuous heartbeat; either side initiates with one unexpected bit; data is raw keyed-BLAKE3 MAC output (random by construction → no encoding, no framing); done returns to heartbeat.
+Single-wire authenticated channel between an FPGA enclave and a host. Idle is a continuous heartbeat; either side initiates with one unexpected bit; data is raw ragu output (chaos-amplified keyed-BLAKE3, random by construction → no encoding, no framing); done returns to heartbeat.
 
 The enclave holds a write-once key, runs on a ring oscillator (no external clock, no PLL, no governed timebase), and exposes exactly one bidirectional IO pin to the outside world.
 
-This is the FPGA prototype of the same write-once-key anchor that Glyph silicon will hold in a custom CSR. ferros's `ferros_vault::anchor` consumes the keyed-MAC output in both cases.
+This is the FPGA prototype of the same write-once-key anchor that Glyph silicon will hold in a custom CSR. ferros's `ferros_vault::anchor` consumes the ragu output in both cases.
 
 For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 
@@ -79,7 +79,7 @@ scripts/
   build_freq_counter.sh     measurement build (Phase B)
 
 sim/                        testbenches (Icarus / Verilator)
-host/                       PC-side challenge/MAC verifier
+host/                       PC-side challenge / ragu verifier
 data/                       on-chip ROM data (font, etc.)
 patent/                     claim drafts + synthesis evidence
 ```
