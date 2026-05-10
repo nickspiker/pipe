@@ -1,4 +1,9 @@
-//! PIPE host-side reference implementation.
+//! PIPE enclave-side reference implementation.
+//!
+//! This crate is the bit-exact spec for what the silicon computes. The
+//! Verilog implementation in `rtl/chaos_amp.v` must match this Rust code
+//! on every input; `gen-test-vectors` emits hex vectors for the Verilog
+//! testbench to validate against.
 //!
 //! PIPE silicon is a *primitive*, not a protocol:
 //!

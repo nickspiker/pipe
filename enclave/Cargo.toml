@@ -1,9 +1,9 @@
 [package]
-name = "pipe"
+name = "pipe-enclave"
 version = "0.0.0"
 edition = "2021"
 authors = ["Nick Spiker <fractaldecoder@proton.me>"]
-description = "PIPE host-side: chaos amp + keyed-BLAKE3 MAC, USB-GPIO bit-bang for the wire"
+description = "PIPE enclave-side reference: chaos amp + keyed-BLAKE3 MAC. Bit-exact spec for the silicon."
 license = "TBD"
 publish = false
 
