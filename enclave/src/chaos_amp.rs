@@ -54,8 +54,7 @@ const SBOX: [u8; 256] = [
 
 /// Round constants — first 32 bytes from `blake3("PIPE chaos amp v1 - Dragonfly")` give the first 8 u32; remaining 4 from `blake3("PIPE chaos amp v1 - Dragonfly - more")`. Verified bit-exact by `round_consts_match_blake3`. Distinct, identifying values that name PIPE's chaos amp specifically — anyone implementing a different chaos amp would derive different constants from a different label.
 const ROUND_CONSTS: [u32; ROUNDS] = [
-    0xb49cfd47, 0x1ad8cacb, 0x7cee4209, 0x45c2c3ba,
-    0xda61bf21, 0x1ae39132, 0x0f7a9015, 0xbb017f89,
+    0xb49cfd47, 0x1ad8cacb, 0x7cee4209, 0x45c2c3ba, 0xda61bf21, 0x1ae39132, 0x0f7a9015, 0xbb017f89,
     0x457b8fd0, 0xd9abdd9e, 0xeaf22790, 0x17b72570,
 ];
 
@@ -81,10 +80,7 @@ fn mix(state: &mut ChaosState) {
         let near = snap[(i + 1) & (N_BUCKETS - 1)];
         let far = snap[(i + 11) & (N_BUCKETS - 1)];
         let rot = near & 31;
-        state[i] = snap[i]
-            .wrapping_add(near)
-            .rotate_left(rot)
-            ^ far.rotate_right(7);
+        state[i] = snap[i].wrapping_add(near).rotate_left(rot) ^ far.rotate_right(7);
     }
 }
 
@@ -106,7 +102,7 @@ fn lose(state: &mut ChaosState, round_idx: usize) {
     let target = (round_idx * 7) & (N_BUCKETS - 1);
     let v = state[target];
     let neighbor = state[(target + 1) & (N_BUCKETS - 1)];
-    let popcnt = (v ^ neighbor).count_ones();   // 0..32 → 6 bits
+    let popcnt = (v ^ neighbor).count_ones(); // 0..32 → 6 bits
     state[target] = (popcnt << 26) | (v & 0x03FF_FFFF);
     // High 6 bits of v are LOST. They're replaced by popcount of (v ^ neighbor), which is a 6-bit summary of 64 bits of joint entropy. Cannot be inverted.
 }
@@ -195,7 +191,9 @@ mod tests {
             let b1 = state_to_bytes(&s1);
             let b2 = state_to_bytes(&s2);
 
-            let diff: u32 = b1.iter().zip(b2.iter())
+            let diff: u32 = b1
+                .iter()
+                .zip(b2.iter())
                 .map(|(a, b)| (a ^ b).count_ones())
                 .sum();
             total_diff += diff as u64;
@@ -224,10 +222,12 @@ mod tests {
 
         let mut expected = [0u32; ROUNDS];
         for i in 0..8 {
-            expected[i] = u32::from_le_bytes([b1[i*4], b1[i*4+1], b1[i*4+2], b1[i*4+3]]);
+            expected[i] =
+                u32::from_le_bytes([b1[i * 4], b1[i * 4 + 1], b1[i * 4 + 2], b1[i * 4 + 3]]);
         }
         for i in 0..4 {
-            expected[i + 8] = u32::from_le_bytes([b2[i*4], b2[i*4+1], b2[i*4+2], b2[i*4+3]]);
+            expected[i + 8] =
+                u32::from_le_bytes([b2[i * 4], b2[i * 4 + 1], b2[i * 4 + 2], b2[i * 4 + 3]]);
         }
 
         if ROUND_CONSTS != expected {
