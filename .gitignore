@@ -17,11 +17,9 @@ build_*/
 *.fst
 sim/work/
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-.venv/
+# Rust / cargo
+target/
+**/target/
 
 # Editor / OS
 .DS_Store
