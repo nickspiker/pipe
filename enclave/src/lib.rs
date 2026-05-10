@@ -22,7 +22,9 @@
 //! Both must fall to break the MAC. The chaos amp's hardness is auditable (count the paths, count the destroyed bits). The BLAKE3 layer's hardness is conjectural but well-validated.
 
 pub mod chaos_amp;
+pub mod chaos_amp_v2;
 pub mod mac;
 
 pub use chaos_amp::{chaos_amp, ChaosState};
+pub use chaos_amp_v2::{chaos_amp_v2, ChaosStateV2};
 pub use mac::pipe_mac;

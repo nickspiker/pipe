@@ -1,0 +1,17 @@
+# Minimal LPF for the chaos_amp Fmax synthesis bench.
+# 25 MHz crystal seeds the reported clock — we then push the FREQUENCY
+# constraint up via build_chaos_amp_synth.sh's --freq argument until nextpnr
+# can no longer close.
+
+LOCATE COMP "clk"     SITE "P6";
+IOBUF PORT "clk"     IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 25 MHz;
+
+LOCATE COMP "reset_n" SITE "R7";
+IOBUF PORT "reset_n" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "led"     SITE "T6";
+IOBUF PORT "led"     IO_TYPE=LVCMOS33;
+
+LOCATE COMP "ext_led" SITE "T2";
+IOBUF PORT "ext_led" IO_TYPE=LVCMOS33;

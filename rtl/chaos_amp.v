@@ -60,7 +60,14 @@ module chaos_amp (
     localparam integer ROUNDS    = 12;
 
     // =========================================================================
-    // AES S-box (8 → 8 bijection). Each lookup yosys infers as LUT4 logic.
+    // AES S-box (8 → 8 bijection). Compiled to LUT logic — yosys with wide-LUT
+    // mode (synth_ecp5 *without* -nowidelut) packs the 8-input function into
+    // ~16 LUT4-equivalent per byte using LUT5/LUT6/LUT7 SLICE combiners. With
+    // 64 parallel byte reads (16 buckets × 4 bytes) that's roughly 1 k LUT4
+    // for the S-box layer — fits comfortably. `ram_style = "block"` would map
+    // to BRAM but requires clocked read ports; chaos_amp's round logic uses
+    // combinational reads so BRAM mapping is incompatible without pipelining
+    // the substitute phase into its own cycle.
     // =========================================================================
     reg [7:0] sbox [0:255];
     initial begin
