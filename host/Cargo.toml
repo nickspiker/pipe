@@ -1,0 +1,31 @@
+[package]
+name = "pipe"
+version = "0.0.0"
+edition = "2021"
+authors = ["Nick Spiker <fractaldecoder@proton.me>"]
+description = "PIPE host-side: chaos amp + keyed-BLAKE3 MAC, USB-GPIO bit-bang for the wire"
+license = "TBD"
+publish = false
+
+[lib]
+name = "pipe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gen-test-vectors"
+path = "src/bin/gen_test_vectors.rs"
+
+[dependencies]
+blake3 = "1.5"
+
+[dev-dependencies]
+# proptest, criterion etc. as we need them
+
+[profile.release]
+opt-level = 3
+lto = true
+debug = false
+
+[profile.dev]
+opt-level = 0
+debug = true
