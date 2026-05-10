@@ -13,6 +13,7 @@
 
 use pipe::{chaos_amp, ragu};
 use pipe::chaos_amp::state_to_bytes;
+use pipe::chaos_amp_v2::{chaos_amp_v2, state_to_bytes_v2};
 
 fn main() {
     let mem_dir = std::env::args().nth(1);
@@ -44,8 +45,12 @@ fn main() {
     inp3[32..].copy_from_slice(hb);
     vectors.push((inp3, *hb));
 
+    // v1 vectors: 16 × u32 input + 16 × u32 chaos state per vector
     let mut input_mem = String::new();
     let mut state_mem = String::new();
+
+    // v2 vectors: same input layout, but state is 16 × 24-bit (zero-padded to 24-bit hex)
+    let mut state_mem_v2 = String::new();
 
     for (input, key) in &vectors {
         let state = chaos_amp(input);
@@ -54,6 +59,7 @@ fn main() {
 
         print_vector_comment(input, &state_bytes, key, &r);
 
+        // v1 emission
         for chunk in input.chunks(4) {
             let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             input_mem.push_str(&format!("{:08x}\n", v));
@@ -61,15 +67,38 @@ fn main() {
         for &word in &state {
             state_mem.push_str(&format!("{:08x}\n", word));
         }
+
+        // v2 emission (state is 24 bits per bucket; emit as 6 hex chars)
+        let state_v2 = chaos_amp_v2(input);
+        for &word24 in &state_v2 {
+            state_mem_v2.push_str(&format!("{:06x}\n", word24 & 0x00FF_FFFF));
+        }
     }
 
     if let Some(dir) = mem_dir {
-        let p_in = format!("{}/vectors_input.mem", dir);
-        let p_st = format!("{}/vectors_state.mem", dir);
+        let p_in    = format!("{}/vectors_input.mem", dir);
+        let p_st    = format!("{}/vectors_state.mem", dir);
+        let p_st_v2 = format!("{}/vectors_state_v2.mem", dir);
         std::fs::write(&p_in, &input_mem).expect("write vectors_input.mem");
         std::fs::write(&p_st, &state_mem).expect("write vectors_state.mem");
+        std::fs::write(&p_st_v2, &state_mem_v2).expect("write vectors_state_v2.mem");
         eprintln!("wrote {} ({} vectors)", p_in, vectors.len());
         eprintln!("wrote {} ({} vectors)", p_st, vectors.len());
+        eprintln!("wrote {} ({} vectors)", p_st_v2, vectors.len());
+
+        // Emit a separate human-readable v2 dump for cross-checking the Verilog
+        let mut v2_log = String::new();
+        for (vi, (input, _)) in vectors.iter().enumerate() {
+            v2_log.push_str(&format!("// v2 vector {}: input=", vi));
+            for b in input.iter() { v2_log.push_str(&format!("{:02x}", b)); }
+            v2_log.push('\n');
+            let st = chaos_amp_v2(input);
+            v2_log.push_str("// chaos_amp_v2 state (16 × 24b LE):  ");
+            for w in &st { v2_log.push_str(&format!("{:06x} ", w & 0x00FF_FFFF)); }
+            v2_log.push('\n');
+        }
+        let p_log_v2 = format!("{}/vectors_v2.txt", dir);
+        std::fs::write(&p_log_v2, &v2_log).expect("write vectors_v2.txt");
     }
 }
 
