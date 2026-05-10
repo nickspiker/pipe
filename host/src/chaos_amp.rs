@@ -17,7 +17,7 @@
 //!    popcount treatment: 6 bits of `popcount(v ^ neighbor)` replace the
 //!    upper 6 bits of `v`. **Provably destroys 6 bits per use; 72 bits
 //!    over 12 rounds.** Irrecoverable.
-//! 5. **SEASON** — XOR a TACOS-derived round constant into bucket 0 to
+//! 5. **SEASON** — XOR a Dragonfly-derived round constant into bucket 0 to
 //!    break symmetries and bind the algorithm's identity to PIPE.
 //!
 //! # Path explosion (counting argument)
@@ -42,7 +42,7 @@
 //!
 //! # Round constants derivation
 //!
-//! Round constants come from `blake3("PIPE chaos amp v1 - TACOS")` truncated
+//! Round constants come from `blake3("PIPE chaos amp v1 - Dragonfly")` truncated
 //! to 12 × u32. Hardcoded for `const`-correctness; verified by the
 //! `round_consts_match_blake3` test.
 
@@ -72,15 +72,15 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-/// Round constants — first 32 bytes from `blake3("PIPE chaos amp v1 - TACOS")`
-/// give the first 8 u32; remaining 4 from `blake3("PIPE chaos amp v1 - TACOS - more")`.
+/// Round constants — first 32 bytes from `blake3("PIPE chaos amp v1 - Dragonfly")`
+/// give the first 8 u32; remaining 4 from `blake3("PIPE chaos amp v1 - Dragonfly - more")`.
 /// Verified bit-exact by `round_consts_match_blake3`. Distinct, identifying
 /// values that name PIPE's chaos amp specifically — anyone implementing a
 /// different chaos amp would derive different constants from a different label.
 const ROUND_CONSTS: [u32; ROUNDS] = [
-    0x4d4a2301, 0x70ae9069, 0x0b2de6a8, 0xa09bc93c,
-    0x93d6cb16, 0x96f498af, 0x4ac1ff15, 0x5738e021,
-    0xedf59626, 0xa48d05bd, 0x2b86d528, 0x65107d57,
+    0xb49cfd47, 0x1ad8cacb, 0x7cee4209, 0x45c2c3ba,
+    0xda61bf21, 0x1ae39132, 0x0f7a9015, 0xbb017f89,
+    0x457b8fd0, 0xd9abdd9e, 0xeaf22790, 0x17b72570,
 ];
 
 /// SUBSTITUTE: each byte through the S-box.
@@ -245,9 +245,9 @@ mod tests {
     /// Verify the hardcoded ROUND_CONSTS match what we'd get from BLAKE3.
     #[test]
     fn round_consts_match_blake3() {
-        let h1 = blake3::hash(b"PIPE chaos amp v1 - TACOS");
+        let h1 = blake3::hash(b"PIPE chaos amp v1 - Dragonfly");
         let b1 = h1.as_bytes();
-        let h2 = blake3::hash(b"PIPE chaos amp v1 - TACOS - more");
+        let h2 = blake3::hash(b"PIPE chaos amp v1 - Dragonfly - more");
         let b2 = h2.as_bytes();
 
         let mut expected = [0u32; ROUNDS];
