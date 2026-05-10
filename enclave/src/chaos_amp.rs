@@ -1,50 +1,30 @@
 //! PIPE chaos amplifier v1.
 //!
-//! Provably lossy mixer with combinatorial path explosion. Designed so any
-//! preimage-search exceeds the heat-death bit-flip budget of the observable
-//! universe (~10^120 ≈ 2^400) by many orders of magnitude.
+//! Provably lossy mixer with combinatorial path explosion. Designed so any preimage-search exceeds the heat-death bit-flip budget of the observable universe (~10^120 ≈ 2^400) by many orders of magnitude.
 //!
 //! # Round structure (5 phases per round, 12 rounds total)
 //!
-//! 1. **SUBSTITUTE** — each state byte through an AES-style S-box
-//!    (8→8 nonlinear bijection; provides byte-level avalanche).
-//! 2. **MIX** — ARX-style across buckets: each bucket = `add + rotate ^ rotate`
-//!    of its near (`+1`) and far (`+11`) neighbors. Rotation amount is
-//!    data-dependent (5 bits of path entropy per bucket per round).
-//! 3. **INTERLEAVE** — pair-wise swap of upper/lower halves between buckets
-//!    `i` and `i+8`; spreads bit influence across the bucket array.
-//! 4. **LOSE** — one bucket per round (rotated by `round_idx`) gets the
-//!    popcount treatment: 6 bits of `popcount(v ^ neighbor)` replace the
-//!    upper 6 bits of `v`. **Provably destroys 6 bits per use; 72 bits
-//!    over 12 rounds.** Irrecoverable.
-//! 5. **SEASON** — XOR a Dragonfly-derived round constant into bucket 0 to
-//!    break symmetries and bind the algorithm's identity to PIPE.
+//! 1. **SUBSTITUTE** — each state byte through an AES-style S-box (8→8 nonlinear bijection; provides byte-level avalanche).
+//! 2. **MIX** — ARX-style across buckets: each bucket = `add + rotate ^ rotate` of its near (`+1`) and far (`+11`) neighbors. Rotation amount is data-dependent (5 bits of path entropy per bucket per round).
+//! 3. **INTERLEAVE** — pair-wise swap of upper/lower halves between buckets `i` and `i+8`; spreads bit influence across the bucket array.
+//! 4. **LOSE** — one bucket per round (rotated by `round_idx`) gets the popcount treatment: 6 bits of `popcount(v ^ neighbor)` replace the upper 6 bits of `v`. **Provably destroys 6 bits per use; 72 bits over 12 rounds.** Irrecoverable.
+//! 5. **SEASON** — XOR a Dragonfly-derived round constant into bucket 0 to break symmetries and bind the algorithm's identity to PIPE.
 //!
 //! # Path explosion (counting argument)
 //!
-//! Per round: 16 buckets × 5-bit data-dependent rotation = **80 bits** of
-//! path entropy. Across 12 rounds: 80 × 12 = **960 bits ≈ 10^289 paths**.
-//! Heat-death budget: ~10^120 ≈ 2^400 bit-flips. Margin: **~170 orders of
-//! magnitude past heat death**, before counting information loss.
+//! Per round: 16 buckets × 5-bit data-dependent rotation = **80 bits** of path entropy. Across 12 rounds: 80 × 12 = **960 bits ≈ 10^289 paths**. Heat-death budget: ~10^120 ≈ 2^400 bit-flips. Margin: **~170 orders of magnitude past heat death**, before counting information loss.
 //!
 //! # Information destruction (counting argument)
 //!
-//! 1 lossy op per round × 6 bits each × 12 rounds = **72 bits irrecoverable**
-//! per chaos_amp call. Combined with path entropy: **2^(960 + 72) ≈ 10^310
-//! candidates per output**.
+//! 1 lossy op per round × 6 bits each × 12 rounds = **72 bits irrecoverable** per chaos_amp call. Combined with path entropy: **2^(960 + 72) ≈ 10^310 candidates per output**.
 //!
 //! # Why this works after BLAKE3 frosting
 //!
-//! BLAKE3 keyed mode provides cryptographic uniformity (avalanche, no
-//! statistical artifacts in the final MAC). The chaos amp doesn't need a
-//! beautiful output distribution; it just needs the path-and-loss bounds
-//! to hold. BLAKE3 cleans up after.
+//! BLAKE3 keyed mode provides cryptographic uniformity (avalanche, no statistical artifacts in the final MAC). The chaos amp doesn't need a beautiful output distribution; it just needs the path-and-loss bounds to hold. BLAKE3 cleans up after.
 //!
 //! # Round constants derivation
 //!
-//! Round constants come from `blake3("PIPE chaos amp v1 - Dragonfly")` truncated
-//! to 12 × u32. Hardcoded for `const`-correctness; verified by the
-//! `round_consts_match_blake3` test.
+//! Round constants come from `blake3("PIPE chaos amp v1 - Dragonfly")` truncated to 12 × u32. Hardcoded for `const`-correctness; verified by the `round_consts_match_blake3` test.
 
 const N_BUCKETS: usize = 16;
 pub const ROUNDS: usize = 12;
@@ -72,11 +52,7 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-/// Round constants — first 32 bytes from `blake3("PIPE chaos amp v1 - Dragonfly")`
-/// give the first 8 u32; remaining 4 from `blake3("PIPE chaos amp v1 - Dragonfly - more")`.
-/// Verified bit-exact by `round_consts_match_blake3`. Distinct, identifying
-/// values that name PIPE's chaos amp specifically — anyone implementing a
-/// different chaos amp would derive different constants from a different label.
+/// Round constants — first 32 bytes from `blake3("PIPE chaos amp v1 - Dragonfly")` give the first 8 u32; remaining 4 from `blake3("PIPE chaos amp v1 - Dragonfly - more")`. Verified bit-exact by `round_consts_match_blake3`. Distinct, identifying values that name PIPE's chaos amp specifically — anyone implementing a different chaos amp would derive different constants from a different label.
 const ROUND_CONSTS: [u32; ROUNDS] = [
     0xb49cfd47, 0x1ad8cacb, 0x7cee4209, 0x45c2c3ba,
     0xda61bf21, 0x1ae39132, 0x0f7a9015, 0xbb017f89,
@@ -97,8 +73,7 @@ fn substitute(state: &mut ChaosState) {
     }
 }
 
-/// MIX: ARX with data-dependent rotation amount, near + far neighbor.
-/// Reads from a snapshot so all buckets update in parallel.
+/// MIX: ARX with data-dependent rotation amount, near + far neighbor. Reads from a snapshot so all buckets update in parallel.
 #[inline]
 fn mix(state: &mut ChaosState) {
     let snap = *state;
@@ -125,8 +100,7 @@ fn interleave(state: &mut ChaosState) {
     }
 }
 
-/// LOSE: destroy 6 bits in one bucket via popcount mixing.
-/// Target rotates by round so every bucket gets crushed eventually.
+/// LOSE: destroy 6 bits in one bucket via popcount mixing. Target rotates by round so every bucket gets crushed eventually.
 #[inline]
 fn lose(state: &mut ChaosState, round_idx: usize) {
     let target = (round_idx * 7) & (N_BUCKETS - 1);
@@ -134,8 +108,7 @@ fn lose(state: &mut ChaosState, round_idx: usize) {
     let neighbor = state[(target + 1) & (N_BUCKETS - 1)];
     let popcnt = (v ^ neighbor).count_ones();   // 0..32 → 6 bits
     state[target] = (popcnt << 26) | (v & 0x03FF_FFFF);
-    // High 6 bits of v are LOST. They're replaced by popcount of (v ^ neighbor),
-    // which is a 6-bit summary of 64 bits of joint entropy. Cannot be inverted.
+    // High 6 bits of v are LOST. They're replaced by popcount of (v ^ neighbor), which is a 6-bit summary of 64 bits of joint entropy. Cannot be inverted.
 }
 
 /// SEASON: XOR a round constant into bucket 0.
@@ -200,8 +173,7 @@ mod tests {
         assert_ne!(chaos_amp(&i1), chaos_amp(&i2));
     }
 
-    /// Avalanche test: 1-bit input flip should flip ~50% of output bits.
-    /// Tolerance: 45-55%.
+    /// Avalanche test: 1-bit input flip should flip ~50% of output bits. Tolerance: 45-55%.
     #[test]
     fn avalanche_one_bit_flip() {
         const TRIALS: usize = 200;

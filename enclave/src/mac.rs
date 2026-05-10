@@ -6,36 +6,26 @@
 //! mac = BLAKE3_keyed(key, chaos_amp(input))
 //! ```
 //!
-//! where `input` is a 64-byte block supplied by the caller. The semantics
-//! of the input — what it represents, how it's layered, what domain it
-//! belongs to — is the kernel's responsibility.
+//! where `input` is a 64-byte block supplied by the caller. The semantics of the input — what it represents, how it's layered, what domain it belongs to — is the kernel's responsibility.
 //!
-//! This matches BLAKE3's own design: `keyed_hash(key, input)` doesn't take
-//! domain-tag arguments. The caller prefixes context. PIPE follows the
-//! same convention. Domain separation is *policy*, policy belongs in
-//! software (mutable), not silicon (immutable).
+//! This matches BLAKE3's own design: `keyed_hash(key, input)` doesn't take domain-tag arguments. The caller prefixes context. PIPE follows the same convention. Domain separation is *policy*, policy belongs in software (mutable), not silicon (immutable).
 //!
 //! # Caller responsibility
 //!
-//! The caller MUST ensure that `input` for distinct purposes never collides.
-//! Typical layout for an oracle attestation request:
+//! The caller MUST ensure that `input` for distinct purposes never collides. Typical layout for an oracle attestation request:
 //!
 //! ```text
-//! input[0..32]   = domain tag chosen by kernel (e.g., per-use-case ID,
-//!                   per-capability ID, whatever distinguishes this request)
+//! input[0..32]   = domain tag chosen by kernel (e.g., per-use-case ID, per-capability ID, whatever distinguishes this request)
 //! input[32..64]  = challenge bytes
 //! ```
 //!
-//! Other use cases (signatures, derive-key, attestation chains) get their
-//! own tag conventions. PIPE silicon doesn't care — it just hashes.
+//! Other use cases (signatures, derive-key, attestation chains) get their own tag conventions. PIPE silicon doesn't care — it just hashes.
 
 use crate::chaos_amp::{chaos_amp, state_to_bytes};
 
 /// PIPE primitive: chaos_amp + keyed-BLAKE3.
 ///
-/// `key` is the 256-bit secret in the silicon's key register (write-once).
-/// `input` is a 64-byte caller-prepared block (kernel layers semantics here).
-/// Returns 256 bits.
+/// `key` is the 256-bit secret in the silicon's key register (write-once). `input` is a 64-byte caller-prepared block (kernel layers semantics here). Returns 256 bits.
 pub fn pipe_mac(key: &[u8; 32], input: &[u8; 64]) -> [u8; 32] {
     let chaos_state = chaos_amp(input);
     let chaos_bytes = state_to_bytes(&chaos_state);
@@ -71,11 +61,7 @@ mod tests {
         a[0] = 1;  // suppress unused_mut warning
     }
 
-    /// Avalanche on the full MAC: 1-bit input flip → ~50% output bit flips.
-    /// This is mostly testing BLAKE3's avalanche, which is well-established.
-    /// Loose tolerance: 45-55%. Will fail if chaos_amp is absorbing input
-    /// bit-flips too aggressively (which currently happens with the v0
-    /// chaos amp design — flagging it for the avalanche redesign work).
+    /// Avalanche on the full MAC: 1-bit input flip → ~50% output bit flips. This is mostly testing BLAKE3's avalanche, which is well-established. Loose tolerance: 45-55%. Will fail if chaos_amp is absorbing input bit-flips too aggressively (which currently happens with the v0 chaos amp design — flagging it for the avalanche redesign work).
     #[test]
     fn mac_avalanche() {
         const TRIALS: usize = 200;

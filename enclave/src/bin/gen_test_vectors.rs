@@ -1,7 +1,6 @@
 //! Generate test vectors for the Verilog testbenches.
 //!
-//! Emits hex lines suitable for $readmemh in tb_chaos_amp.v and tb_pipe_mac.v.
-//! Each vector: 64-byte input → 32-byte key → expected chaos state, expected MAC.
+//! Emits hex lines suitable for $readmemh in tb_chaos_amp.v and tb_pipe_mac.v. Each vector: 64-byte input → 32-byte key → expected chaos state, expected MAC.
 
 use pipe::{chaos_amp, pipe_mac};
 use pipe::chaos_amp::state_to_bytes;
