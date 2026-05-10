@@ -24,7 +24,9 @@
 pub mod chaos_amp;
 pub mod chaos_amp_v2;
 pub mod ragu;
+pub mod silicon;
 
 pub use chaos_amp::{chaos_amp, ChaosState};
 pub use chaos_amp_v2::{chaos_amp_v2, ChaosStateV2};
 pub use ragu::ragu;
+pub use silicon::Silicon;
