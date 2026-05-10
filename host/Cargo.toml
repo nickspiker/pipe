@@ -1,0 +1,16 @@
+[package]
+name = "pipe-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PIPE host-side: mirror-XOR codec, FT232H bit-bang, MAC verifier."
+
+[lib]
+name = "pipe_host"
+path = "src/lib.rs"
+
+[dependencies]
+pipe-enclave = { path = "../enclave" }
+blake3 = "1.5"
