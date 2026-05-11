@@ -101,9 +101,10 @@ module top_ntsc (
     // Blake3 reset: active-low. Assert during POR and button hold.
     wire b3_reset_n = por_done & pll_lock & ~btn_held_sys;
 
-`ifdef RING_STAGES
     // =========================================================================
-    // Ring frequency counter — ported from top_extclk.v (proven pipeline).
+    // sys_clk frequency counter — ported from top_extclk.v (proven pipeline).
+    // Runs in RING, PLL, and baseline modes — measures whatever sys_clk is
+    // against the 25 MHz crystal so the OLED always shows the actual clock.
     //
     // Gated 32-bit ripple counter on sys_clk (the ring). 1/60 sec windowed FSM
     // in 25 MHz clk domain samples count → count_snap. count_snap × MULT_K
@@ -241,12 +242,20 @@ module top_ntsc (
     // Glyph ROM — 11 glyphs × 12w × 16h × 8bpp = 2112 bytes. Slot 10 = '.'.
     reg [7:0] glyph_rom [0:2111];
     initial $readmemh("decimal_glyphs.mem", glyph_rom);
-`endif
 
     // =========================================================================
     // Constants
     // =========================================================================
-    localparam CE_GOLD_DIV = 256;      // gold CE divider (effective freq = PLL/256)
+    // gold CE divider — should be MUCH larger than the DUT's cycles-per-call
+    // so PH_GOLD's wall-time is dominated by the slow CE pacing rather than by
+    // DUT throughput. blake3 takes ~30 cycles → 256 is plenty. chaos_amp_v2
+    // takes ~514 cycles → 256 is too small and gold runs at the same rate as
+    // test (the DUT is the bottleneck). 4096 restores an ~8x gold/test ratio.
+`ifdef DUT_CHAOS_AMP_V2
+    localparam CE_GOLD_DIV = 4096;
+`else
+    localparam CE_GOLD_DIV = 256;
+`endif
 
     // Protocol: 18-bit counter, bit taps for events (zero comparisons)
     //   [0..32767]                       warmup (LFSR runs, no accumulation)
@@ -324,11 +333,12 @@ module top_ntsc (
     reg [15:0] combo_tested = 0;  // 1 = this combo has been tested
 `endif
 
-    // CE generator (registered for clean fanout at high freq)
-    reg [7:0] ce_div = 0;
-    reg       ce = 0;
+    // CE generator (registered for clean fanout at high freq). Width tracks
+    // CE_GOLD_DIV so it accommodates whichever DUT-specific value is chosen.
+    reg [$clog2(CE_GOLD_DIV)-1:0] ce_div = 0;
+    reg                            ce    = 0;
     always @(posedge sys_clk) begin
-        ce_div <= (ce_div == CE_GOLD_DIV - 1) ? 8'd0 : ce_div + 1;
+        ce_div <= (ce_div == CE_GOLD_DIV - 1) ? {($clog2(CE_GOLD_DIV)){1'b0}} : ce_div + 1'b1;
         ce     <= (phase == PH_TEST) || (ce_div == CE_GOLD_DIV - 1);
     end
 
@@ -1248,6 +1258,66 @@ module top_ntsc (
     wire dut_advance = b3_ready && !b3_ready_d;  // rising edge = hash done
 `define DUT_ITER_ADVANCE
 
+`elsif DUT_CHAOS_AMP_V2
+    // ----- chaos_amp v2 — Dragonfly 32-op data-dep ALU, 1 bucket/cycle, ~514 cycles per call -----
+    // 64-byte input drawn from lfsr/lfsr2 concatenations; 384-bit state output
+    // gets XOR-folded to 32 bits to feed the dual-CE accumulator.
+    wire [511:0] ca_in_data = {
+        ~lfsr,
+        lfsr ^ 64'hAAAA_AAAA_AAAA_AAAA,
+        lfsr + 64'h1234_5678_9ABC_DEF0,
+        lfsr - 64'hFEDC_BA98_7654_3210,
+        lfsr2 ^ lfsr,
+        lfsr2,
+        lfsr2 + 64'h5555_5555_5555_5555,
+        lfsr
+    };
+    wire [383:0] ca_state_out;
+    wire         ca_done;
+    wire ca_reset_n = b3_reset_n && (phase != PH_IDLE) && (phase != PH_SWITCH);
+
+    reg iter_busy  = 0;
+    reg iter_start = 0;
+    reg ca_done_d  = 0;
+    always @(posedge sys_clk) begin
+        iter_start <= 0;
+        ca_done_d  <= ca_done;
+        // Defensive reset on btn-held / por-not-done / DUT reset
+        if (btn_held_sys || !por_done || !ca_reset_n) begin
+            iter_busy <= 0;
+        end else if (ce && !iter_busy) begin
+            iter_start <= 1;
+            iter_busy  <= 1;
+        end else if (ca_done) begin
+            iter_busy <= 0;
+        end
+    end
+
+    chaos_amp_v2 dut_chaos_amp_v2 (
+        .clk       (sys_clk),
+        .reset_n   (ca_reset_n),
+        .start     (iter_start),
+        .in_data   (ca_in_data),
+        .state_out (ca_state_out),
+        .done      (ca_done)
+    );
+
+    // Latch output on done rising edge
+    reg [383:0] ca_out_r = 0;
+    always @(posedge sys_clk)
+        if (ca_done && !ca_done_d) ca_out_r <= ca_state_out;
+
+    // XOR-fold 384 → 32 (12 × 32-bit chunks)
+    wire [31:0] mul_fold = ca_out_r[ 31:  0] ^ ca_out_r[ 63: 32]
+                         ^ ca_out_r[ 95: 64] ^ ca_out_r[127: 96]
+                         ^ ca_out_r[159:128] ^ ca_out_r[191:160]
+                         ^ ca_out_r[223:192] ^ ca_out_r[255:224]
+                         ^ ca_out_r[287:256] ^ ca_out_r[319:288]
+                         ^ ca_out_r[351:320] ^ ca_out_r[383:352];
+
+    wire dut_advance = ca_done && !ca_done_d;
+`define DUT_ITER_ADVANCE
+
 `elsif DUT_SPIRIX_ADDBIT
     // ----- Spirix ALU addbit (combinational + output reg, 5 ops, 64-bit datapath) -----
     // ADD/SUB/AND/OR/XOR with close/far split + shared barrel.
@@ -1651,10 +1721,23 @@ module top_ntsc (
     reg [8:0] proto_hi;
     reg       proto_carry;  // registered carry from lo to hi
     wire       proto_done = proto_hi[8];             // bit tap: done at 131072
-    wire       accumulating = proto_hi[6] & ~proto_done;  // bit tap: accum from 32768..131071
+    // `accumulating` is intended to mean "proto_hi >= 64" — a single
+    // contiguous window from sample 32768 to 131071. The original code used a
+    // bare bit-tap `proto_hi[6]` which is NOT equivalent: bit 6 toggles 4
+    // times across the 0..256 sweep (off / on / off / on), giving two
+    // disjoint accumulating windows instead of one. Visually that shows up as
+    // the top-right pixel blinking twice per phase. Replace with `>= 64`
+    // implemented as `proto_hi[7] | proto_hi[6]` — same 1-LUT cost, correct
+    // single-window semantics.
+    wire       accumulating = (proto_hi[7] | proto_hi[6]) & ~proto_done;
     reg [31:0] accum;
     reg [31:0] gold_reg = 0, test_reg = 0;
     reg        test_done_sys = 0;
+    // Toggles on each PH_TEST → PH_DONE transition. CDC'd to clk for edge-
+    // detect so display_miss latches exactly once per real capture (not
+    // continuously, which would let it transiently show garbage during the
+    // next cycle's PH_GOLD accumulation).
+    reg        capture_tick = 0;
 
     always @(posedge sys_clk) begin
         if (!pll_lock || !por_done) begin
@@ -1731,6 +1814,7 @@ module top_ntsc (
                     if (proto_done) begin
                         test_reg      <= accum;
                         test_done_sys <= 1;
+                        capture_tick  <= ~capture_tick;
                         phase         <= PH_DONE;
                     end
                 end
@@ -1785,13 +1869,38 @@ module top_ntsc (
     wire btn_held_sys = ~btn_sync_sys[1];  // 1 when button held (sys_clk domain)
 
     // =========================================================================
-    // CDC: test_done_sys → clk domain
+    // CDC: test_done_sys → clk domain, plus phase-bit CDC for debug pixels
     // =========================================================================
     reg done_sync1 = 0, done_sync2 = 0;
     always @(posedge clk) begin
         done_sync1 <= test_done_sys;
         done_sync2 <= done_sync1;
     end
+
+    // Single-bit phase indicators (sys_clk domain) → CDC into clk for the
+    // top-row debug pixels. `accumulating` is already a wire (proto_hi[6] &&
+    // !proto_hi[8]) — it goes high once the warmup phase has passed and the
+    // mul_fold output is being XORed into accum. That's the warmup→captured
+    // transition the top-right pixel needs to display.
+    wire in_gold_sys = (phase == PH_GOLD);
+    wire in_test_sys = (phase == PH_TEST);
+    reg [1:0] gold_sync  = 0;
+    reg [1:0] test_sync  = 0;
+    reg [1:0] accum_sync = 0;
+    reg [1:0] cap_sync   = 0;
+    reg       cap_prev   = 0;
+    always @(posedge clk) begin
+        gold_sync  <= {gold_sync[0],  in_gold_sys};
+        test_sync  <= {test_sync[0],  in_test_sys};
+        accum_sync <= {accum_sync[0], accumulating};
+        cap_sync   <= {cap_sync[0],   capture_tick};
+        cap_prev   <= cap_sync[1];
+    end
+    wire in_gold_clk      = gold_sync[1];
+    wire in_test_clk      = test_sync[1];
+    wire accumulating_clk = accum_sync[1];
+    // 1-clk pulse on each capture_tick toggle = one event per PH_DONE entry
+    wire capture_pulse    = cap_sync[1] ^ cap_prev;
 
     reg lock_sync1 = 0, lock_sync2 = 0;
     always @(posedge clk) begin
@@ -1829,13 +1938,13 @@ module top_ntsc (
         end
     end
 
-    // Keypad LED: LIVE XOR comparison — bright when (gold_reg ^ test_reg) is
-    // all zeros (passing), dark when any bit is set. Reflects current state
-    // rather than the last PH_DONE latch, so the LED naturally flickers
-    // through the bench cycle: bright in PH_IDLE/PH_GOLD (both regs 0), dark
-    // through PH_SWITCH/PH_TEST (gold latched non-zero, test still 0), then
-    // bright again at PH_DONE if timing closed (test == gold).
-    assign ext_led = (gold_reg == test_reg);
+    // Keypad LED: LATCHED pass/fail. Drives off the buffered display_miss
+    // (which only updates at the per-capture PH_DONE edge), so the LED
+    // reports the *last completed* gold-vs-test comparison and stays steady
+    // between captures. Previously this was a live `gold_reg == test_reg`
+    // comparison that flickered through every cycle as the registers were
+    // being mutated — useless for visual pass/fail.
+    assign ext_led = (display_miss == 32'd0);
 
     // =========================================================================
     // NTSC display (clk domain = 25 MHz)
@@ -1919,7 +2028,10 @@ module top_ntsc (
     reg [31:0] display_mul  = 0;
     reg [31:0] display_gold = 0;
     reg [31:0] display_test = 0;
-    wire [31:0] display_miss = display_gold ^ display_test;
+    // display_miss is latched separately and ONLY updates when phase enters
+    // PH_DONE — otherwise band 3 transiently shows "fail" during PH_GOLD when
+    // gold_reg has accumulated but test_reg is still zero.
+    reg [31:0] display_miss = 0;
 
     // 32-bit Galois LFSR for per-pixel temporal dither.
     reg [31:0] dith_lfsr = 32'hCAFE_BABE;
@@ -1948,7 +2060,6 @@ module top_ntsc (
     wire [7:0]  bit_pixel   = bit_pos_odd ? (bit_value ? 8'd255 : 8'd32)
                                           : (bit_value ? 8'd191 : 8'd0);
 
-`ifdef RING_STAGES
     // Top band (rows 0..15) renders 8 BCD digit slots: 4 digits + '.' + 3 digits
     // = 96 px wide, centered cols 16..112. Layout: NNN.NNN MHz with leading-zero
     // suppression on the first 3 integer-position digits.
@@ -2014,10 +2125,21 @@ module top_ntsc (
     wire [7:0]  fc_freq_pixel  = (in_band0 && fc_in_digit_area && fc_freq_slot_valid)
                                  ? fc_glyph_pixel : 8'h00;
 
-    wire [7:0] fb_wr_pixel = in_band0 ? fc_freq_pixel : bit_pixel;
-`else
-    wire [7:0] fb_wr_pixel = bit_pixel;
-`endif
+    wire [7:0] fb_wr_pixel_base = in_band0 ? fc_freq_pixel : bit_pixel;
+    // Debug pixels — top corners, overlaid above the freq display (digit area
+    // is cols 16..112, so cols 0 and 127 row 0 are safe to use):
+    //   top-left  (col 0,   row 0): WHITE during PH_GOLD, BLACK during PH_TEST
+    //   top-right (col 127, row 0): WHITE during warmup (proto count < 32 k,
+    //                                                    accum not yet sampling),
+    //                                BLACK during captured (accum is being
+    //                                                       XOR-folded). Same
+    //                                255/0 style as top-left, applied to the
+    //                                accumulating signal.
+    wire is_top_left  = (wr_col == 7'd0)   && (wr_row == 6'd0);
+    wire is_top_right = (wr_col == 7'd127) && (wr_row == 6'd0);
+    wire [7:0] fb_wr_pixel = is_top_left  ? (in_gold_clk ? 8'hFF : (in_test_clk ? 8'h00 : 8'h40))
+                           : is_top_right ? (accumulating_clk ? 8'h00 : 8'hFF)
+                           : fb_wr_pixel_base;
 
     always @(posedge clk) begin
         fb[fb_wr_addr] <= fb_wr_pixel;
@@ -2095,6 +2217,20 @@ module top_ntsc (
         display_mul  <= display_mul_live;
         display_gold <= display_gold_live;
         display_test <= display_test_live;
+        // display_gold / display_test continuously sample the live values
+        // (so the gold/test bands stay lively as accumulation runs). But
+        // display_miss must NOT continuously update — between captures
+        // gold_reg gets reset/refilled while test_reg still holds the prior
+        // cycle, so a live XOR would show transient "fail" patterns.
+        // → see the always block below: latch exactly once per real capture.
+    end
+
+    // Per-test latch on display_miss. Fires when capture_pulse goes high
+    // (one clk cycle per PH_TEST → PH_DONE transition, edge-detected through
+    // a toggle CDC). At that moment both gold_reg and test_reg are stable
+    // and reflect the SAME cycle's gold/test accumulators.
+    always @(posedge clk) begin
+        if (capture_pulse) display_miss <= display_gold_live ^ display_test_live;
     end
 
     always @(posedge clk) if (oled_ce) begin

@@ -79,4 +79,15 @@ if [ "$PNR_RC" -ne 0 ]; then
 fi
 
 echo ""
+echo "--- Pack bitstream ---"
+ecppack --svf "$BUILD/chaos_amp_v2_synth.svf" "$BUILD/chaos_amp_v2_synth.config" "$BUILD/chaos_amp_v2_synth.bit"
+echo "Bitstream: $BUILD/chaos_amp_v2_synth.bit ($(stat -c%s "$BUILD/chaos_amp_v2_synth.bit") bytes)"
+
+if [ "${PROGRAM:-0}" = "1" ] || echo "$@" | grep -q -- '--program'; then
+    echo ""
+    echo "--- Program SRAM ---"
+    openFPGALoader -c ft232 "$BUILD/chaos_amp_v2_synth.svf"
+fi
+
+echo ""
 echo "✓ chaos_amp_v2 closes timing at ${FREQ} MHz (seed ${SEED})"

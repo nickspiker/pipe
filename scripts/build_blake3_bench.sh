@@ -76,12 +76,12 @@ elif [ "$FREQ" != "25" ]; then
     CPHASE=$(( (CLKOP - 1) / 2 ))
     DEFINES="$DEFINES -DPLL_CLKI_DIV=$CLKI -DPLL_CLKFB_DIV=$CLKFB"
     DEFINES="$DEFINES -DPLL_CLKOP_DIV=$CLKOP -DPLL_CLKOP_CPHASE=$CPHASE"
-    PNR_EXTRA=""
+    PNR_EXTRA="--timing-allow-fail"
     echo "================================================================"
     echo " blake3 bench @ ${ACTUAL_FREQ} MHz (PLL CLKI=$CLKI CLKFB=$CLKFB CLKOP=$CLKOP)"
     echo "================================================================"
 else
-    PNR_EXTRA=""
+    PNR_EXTRA="--timing-allow-fail"
     echo "================================================================"
     echo " blake3 bench @ 25 MHz (no PLL — baseline / debug only)"
     echo "================================================================"
@@ -131,8 +131,11 @@ if [ "$PNR_RC" -eq 124 ]; then
 fi
 
 grep -E "(Max frequency|Total LUT4|Info: Device utilisation)" "$BUILD/blake3_bench_pnr.log" | head -8
-if grep -q 'ERROR' "$BUILD/blake3_bench_pnr.log"; then
-    echo "PNR ERROR — see $BUILD/blake3_bench_pnr.log"
+# With --timing-allow-fail nextpnr emits "ERROR: Max frequency ..." lines for
+# clocks that miss target but still exits 0. Only bail on a non-zero nextpnr
+# exit (genuine PnR / routing failure).
+if [ "$PNR_RC" -ne 0 ]; then
+    echo "PNR exited with rc=$PNR_RC — see $BUILD/blake3_bench_pnr.log"
     exit 1
 fi
 
