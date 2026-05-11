@@ -59,28 +59,31 @@ module top_ntsc (
     // keeps the oscillator loop itself fast (no DCCA delay inside the ring).
 `ifdef RING_DIV
     // Arbitrary integer divider: sys_clk = ring_freq / RING_DIV. RING_DIV
-    // must be ≥ 2. Implemented as a modulo-N counter (the "second ring":
-    // cycles through N states). Output is high for the first floor(N/2)
-    // states, low for the rest — exact 50% duty for even N, off-by-one
-    // duty for odd N. Downstream FFs only sample rising edges so duty
-    // asymmetry is harmless. Two DCCAs consumed: one buffers the raw
-    // ring onto the global net (so the counter is reliably clocked), one
-    // buffers the divided output as the final sys_clk.
+    // must be ≥ 2 and even (odd values get floor-rounded — half-period =
+    // RING_DIV/2 input cycles). Implemented as count-to-half + toggle on
+    // rollover: the counter walks 0..HALF-1, and on hitting HALF-1 wraps
+    // to 0 and toggles the output flip-flop. Output is REGISTERED with
+    // exact 50% duty cycle for even RING_DIV, glitch-free by construction
+    // (the FF only changes on its own clock edge). Two DCCAs consumed:
+    // one buffers the raw ring onto the global net (so the counter is
+    // reliably clocked), one buffers the toggle output as final sys_clk.
     wire sys_clk_raw;
     (* keep *) DCCA dcca_ring_raw (
         .CLKI(ring_q[0]),
         .CE  (1'b1),
         .CLKO(sys_clk_raw)
     );
-    localparam integer DIV_W = ($clog2(`RING_DIV) > 0) ? $clog2(`RING_DIV) : 1;
+    localparam integer DIV_HALF = (`RING_DIV >> 1);
+    localparam integer DIV_W    = ($clog2(DIV_HALF) > 0) ? $clog2(DIV_HALF) : 1;
     reg [DIV_W-1:0] ring_div_cnt = 0;
     reg             ring_div_out = 0;
     always @(posedge sys_clk_raw) begin
-        if (ring_div_cnt == (`RING_DIV - 1))
+        if (ring_div_cnt == (DIV_HALF - 1)) begin
             ring_div_cnt <= 0;
-        else
+            ring_div_out <= ~ring_div_out;
+        end else begin
             ring_div_cnt <= ring_div_cnt + 1'b1;
-        ring_div_out <= (ring_div_cnt < (`RING_DIV >> 1));
+        end
     end
     (* keep *) DCCA dcca_sys_clk (
         .CLKI(ring_div_out),
@@ -134,93 +137,86 @@ module top_ntsc (
     wire b3_reset_n = por_done & pll_lock & ~btn_held_sys;
 
     // =========================================================================
-    // sys_clk frequency counter — ported from top_extclk.v (proven pipeline).
-    // Runs in RING, PLL, and baseline modes — measures whatever sys_clk is
-    // against the 25 MHz crystal so the OLED always shows the actual clock.
+    // sys_clk frequency counter — synchronous-counter + single-pulse snap.
     //
-    // Gated 32-bit ripple counter on sys_clk (the ring). 1/60 sec windowed FSM
-    // in 25 MHz clk domain samples count → count_snap. count_snap × MULT_K
-    // >> 32 = milli-MHz integer. Double-dabble produces 7 BCD digits → glyph
-    // render → OLED top band.
+    // Design:
+    //   - sys_clk drives a synchronous binary counter `fc_count`. All 32 bits
+    //     update simultaneously on each sys_clk edge → safe to sample at any
+    //     time (no ripple-flight hazard like the old top_extclk.v port).
+    //   - clk emits a 60 Hz toggle (`fc_cap_tgl`) on each FC_SNAP_INTERVAL.
+    //     The toggle is CDC'd into sys_clk (2-FF sync + edge detect) → one
+    //     sys_clk-domain pulse per window.
+    //   - On that pulse, sys_clk does fc_snapped <= fc_count and fc_count <= 1
+    //     in the SAME cycle. The "single click" — register and reset together,
+    //     so there's no count lost between snap and reset.
+    //   - fc_snapped is 2-FF synced back to clk. Multi-bit CDC is safe here
+    //     because fc_snapped only changes once per 16.67 ms, and we latch
+    //     count_snap one window LATER (when the next window pulse fires) —
+    //     by then any in-flight bit has had ~833 sys_clk cycles at 50 kHz to
+    //     propagate, ~26000 cycles at our 617 kHz target.
+    //   - Display latency is one window = 16.67 ms, invisible to the eye.
     //
-    // counter_enable / counter_reset are clk-domain regs synchronized into
-    // sys_clk domain via 2-FF sync (race-free).
+    // count_snap × MULT_K >> 32 = milli-MHz integer. MULT_K unchanged from
+    // the old design: the window period is identical, just measured cleanly.
     // =========================================================================
-    reg counter_enable = 1;
-    reg counter_reset  = 0;
-
-    reg [1:0] fc_ena_sync;
-    reg [1:0] fc_rst_sync;
-    always @(posedge sys_clk) begin
-        fc_ena_sync <= {fc_ena_sync[0], counter_enable};
-        fc_rst_sync <= {fc_rst_sync[0], counter_reset};
-    end
-    wire fc_ena_ext = fc_ena_sync[1];
-    wire fc_rst_ext = fc_rst_sync[1];
-
-    reg [31:0] fc_count;
-    always @(posedge sys_clk or posedge fc_rst_ext) begin
-        if (fc_rst_ext)        fc_count[0] <= 1'b0;
-        else if (fc_ena_ext)   fc_count[0] <= ~fc_count[0];
-    end
-    genvar fc_gi;
-    generate
-        for (fc_gi = 1; fc_gi < 32; fc_gi = fc_gi + 1) begin : fc_ripple
-            always @(negedge fc_count[fc_gi-1] or posedge fc_rst_ext) begin
-                if (fc_rst_ext) fc_count[fc_gi] <= 1'b0;
-                else            fc_count[fc_gi] <= ~fc_count[fc_gi];
-            end
-        end
-    endgenerate
-
-    // 60 Hz windowed FSM (clk domain): SAMPLE → DISCONNECT → READ → RESET → RECONNECT
     localparam integer FC_SNAP_INTERVAL = 25_000_000 / 60;  // 416666
-    reg [19:0] fc_window_cnt = 0;
-    reg [3:0]  fc_state      = 0;
-    reg [3:0]  fc_settle     = 0;
-    reg [31:0] count_snap    = 0;
-    reg        snap_pulse    = 0;
+
+    // ---- clk domain: 60 Hz window pulse + toggle ----
+    reg [19:0] fc_window_cnt    = 0;
+    reg        fc_window_at_top = 0;
+    reg        fc_cap_tgl       = 0;
     wire fc_global_reset = !por_done || btn_held_sys;
     always @(posedge clk) begin
-        snap_pulse <= 1'b0;
+        fc_window_at_top <= 1'b0;
         if (fc_global_reset) begin
-            fc_state       <= 0;
-            fc_window_cnt  <= 0;
-            fc_settle      <= 0;
-            counter_enable <= 1;
-            counter_reset  <= 0;
+            fc_window_cnt <= 0;
+        end else if (fc_window_cnt == FC_SNAP_INTERVAL - 1) begin
+            fc_window_cnt    <= 0;
+            fc_cap_tgl       <= ~fc_cap_tgl;
+            fc_window_at_top <= 1'b1;
         end else begin
-            case (fc_state)
-                4'd0: begin // SAMPLE
-                    fc_window_cnt <= fc_window_cnt + 1;
-                    if (fc_window_cnt == FC_SNAP_INTERVAL - 1) begin
-                        counter_enable <= 1'b0;
-                        fc_settle      <= 0;
-                        fc_state       <= 4'd1;
-                    end
-                end
-                4'd1: begin // DISCONNECT (settle ripple)
-                    fc_settle <= fc_settle + 1;
-                    if (fc_settle == 4'd4) fc_state <= 4'd2;
-                end
-                4'd2: begin // READ
-                    count_snap <= fc_count;
-                    snap_pulse <= 1'b1;
-                    fc_settle  <= 0;
-                    fc_state   <= 4'd3;
-                end
-                4'd3: begin // RESET counter
-                    counter_reset <= 1'b1;
-                    fc_settle     <= fc_settle + 1;
-                    if (fc_settle == 4'd4) fc_state <= 4'd4;
-                end
-                4'd4: begin // RECONNECT
-                    counter_reset  <= 1'b0;
-                    counter_enable <= 1'b1;
-                    fc_window_cnt  <= 0;
-                    fc_state       <= 4'd0;
-                end
-            endcase
+            fc_window_cnt <= fc_window_cnt + 1;
+        end
+    end
+
+    // ---- sys_clk domain: toggle CDC + edge detect ----
+    reg [1:0] fc_cap_sync_sys = 0;
+    reg       fc_cap_prev_sys = 0;
+    always @(posedge sys_clk) begin
+        fc_cap_sync_sys <= {fc_cap_sync_sys[0], fc_cap_tgl};
+        fc_cap_prev_sys <= fc_cap_sync_sys[1];
+    end
+    wire fc_snap_sys = fc_cap_sync_sys[1] ^ fc_cap_prev_sys;
+
+    // ---- sys_clk domain: synchronous counter + single-pulse snap-and-reset ----
+    reg [31:0] fc_count   = 0;
+    reg [31:0] fc_snapped = 0;
+    always @(posedge sys_clk) begin
+        if (fc_snap_sys) begin
+            fc_snapped <= fc_count;
+            fc_count   <= 32'd1;   // this edge counts as 1 toward the new window
+        end else begin
+            fc_count <= fc_count + 1'b1;
+        end
+    end
+
+    // ---- clk domain: 2-FF sync fc_snapped + latch on next window pulse ----
+    reg [31:0] snap_sync1 = 0, snap_sync2 = 0;
+    always @(posedge clk) begin
+        snap_sync1 <= fc_snapped;
+        snap_sync2 <= snap_sync1;
+    end
+
+    reg [31:0] count_snap = 0;
+    reg        snap_pulse = 0;
+    always @(posedge clk) begin
+        snap_pulse <= 1'b0;
+        if (fc_window_at_top) begin
+            // snap_sync2 holds the count from the PREVIOUS window — by now
+            // it has had a full 16.67 ms to propagate through CDC at any
+            // sys_clk we care about. One-window display lag is invisible.
+            count_snap <= snap_sync2;
+            snap_pulse <= 1'b1;
         end
     end
 
@@ -280,11 +276,10 @@ module top_ntsc (
     // =========================================================================
     // gold CE divider — should be MUCH larger than the DUT's cycles-per-call
     // so PH_GOLD's wall-time is dominated by the slow CE pacing rather than by
-    // DUT throughput. blake3 takes ~30 cycles → 256 is plenty. chaos_amp_v2
-    // takes ~514 cycles → 256 is too small and gold runs at the same rate as
-    // test (the DUT is the bottleneck). 4096 restores an ~8x gold/test ratio.
+    // DUT throughput. blake3 takes ~30 cycles → 256 gives ~8.5:1. chaos_amp_v2
+    // takes 514 cycles → 8 × 514 = 4112 gives exact 8:1 effective ratio.
 `ifdef DUT_CHAOS_AMP_V2
-    localparam CE_GOLD_DIV = 4096;
+    localparam CE_GOLD_DIV = 4112;  // 8 × 514 cycles per chaos_amp_v2 call
 `else
     localparam CE_GOLD_DIV = 256;
 `endif
@@ -1747,21 +1742,22 @@ module top_ntsc (
     // Protocol counter + accumulator + phase FSM
     // =========================================================================
 
-    // Split counter: registered carry between halves to break 18-bit carry chain.
+    // Split counter: registered carry between halves to break the carry chain.
     // Each half is 9 bits (4-5 CCU2C stages), ~1ns carry — good to 500+ MHz.
+    //
+    // Total cycles = 2^12 = 4096. Done fires when proto_hi reaches 8 (proto_hi[3]
+    // set), i.e. after 8 × 512 = 4096 advances. Warmup = first 1024 cycles
+    // (proto_hi 0..1), accumulate = cycles 1024..4095 (proto_hi 2..7), giving
+    // the same 25%/75% warmup/accumulate split as the original 2^17 design.
     reg [8:0] proto_lo;
     reg [8:0] proto_hi;
     reg       proto_carry;  // registered carry from lo to hi
-    wire       proto_done = proto_hi[8];             // bit tap: done at 131072
-    // `accumulating` is intended to mean "proto_hi >= 64" — a single
-    // contiguous window from sample 32768 to 131071. The original code used a
-    // bare bit-tap `proto_hi[6]` which is NOT equivalent: bit 6 toggles 4
-    // times across the 0..256 sweep (off / on / off / on), giving two
-    // disjoint accumulating windows instead of one. Visually that shows up as
-    // the top-right pixel blinking twice per phase. Replace with `>= 64`
-    // implemented as `proto_hi[7] | proto_hi[6]` — same 1-LUT cost, correct
-    // single-window semantics.
-    wire       accumulating = (proto_hi[7] | proto_hi[6]) & ~proto_done;
+    wire       proto_done = proto_hi[3];             // bit tap: done at 4096
+    // `accumulating` = "proto_hi >= 2", a single contiguous window from
+    // sample 1024 to 4095. (proto_hi[2] | proto_hi[1]) covers proto_hi
+    // values 2..7; ANDing with ~proto_done masks proto_hi ≥ 8 (which we
+    // never actually reach since the counter stops at done).
+    wire       accumulating = (proto_hi[2] | proto_hi[1]) & ~proto_done;
     reg [31:0] accum;
     reg [31:0] gold_reg = 0, test_reg = 0;
     reg        test_done_sys = 0;
@@ -2115,21 +2111,31 @@ module top_ntsc (
     end
     wire [3:0] fc_gy = wr_row[3:0];
 
+    // kHz integer display: 7 BCD digits, right-justified in slots 1..7.
+    // Slot 0 is always empty. Leading zeros suppressed up through slot 6;
+    // slot 7 (BCD[3:0]) always visible so a "0" reading shows as "0" not
+    // blank. Underlying milli_mhz == kHz (1 milli-MHz = 1 kHz), so the
+    // displayed integer IS the frequency in kHz. No decimal point — at
+    // ring/divider operating points we don't have sub-kHz resolution
+    // anyway (1/60 sec window → ±1 kHz LSB).
     wire fc_suppress_p0 = (display_bcd[27:24] == 4'd0);
     wire fc_suppress_p1 = fc_suppress_p0 && (display_bcd[23:20] == 4'd0);
     wire fc_suppress_p2 = fc_suppress_p1 && (display_bcd[19:16] == 4'd0);
+    wire fc_suppress_p3 = fc_suppress_p2 && (display_bcd[15:12] == 4'd0);
+    wire fc_suppress_p4 = fc_suppress_p3 && (display_bcd[11: 8] == 4'd0);
+    wire fc_suppress_p5 = fc_suppress_p4 && (display_bcd[ 7: 4] == 4'd0);
 
     reg [3:0] fc_freq_slot;
     reg       fc_freq_slot_valid;
     always @(*) begin
         case (fc_freq_pos)
-            3'd0: begin fc_freq_slot = display_bcd[27:24]; fc_freq_slot_valid = !fc_suppress_p0; end
-            3'd1: begin fc_freq_slot = display_bcd[23:20]; fc_freq_slot_valid = !fc_suppress_p1; end
-            3'd2: begin fc_freq_slot = display_bcd[19:16]; fc_freq_slot_valid = !fc_suppress_p2; end
-            3'd3: begin fc_freq_slot = display_bcd[15:12]; fc_freq_slot_valid = 1'b1; end
-            3'd4: begin fc_freq_slot = 4'd10;              fc_freq_slot_valid = 1'b1; end // '.'
-            3'd5: begin fc_freq_slot = display_bcd[11: 8]; fc_freq_slot_valid = 1'b1; end
-            3'd6: begin fc_freq_slot = display_bcd[ 7: 4]; fc_freq_slot_valid = 1'b1; end
+            3'd0: begin fc_freq_slot = 4'd0;               fc_freq_slot_valid = 1'b0; end // empty
+            3'd1: begin fc_freq_slot = display_bcd[27:24]; fc_freq_slot_valid = !fc_suppress_p0; end
+            3'd2: begin fc_freq_slot = display_bcd[23:20]; fc_freq_slot_valid = !fc_suppress_p1; end
+            3'd3: begin fc_freq_slot = display_bcd[19:16]; fc_freq_slot_valid = !fc_suppress_p2; end
+            3'd4: begin fc_freq_slot = display_bcd[15:12]; fc_freq_slot_valid = !fc_suppress_p3; end
+            3'd5: begin fc_freq_slot = display_bcd[11: 8]; fc_freq_slot_valid = !fc_suppress_p4; end
+            3'd6: begin fc_freq_slot = display_bcd[ 7: 4]; fc_freq_slot_valid = !fc_suppress_p5; end
             3'd7: begin fc_freq_slot = display_bcd[ 3: 0]; fc_freq_slot_valid = 1'b1; end
         endcase
     end
