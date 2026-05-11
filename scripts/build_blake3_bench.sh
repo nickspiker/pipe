@@ -96,8 +96,8 @@ cd "$BUILD"
 yosys -p "
     read_verilog $BLAKE3_RTL/blake3.v
     read_verilog $RTL/ssd1306_i2c.v
-    read_verilog $DEFINES $RTL/top_blake3_bench.v
-    synth_ecp5 -nowidelut -abc2 -top top_ntsc -json $BUILD/blake3_bench.json
+    read_verilog $DEFINES $RTL/top_dut_bench.v
+    synth_ecp5 -nowidelut -abc2 -top top_dut_bench -json $BUILD/blake3_bench.json
     stat
 " > "$BUILD/blake3_bench_yosys.log" 2>&1
 cd - > /dev/null

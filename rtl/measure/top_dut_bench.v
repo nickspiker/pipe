@@ -7,7 +7,7 @@
 // CRT shows: gold hash (bottom strip), test hash (top strip, flipped CRT).
 // Output: J1 pin 1 (R0, C4) = sync, J1 pin 2 (G0, D4) = video
 
-module top_ntsc (
+module top_dut_bench (
     input  wire clk,       // 25 MHz oscillator (P6)
     output reg  led,       // LED on T6 (active-low) — geiger random (alive indicator)
     output wire ext_led,   // T2 (J4 pin 6) — keypad LED, solid ON = pass, OFF = fail
