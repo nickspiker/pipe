@@ -57,11 +57,43 @@ module top_ntsc (
     // skew across blake3's wide datapath causes setup/hold failures even
     // at frequencies far below silicon Fmax. The (* noglobal *) on ring_q
     // keeps the oscillator loop itself fast (no DCCA delay inside the ring).
+`ifdef RING_DIV
+    // Arbitrary integer divider: sys_clk = ring_freq / RING_DIV. RING_DIV
+    // must be ≥ 2. Implemented as a modulo-N counter (the "second ring":
+    // cycles through N states). Output is high for the first floor(N/2)
+    // states, low for the rest — exact 50% duty for even N, off-by-one
+    // duty for odd N. Downstream FFs only sample rising edges so duty
+    // asymmetry is harmless. Two DCCAs consumed: one buffers the raw
+    // ring onto the global net (so the counter is reliably clocked), one
+    // buffers the divided output as the final sys_clk.
+    wire sys_clk_raw;
+    (* keep *) DCCA dcca_ring_raw (
+        .CLKI(ring_q[0]),
+        .CE  (1'b1),
+        .CLKO(sys_clk_raw)
+    );
+    localparam integer DIV_W = ($clog2(`RING_DIV) > 0) ? $clog2(`RING_DIV) : 1;
+    reg [DIV_W-1:0] ring_div_cnt = 0;
+    reg             ring_div_out = 0;
+    always @(posedge sys_clk_raw) begin
+        if (ring_div_cnt == (`RING_DIV - 1))
+            ring_div_cnt <= 0;
+        else
+            ring_div_cnt <= ring_div_cnt + 1'b1;
+        ring_div_out <= (ring_div_cnt < (`RING_DIV >> 1));
+    end
+    (* keep *) DCCA dcca_sys_clk (
+        .CLKI(ring_div_out),
+        .CE  (1'b1),
+        .CLKO(sys_clk)
+    );
+`else
     (* keep *) DCCA dcca_sys_clk (
         .CLKI(ring_q[0]),
         .CE  (1'b1),
         .CLKO(sys_clk)
     );
+`endif
     assign pll_lock = 1'b1;
 `elsif PLL_CLKFB_DIV
     (* ICP_CURRENT="12" *) (* LPF_RESISTOR="8" *)

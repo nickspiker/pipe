@@ -59,8 +59,18 @@ if [ -n "${RING:-}" ]; then
     fi
     DEFINES="$DEFINES -DRING_STAGES=$RING"
     PNR_EXTRA="--ignore-loops --timing-allow-fail"
+    if [ -n "${RING_DIV:-}" ]; then
+        if [ "$RING_DIV" -lt 2 ]; then
+            echo "ERROR: RING_DIV=$RING_DIV must be ≥ 2 (modulo-N counter)" >&2
+            exit 1
+        fi
+        DEFINES="$DEFINES -DRING_DIV=$RING_DIV"
+        DIV_DESC=" /$RING_DIV"
+    else
+        DIV_DESC=""
+    fi
     echo "================================================================"
-    echo " chaos_amp_v2 bench on internal ring oscillator: 1 NOT + $((RING-1)) BUFs"
+    echo " chaos_amp_v2 bench on internal ring oscillator: 1 NOT + $((RING-1)) BUFs${DIV_DESC}"
     echo " sys_clk = ring output via DCCA. Frequency on OLED top row."
     echo "================================================================"
 elif [ "$FREQ" != "25" ]; then
