@@ -2,10 +2,7 @@
 //!
 //! Bit-exact match to `rtl/codec.v`. Both sides follow the encode/decode rules in `PROTOCOL.md`:
 //!
-//! ```text
-//! wire    = own_idle   ^ tx_data ^ other_last
-//! decoded = wire       ^ other_idle ^ own_last
-//! ```
+//! ```text wire    = own_idle   ^ tx_data ^ other_last decoded = wire       ^ other_idle ^ own_last ```
 //!
 //! `own_idle` is `1` for the enclave instance and `0` for the host instance. Each side keeps two single-bit registers (`own_last`, `other_last`) initialised to 0; they update at slot boundaries based on whose slot it was.
 
@@ -181,8 +178,7 @@ mod tests {
         );
     }
 
-    /// Reproduces the wire pattern in `PROTOCOL.md` "Host injects one `1` at slot 11" example.
-    /// The 8-slot window starting at slot 8 should read: E h E H e h E h.
+    /// Reproduces the wire pattern in `PROTOCOL.md` "Host injects one `1` at slot 11" example. The 8-slot window starting at slot 8 should read: E h E H e h E h.
     #[test]
     fn protocol_md_example_host_injects_one() {
         let mut enc = Codec::enclave();
@@ -200,9 +196,7 @@ mod tests {
                 wire.push(w);
             }
         }
-        // Expected wire (from PROTOCOL.md example):
-        // slot:  0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-        // wire:  1 0 1 0 1 0 1 0 1 0  1  1  0  0  1  0
+        // Expected wire (from PROTOCOL.md example): slot:  0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 wire:  1 0 1 0 1 0 1 0 1 0  1  1  0  0  1  0
         let expected = vec![1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0];
         assert_eq!(wire, expected);
     }

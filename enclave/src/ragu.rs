@@ -2,9 +2,7 @@
 //!
 //! PIPE silicon is a *primitive*, not a protocol. It computes:
 //!
-//! ```text
-//! ragu = BLAKE3_keyed(key, chaos_amp(input) || input)
-//! ```
+//! ```text ragu = BLAKE3_keyed(key, chaos_amp(input) || input) ```
 //!
 //! where `input` is a 64-byte block supplied by the caller. The semantics of the input — what it represents, how it's layered, what domain it belongs to — is the kernel's responsibility.
 //!

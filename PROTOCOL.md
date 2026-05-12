@@ -2,30 +2,47 @@
 
 Single-wire, full-duplex, self-clocking, DC-balanced line code for the PIPE attestation channel. This document is the canonical reference both the silicon (Verilog) and host (Rust) implementations build against.
 
+## Layer 0 — physical topology
+
+The wire is a single PCB trace with a 400 Ω series resistor between each side's I/O pin and a passive 5 kΩ pull-down to GND:
+
+```
+ECP5 pin ──/\/\──┬──/\/\──FT232H pin
+       400 Ω    │    400 Ω
+                ⏚ 5 kΩ pull-down to GND
+```
+
+**Drive rules.** Neither side ever actively drives LOW. They drive HIGH (overriding the pull-down) or release to HIGH-Z (pull-down wins, line goes LOW). LOW is a *passive* state of the wire, set by the pull-down whenever no driver is active. This makes the wire's behavior deterministic in every regime — silent, half-driven, contended — without any "what-if-both-tristate" edge cases.
+
 ## Layer 1 — slot ownership
 
 Time on the wire is divided into **slots**, each one bit-time `T` long. Slot index `s` increments every `T`. Slots alternate ownership:
 
 | s mod 2 | owner | direction |
 |---|---|---|
-| 0 (even) | enclave | drives push-pull; host samples |
-| 1 (odd)  | host    | drives push-pull; enclave samples |
+| 0 (even) | enclave | drives HIGH or releases; host samples |
+| 1 (odd)  | host    | drives HIGH or releases; enclave samples |
 
-Both sides drive their own slots **always** — even in idle. The off-side is HIGH-Z. There is no pull-up or pull-down on the line; with exactly one driver per slot at all times, the line is never floating and never contended.
+Only the slot owner is permitted to drive. The off-side is always HIGH-Z. Within an owner's slot, whether the owner drives or releases depends on the codec's `wire_out` (see Layer 2): drive HIGH if `wire_out == 1`, release if `wire_out == 0`.
 
-Slot phase (which slot count is currently `s mod 2 == 0`) is established at boot from the idle pattern (see Layer 2) and tracked thereafter by the host's CDR.
+In idle, this gives the enclave 100% drive duty on its even slots (idle `wire_out` = 1) and 0% drive duty on the host's odd slots (idle `wire_out` = 0, pull-down handles it). The host is fully passive in idle — zero current.
 
-## Layer 2 — line code: mirror-XOR
+Slot phase is established at boot from the idle pattern (see Layer 2) and tracked thereafter by the host's CDR.
+
+## Layer 2 — line code: mirror-XOR with asymmetric drive
 
 Each side maintains a **data stream** — a sequence of bits it intends to communicate. In idle, both streams are constant zero; activity is signaled simply by inserting non-zero bits.
 
 ### Encode rule
 
-When it is your slot, drive the wire with:
+When it is your slot, compute:
 
 ```
-wire[s] = own_idle  XOR  own_data[i]  XOR  other_last_data
+wire_out  = own_idle  XOR  own_data[i]  XOR  other_last_data
+drive_en  = my_slot  AND  wire_out
 ```
+
+If `drive_en == 1` → drive the pin HIGH. If `drive_en == 0` → release the pin (HIGH-Z, pull-down holds the line LOW).
 
 where:
 
@@ -53,13 +70,16 @@ Two single-bit registers, both initialized to 0:
 - `own_last_data` — what you most recently drove (updated at end of each of your slots)
 - `other_last_data` — what you most recently decoded from the other side (updated at end of each of their slots)
 
-### Properties (verified by example below)
+### Properties
 
-1. **Self-clocking idle.** Both streams = 0 → wire = `1 0 1 0 1 0 …` (alternation by slot ownership). 100% edge density.
-2. **DC-balanced for arbitrary data.** A `1` from one side gets compensated on the next slot's other-side drive via the `other_last_data` XOR term. Wire mean stays 50/50 after at most a 1-slot startup transient.
-3. **No doorbell, no framing primitive at this layer.** A `1` in your data stream is enough — the receiver picks it up the same slot it appears.
-4. **Full duplex with independent streams.** Encode and decode are self-inverse XOR operations; the two streams are decoded independently by each side without coordination.
-5. **Single-edge interference window.** A data bit perturbs the wire only at its own slot and the next slot; thereafter the wire returns to a phase-shifted alternation that is still 50/50 and still self-clocking.
+1. **Self-clocking idle.** Both streams = 0 → wire = `1 0 1 0 1 0 …`. Enclave actively drives the `1`s on even slots; pull-down handles the `0`s on odd slots. 100% edge density.
+2. **Host is fully passive in idle.** With `own_idle = 0`, idle `wire_out = 0`, so `drive_en = 0`. Host's pin sits HIGH-Z drawing zero current; the pull-down resistor accounts for the host's contribution to the heartbeat.
+3. **CDR locks to enclave drives, ignores pull-down level.** Edge density is 100% in idle, and all edges are produced by the enclave's active HIGH drives on even slots.
+4. **DC-balanced for arbitrary data.** A `1` from one side gets compensated on the next slot's other-side drive via the `other_last_data` XOR term. Wire mean stays 50/50 after at most a 2-slot transient.
+5. **No doorbell, no framing primitive at this layer.** A `1` in your data stream is enough — the receiver picks it up the same slot it appears.
+6. **Full duplex with independent streams.** Encode and decode are self-inverse XOR operations; the two streams are decoded independently by each side without coordination.
+7. **Mirror-XOR compensation can force a side to drive HIGH even with its own data = 0.** If `other_last_data = 1` and `own_data = 0`, the host's `wire_out = 0 XOR 0 XOR 1 = 1` → host drives HIGH. The compensation is what maintains DC balance after the other side transmitted a `1`.
+8. **Wire is deterministic in every regime.** Both sides driving, one silent, both silent — all map to defined wire patterns via the pull-down. There is no floating state to design around.
 
 ### XOR offset N — generalization for line delay
 
@@ -87,64 +107,105 @@ For the current FT232H prototype, `N = 1` and this section is dormant.
 
 ### Worked examples
 
-**Idle (both sides forever 0):**
+Notation per slot column: the action taken (`drive HIGH` or `release → pull-down LOW`) and the resulting wire value. Both sides see the same wire.
+
+**Example 1 — Pure idle (both data streams forever 0).**
 
 ```
-slot:    0 1 2 3 4 5 6 7
-own:     e h e h e h e h
-e_data:  0 . 0 . 0 . 0 .
-h_data:  . 0 . 0 . 0 . 0
-wire:    1 0 1 0 1 0 1 0       (E h E h E h E h)
+slot:    0    1    2    3    4    5    6    7
+owner:   E    H    E    H    E    H    E    H
+e_data:  0         0         0         0
+h_data:       0         0         0         0
+
+E slot:  wire_out = 1^0^0 = 1 → drive HIGH
+H slot:  wire_out = 0^0^0 = 0 → release   (pull-down → LOW)
+
+wire:    1    0    1    0    1    0    1    0
 ```
 
-**Host injects one `1` at slot 11 (otherwise idle):**
+Enclave drives 100% of the highs. Host stays HIGH-Z, draws zero current. Pull-down handles every LOW.
+
+**Example 2 — Host sends a single 1 at slot 5.**
 
 ```
-slot:     8 9 10 11 12 13 14
-own:      e h e  h  e  h  e
-e_data:   0 . 0  .  0  .  0
-h_data:   . 0 .  1  .  0  .
-wire[8]  = 1 ^ 0 ^ 0           = 1   E
-wire[9]  = 0 ^ 0 ^ 0           = 0   h
-wire[10] = 1 ^ 0 ^ h_data[9]=0 = 1   E
-wire[11] = 0 ^ 1 ^ e_data[10]=0 = 1  H   ← host's 1
-wire[12] = 1 ^ 0 ^ h_data[11]=1 = 0  e   ← enclave compensates
-wire[13] = 0 ^ 0 ^ e_data[12]=0 = 0  h
-wire[14] = 1 ^ 0 ^ h_data[13]=0 = 1  E
+slot:    0  1  2  3  4  5  6  7  8
+owner:   E  H  E  H  E  H  E  H  E
+h_data:     0     0     1     0
+e_data:  0     0     0     0     0
+
+slot 4 (E):  wire_out = 1^0^0 = 1 → drive HIGH       wire = 1
+slot 5 (H):  wire_out = 0^1^0 = 1 → drive HIGH       wire = 1   ← host's 1
+             enclave decodes: wire(1) ^ 0 ^ own_last(0) = 1
+             enclave's other_last ← 1
+slot 6 (E):  wire_out = 1^0^1 = 0 → release          wire = 0   ← enclave compensates
+slot 7 (H):  wire_out = 0^0^0 = 0 → release          wire = 0
+slot 8 (E):  wire_out = 1^0^0 = 1 → drive HIGH       wire = 1
 ```
 
-DC over the 4-slot window `EHeh` is `1 1 0 0` = 50/50 ✓
+Slots 4–7 form a `1 1 0 0` window — DC-balanced ✓. Enclave's release on slot 6 is the mirror-XOR compensation that restores balance.
 
-**Both inject `1` at the same window:**
-
-```
-e_data:   . 0 . 1 . 0 .
-h_data:   1 . 0 . 0 . 0       (host_data[5]=1, host_data[6]=0)
-wire[10] = 1 ^ 0 ^ 0           = 1  E
-wire[11] = 0 ^ 1 ^ 0           = 1  H
-wire[12] = 1 ^ 1 ^ 1           = 1  E   ← enclave drives 1 (its data), no compensation
-wire[13] = 0 ^ 0 ^ 1           = 1  H   ← host mirrors enclave's 1
-wire[14] = 1 ^ 0 ^ 0           = 1  E
-```
-
-Pattern `EHEH` over 4 slots = all-1s instantaneously, but offset by surrounding 50/50 idle and a brief 1-slot debit.
-
-**Pathological all-ones host stream (forever):**
+**Example 3 — Enclave sends a single 1 at slot 4.**
 
 ```
-host_data: . 1 . 1 . 1 . 1 . 1
-e_data:    0 . 0 . 0 . 0 . 0 .
-wire[0]  = 1 ^ 0 ^ 0 = 1   E
-wire[1]  = 0 ^ 1 ^ 0 = 1   H
-wire[2]  = 1 ^ 0 ^ 1 = 0   e
-wire[3]  = 0 ^ 1 ^ 0 = 1   H
-wire[4]  = 1 ^ 0 ^ 1 = 0   e
-wire[5]  = 0 ^ 1 ^ 0 = 1   H
-...
-wire = 1 1 0 1 0 1 0 1 0 1 ...
+slot:    0  1  2  3  4  5  6  7  8
+owner:   E  H  E  H  E  H  E  H  E
+e_data:  0     0     1     0     0
+h_data:     0     0     0     0
+
+slot 3 (H):  wire_out = 0^0^0 = 0 → release          wire = 0
+slot 4 (E):  wire_out = 1^1^0 = 0 → release          wire = 0   ← enclave's 1
+             host decodes: wire(0) ^ 1 ^ own_last(0) = 1
+             host's other_last ← 1
+slot 5 (H):  wire_out = 0^0^1 = 1 → drive HIGH       wire = 1   ← host compensates
+slot 6 (E):  wire_out = 1^0^0 = 1 → drive HIGH       wire = 1
+slot 7 (H):  wire_out = 0^0^0 = 0 → release          wire = 0
 ```
 
-After a 1-slot startup transient, wire = `1 0 1 0 1 0 …` — same alternating pattern as idle, just phase-shifted. DC = 50/50 ✓
+Slots 4–7 = `0 1 1 0`, DC-balanced ✓. **Critical:** in slot 5 the host actively drove HIGH even though its data was 0. The compensation term forced it. Host's `drive_en` is *not* "only when I have data" — it's `my_slot AND wire_out`, and the XOR coupling can make `wire_out = 1` with `own_data = 0`.
+
+**Example 4 — Both sides send 1 in the same exchange window.**
+
+```
+slot:    0  1  2  3  4  5  6  7  8
+owner:   E  H  E  H  E  H  E  H  E
+e_data:  0     0     1     0     0
+h_data:     0     0     1     0     0
+
+slot 4 (E):  wire_out = 1^1^0 = 0 → release          wire = 0  ← E's 1
+             host decodes: wire(0)^1^0 = 1 → other_last_h ← 1
+slot 5 (H):  wire_out = 0^1^1 = 0 → release          wire = 0  ← H's 1 (XOR'd away by cross-term)
+             enclave decodes: wire(0)^0^own_last_e(=1) = 1 → other_last_e ← 1
+slot 6 (E):  wire_out = 1^0^1 = 0 → release          wire = 0
+             host decodes: wire(0)^1^own_last_h(=1) = 0 → other_last_h ← 0
+slot 7 (H):  wire_out = 0^0^0 = 0 → release          wire = 0
+slot 8 (E):  wire_out = 1^0^0 = 1 → drive HIGH       wire = 1
+```
+
+Four consecutive LOWs on the wire, but both sides correctly decode the other's 1, and the chain converges back to idle by slot 8. CDR has enough edge history from prior idle to coast through the dropout.
+
+**Example 5 — Host sends a 4-bit message `1 0 1 1` starting at slot 1.**
+
+```
+slot:    0  1  2  3  4  5  6  7  8  9
+owner:   E  H  E  H  E  H  E  H  E  H
+e_data:  0     0     0     0     0     0
+h_data:     1     0     1     1     0     0
+
+wire:    1  1  0  0  1  1  0  1  0  0  …
+
+slot 0 (E): 1^0^0=1 → HIGH                                       (idle)
+slot 1 (H): 0^1^0=1 → HIGH      E rx = 1^0^0 = 1, ol_e ← 1
+slot 2 (E): 1^0^1=0 → release   H rx = 0^1^1 = 0, ol_h ← 0       (E compensates)
+slot 3 (H): 0^0^0=0 → release   E rx = 0^0^0 = 0, ol_e ← 0
+slot 4 (E): 1^0^0=1 → HIGH      H rx = 1^1^0 = 0, ol_h ← 0
+slot 5 (H): 0^1^0=1 → HIGH      E rx = 1^0^0 = 1, ol_e ← 1
+slot 6 (E): 1^0^1=0 → release   H rx = 0^1^1 = 0, ol_h ← 0
+slot 7 (H): 0^1^0=1 → HIGH      E rx = 1^0^0 = 1, ol_e ← 1
+slot 8 (E): 1^0^1=0 → release   H rx = 0^1^1 = 0, ol_h ← 0
+slot 9 (H): 0^0^0=0 → release   E rx = 0^0^0 = 0, ol_e ← 0       (back to idle)
+```
+
+Decoded by enclave: `1, 0, 1, 1` ✓. Each host `1` triggers a one-slot enclave compensation (release in next E slot). The pattern is fully self-clocking and DC-balanced over each pair.
 
 ## Layer 2.5 — host clock recovery
 
@@ -187,6 +248,10 @@ H_resp         : 256 bits   — XOR pad for the "hash" half of next exchange
 ```
 
 `H_req` and `H_resp` ratchet on every verified exchange (see below). All three reset on fresh-session.
+
+### Initiate bit
+
+**Every message from either side begins with a logical `1` as its first transmitted bit.** This is what announces "I am about to transmit a message" — the wire transitions out of pull-down LOW (host slot idle) or out of pull-down LOW after an enclave release on its slot, into a driven HIGH. Without this rule, a message whose first encoded bit happens to be `0` would be indistinguishable from continued idle, since both would result in a passive LOW host slot. The initiate bit is the first bit of the payload, not extra framing: fresh-session is `1, 0, 0, …, 0` (256 bits with leading 1); authenticated payloads are 512 bits with the first bit forced to 1 (the sender constrains `message[0]` so that `X1[0] = message[0] XOR H_req[0] = 1`).
 
 ### Message shape A — fresh-session (host → enclave, then enclave → host)
 

@@ -2,20 +2,11 @@
 // top_pipe_split.v — TX-tristate-clocked + RX-only split bidir
 // =============================================================================
 //
-// E16 (pipe_tx_pad): bidir, periodically tristates. Drives `latched` when
-// active; releases the bus during the sample window so the host's drive
-// (if any) can pull the wire.
-// F15 (pipe_rx_pad): pure IBUF, reads the shorted node continuously. During
-// E16's tristate window F15 sees the wire voltage (host or floating);
-// during E16's drive window F15 sees E16's drive (used as a sanity bit).
+// E16 (pipe_tx_pad): bidir, periodically tristates. Drives `latched` when active; releases the bus during the sample window so the host's drive (if any) can pull the wire. F15 (pipe_rx_pad): pure IBUF, reads the shorted node continuously. During E16's tristate window F15 sees the wire voltage (host or floating); during E16's drive window F15 sees E16's drive (used as a sanity bit).
 //
-// Behaviour: at sample-window time, latch F15's reading into `latched`.
-// `latched` is what E16 drives during the next drive phase. A host write
-// (HIGH or LOW) is captured during the sample window and held by E16 on
-// the subsequent drive cycles — including after the host releases.
+// Behaviour: at sample-window time, latch F15's reading into `latched`. `latched` is what E16 drives during the next drive phase. A host write (HIGH or LOW) is captured during the sample window and held by E16 on the subsequent drive cycles — including after the host releases.
 //
-// Tristate window is ~32 cycles of 8 cycles wide (every 256 enclave_clks);
-// at 600 kHz enclave_clk that's a 13.3 µs sample window every 426 µs.
+// Tristate window is ~32 cycles of 8 cycles wide (every 256 enclave_clks); at 600 kHz enclave_clk that's a 13.3 µs sample window every 426 µs.
 //
 // =============================================================================
 

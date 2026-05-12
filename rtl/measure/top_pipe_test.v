@@ -2,15 +2,9 @@
 // top_pipe_test.v — TX-only wire smoke test
 // =============================================================================
 //
-// Minimum viable "is the wire alive" experiment. The enclave drives the
-// PIPE pad with a 1010 square wave at the slot rate. No codec, no listen
-// path yet — just enough to verify the pad+slot_clk+wire_io chain produces
-// a clean signal a host can sample.
+// Minimum viable "is the wire alive" experiment. The enclave drives the PIPE pad with a 1010 square wave at the slot rate. No codec, no listen path yet — just enough to verify the pad+slot_clk+wire_io chain produces a clean signal a host can sample.
 //
-// Clock source: same ring oscillator + mod-N divider used in the DUT
-// bench, so the wire bit rate tracks the actual production sys_clk
-// (≈600 kHz / DIV_SLOT). At DIV_SLOT = 12 the wire toggles at ~25 kHz
-// (one full period per 2 slots).
+// Clock source: same ring oscillator + mod-N divider used in the DUT bench, so the wire bit rate tracks the actual production sys_clk (≈600 kHz / DIV_SLOT). At DIV_SLOT = 12 the wire toggles at ~25 kHz (one full period per 2 slots).
 //
 // Defines (set by build script):
 //   RING_STAGES   — ring-osc stage count (required)
@@ -82,9 +76,7 @@ module top_pipe_test (
     always @(posedge enclave_clk) if (!por_done) por_cnt <= por_cnt + 1'b1;
 
     // -------------------------------------------------------------------------
-    // Slot clock — divide enclave_clk by SLOT_DIV. slot_tick fires once per
-    // slot; we use it to toggle tx_bit (the data we drive onto the wire) so
-    // the wire alternates 1010 at slot_rate / 2.
+    // Slot clock — divide enclave_clk by SLOT_DIV. slot_tick fires once per slot; we use it to toggle tx_bit (the data we drive onto the wire) so the wire alternates 1010 at slot_rate / 2.
     // -------------------------------------------------------------------------
     wire slot_tick;
     wire slot_my_slot_unused;  // not used in TX-only mode
@@ -115,8 +107,7 @@ module top_pipe_test (
     );
 
     // -------------------------------------------------------------------------
-    // LED liveness — divide slot_tick by 4096 for a visible blink. At
-    // ~50 kbps slot rate, 4096-slot period = ~80 ms = ~12 Hz LED flicker.
+    // LED liveness — divide slot_tick by 4096 for a visible blink. At ~50 kbps slot rate, 4096-slot period = ~80 ms = ~12 Hz LED flicker.
     // -------------------------------------------------------------------------
     reg [11:0] led_cnt = 0;
     reg        led_reg = 1'b1;     // T6 is active-low; start "off"

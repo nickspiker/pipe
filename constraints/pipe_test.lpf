@@ -16,7 +16,8 @@
 # =============================================================================
 
 LOCATE COMP "pipe_pad" SITE "E16";
-IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=DOWN;
+# PULLMODE=DOWN enables the ECP5's internal weak pull-down (~50–100 kΩ). On the production board there is also an external 5 kΩ pull-down to GND; the FPGA's internal pull is purely redundancy/defense-in-depth in case the external is unpopulated. Neither side ever actively drives LOW — codec's drive_en = my_slot AND wire_out, so HIGH-Z + pull-down handles every LOW.
 
 LOCATE COMP "led" SITE "T6";
 IOBUF PORT "led" IO_TYPE=LVCMOS33;

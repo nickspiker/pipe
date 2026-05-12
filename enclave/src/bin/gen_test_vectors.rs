@@ -7,9 +7,7 @@
 //!
 //! If argv[1] is omitted, only stdout output happens. Typical use:
 //!
-//! ```text
-//! cargo run --release --bin gen-test-vectors -- ../sim
-//! ```
+//! ```text cargo run --release --bin gen-test-vectors -- ../sim ```
 
 use pipe::{chaos_amp, ragu};
 use pipe::chaos_amp::state_to_bytes;

@@ -2,11 +2,7 @@
 // top_pipe_listen.v — Always-tristate diagnostic
 // =============================================================================
 //
-// FPGA pin is held in Hi-Z forever. Host has full control of the wire.
-// LED reflects whatever the wire shows (active-low, lit when wire is LOW).
-// This isolates the BB tristate path: if the host's drive on D7 is visible
-// when reading back through ADBUS7, the wiring is good and the issue with
-// top_pipe_latch.v is in the latch / sample-phase logic, not the IO buffer.
+// FPGA pin is held in Hi-Z forever. Host has full control of the wire. LED reflects whatever the wire shows (active-low, lit when wire is LOW). This isolates the BB tristate path: if the host's drive on D7 is visible when reading back through ADBUS7, the wiring is good and the issue with top_pipe_latch.v is in the latch / sample-phase logic, not the IO buffer.
 //
 // =============================================================================
 

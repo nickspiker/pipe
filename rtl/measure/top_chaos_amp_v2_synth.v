@@ -2,13 +2,9 @@
 // top_chaos_amp_v2_synth.v — Fmax bench for chaos_amp_v2.v (Dragonfly v2)
 // =============================================================================
 //
-// Same harness pattern as top_chaos_amp_synth.v (v1) but adapted for the
-// v2 module's narrower 384-bit state output and self-restart via state→input
-// path. Lets nextpnr time the FF→combinational-round→FF critical path.
+// Same harness pattern as top_chaos_amp_synth.v (v1) but adapted for the v2 module's narrower 384-bit state output and self-restart via state→input path. Lets nextpnr time the FF→combinational-round→FF critical path.
 //
-// Self-restart: at reset, in_data_r = 0 and start fires once. On every
-// `done`, we feed state_out (384b) back into in_data_r (512b) — high 128
-// bits are kept zero, low 384 from state_out — and re-pulse start.
+// Self-restart: at reset, in_data_r = 0 and start fires once. On every `done`, we feed state_out (384b) back into in_data_r (512b) — high 128 bits are kept zero, low 384 from state_out — and re-pulse start.
 //
 // Outputs:
 //   led      — toggles each completed chaos_amp_v2 call (~50 kHz at 50 MHz × 512 cycles)
@@ -59,8 +55,7 @@ module top_chaos_amp_v2_synth (
         end
     end
 
-    // XOR-fold state_out → 1 bit, drive to ext_led so synthesis can't
-    // optimise state_out away.
+    // XOR-fold state_out → 1 bit, drive to ext_led so synthesis can't optimise state_out away.
     wire [191:0] xf192 = state_out[383:192] ^ state_out[191:0];
     wire [ 95:0] xf96  = xf192[191:96]      ^ xf192[95:0];
     wire [ 47:0] xf48  = xf96[95:48]        ^ xf96[47:0];

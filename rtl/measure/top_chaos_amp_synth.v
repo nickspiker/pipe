@@ -2,16 +2,9 @@
 // top_chaos_amp_synth.v — minimal Fmax bench for chaos_amp.v
 // =============================================================================
 //
-// Wraps chaos_amp in a self-restarting feedback loop so nextpnr can time the
-// internal FF→combinational→FF critical path. The harness is intentionally
-// thin — no OLED, no I2C, no PRBS source — so chaos_amp's logic dominates
-// utilisation and the reported max-frequency reflects the chaos_amp critical
-// path almost exclusively.
+// Wraps chaos_amp in a self-restarting feedback loop so nextpnr can time the internal FF→combinational→FF critical path. The harness is intentionally thin — no OLED, no I2C, no PRBS source — so chaos_amp's logic dominates utilisation and the reported max-frequency reflects the chaos_amp critical path almost exclusively.
 //
-// Self-restart: at reset, in_data_r = 0 and start fires once. On every
-// `done`, we feed state_out back into in_data_r and pulse start again.
-// chaos_amp runs back-to-back forever; the critical path inside it is
-// continuously exercised.
+// Self-restart: at reset, in_data_r = 0 and start fires once. On every `done`, we feed state_out back into in_data_r and pulse start again. chaos_amp runs back-to-back forever; the critical path inside it is continuously exercised.
 //
 // Outputs:
 //   led      — bright while chaos_amp is mid-round, dim during done pulse
@@ -67,8 +60,7 @@ module top_chaos_amp_synth (
         end
     end
 
-    // XOR-fold state_out → 1 bit, drive to ext_led so synthesis can't optimise
-    // state_out away.
+    // XOR-fold state_out → 1 bit, drive to ext_led so synthesis can't optimise state_out away.
     wire [255:0] xf256 = state_out[511:256] ^ state_out[255:0];
     wire [127:0] xf128 = xf256[255:128] ^ xf256[127:0];
     wire [ 63:0] xf64  = xf128[127:64]  ^ xf128[63:0];

@@ -52,8 +52,7 @@ fn delay_cmds(target_clocks: u32) -> Vec<u8> {
 }
 
 fn calibrate_half_slot_bytes(ft: &mut Ft232h) -> Result<u16, ftdi_nusb::Error> {
-    // Sample 4096 bytes back-to-back. Each GET_BITS_LOW in this batch takes a fixed number of MPSSE cycles; measure the average bit period on ADBUS7 (the wire) to figure out how many GET_BITS_LOW commands correspond to one FPGA half-slot.
-    // Build a chunked sample stream that fits the FT232H's TX FIFO (~1 KB).
+    // Sample 4096 bytes back-to-back. Each GET_BITS_LOW in this batch takes a fixed number of MPSSE cycles; measure the average bit period on ADBUS7 (the wire) to figure out how many GET_BITS_LOW commands correspond to one FPGA half-slot. Build a chunked sample stream that fits the FT232H's TX FIFO (~1 KB).
     let mut samples = Vec::new();
     for _ in 0..4 {
         let chunk = ft.sample_low(256)?;
@@ -117,14 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut host_codec = Codec::host();
     let mut host_drives: Vec<u8> = Vec::with_capacity(PAIR_SLOTS);
 
-    // Each per-loop iteration uses 4 delay commands + 2 SET_BITS_LOW + 2
-    // GET_BITS_LOW. SET_BITS_LOW and GET_BITS_LOW take ~1 byte cycle each;
-    // Clock-For-N takes ~(N+2) byte cycles. We want total per-iter to equal
-    // exactly 2 × FPGA slot = 4 × half_slot_bytes byte cycles, so each
-    // delay's `bytes` arg should be half_slot_bytes - 1 (so its execution
-    // time is half_slot_bytes; the 4 setup cycles for SET/GET commands
-    // amount to the slack absorbed by leaving N slightly under target).
-    // Per pair: 4 SET/GET commands (1 clock cycle each) + 4 waits. Target = 2 FPGA slots = 4 × half_slot_clocks. So each wait should be half_slot_clocks - 1 clock cycles. With bit-granular delay_cmds() we can hit any integer value exactly.
+    // Each per-loop iteration uses 4 delay commands + 2 SET_BITS_LOW + 2 GET_BITS_LOW. SET_BITS_LOW and GET_BITS_LOW take ~1 byte cycle each; Clock-For-N takes ~(N+2) byte cycles. We want total per-iter to equal exactly 2 × FPGA slot = 4 × half_slot_bytes byte cycles, so each delay's `bytes` arg should be half_slot_bytes - 1 (so its execution time is half_slot_bytes; the 4 setup cycles for SET/GET commands amount to the slack absorbed by leaving N slightly under target). Per pair: 4 SET/GET commands (1 clock cycle each) + 4 waits. Target = 2 FPGA slots = 4 × half_slot_clocks. So each wait should be half_slot_clocks - 1 clock cycles. With bit-granular delay_cmds() we can hit any integer value exactly.
     //
     // Empirically, calibration tends to count slightly short (each GET_BITS_LOW takes a little more than 1 MPSSE clock to execute on this chip), so the same N edges span N+ε clock cycles. We add a small wait-time offset to compensate; if you see the wire pattern walk through phases, sweep WAIT_OFFSET ± a few clocks.
     let half_clocks = half_slot_bytes as u32;

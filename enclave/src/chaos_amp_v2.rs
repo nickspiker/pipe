@@ -14,18 +14,15 @@
 //!
 //! Snap-based parallel update — every bucket reads from a pre-round snapshot, so all 16 bucket updates are independent within a round (essential for combinational FPGA implementation):
 //!
-//! ```text
-//! snap = state.clone()
+//! ```text snap = state.clone()
 //!
-//! // Phase 1 — data-dependent op selection
-//! for i in 0..16:
+//! // Phase 1 — data-dependent op selection for i in 0..16:
 //!     val       = snap[i]
 //!     op_idx    = val[4:0]                        // 5 bits → 32-op menu
 //!     secondary = snap[(i + 11) & 15]
 //!     tmp[i]    = op_apply(op_idx, val, secondary) ^ ROUND_CONST[round] ^ pos_const(i, round)
 //!
-//! // Phase 2 — ARX cross-bucket diffusion
-//! for i in 0..16:
+//! // Phase 2 — ARX cross-bucket diffusion for i in 0..16:
 //!     near       = tmp[(i + 1) & 15]
 //!     far_rot    = rotate_left(tmp[(i + 7) & 15], 5)
 //!     state[i]   = (tmp[i] + near + far_rot) & BUCKET_MASK   // 24-bit wrap
@@ -39,38 +36,7 @@
 //!
 //! | idx | name        | source         | description                                     | lossy?         |
 //! |-----|-------------|----------------|-------------------------------------------------|----------------|
-//! | 0   | ADD         | Spirix         | `frac_a + frac_b`, `exp_a + exp_b` (wrapping)   | no             |
-//! | 1   | SUB         | Spirix         | wrapping subtract                                | no             |
-//! | 2   | MUL_LO      | Spirix         | wrapping multiply (low half)                     | no             |
-//! | 3   | AND         | Spirix         | bitwise AND                                      | YES            |
-//! | 4   | OR          | Spirix         | bitwise OR                                       | YES            |
-//! | 5   | XOR         | Spirix         | bitwise XOR                                      | no             |
-//! | 6   | ANDN        | Spirix         | `a & ~b`                                         | YES            |
-//! | 7   | NOT         | Spirix         | `~a ^ b`                                         | no             |
-//! | 8   | SHL         | Spirix         | left shift by secondary low 4 bits               | YES            |
-//! | 9   | SHR         | Spirix         | right shift by secondary low 4 bits              | YES            |
-//! | 10  | ROL_B       | Spirix         | rotate left by secondary low 4                   | no             |
-//! | 11  | ROR_B       | Spirix         | rotate right by secondary low 4                  | no             |
-//! | 12  | ROL_S       | chaos          | rotate left by self low 4 (high path entropy)    | no             |
-//! | 13  | NEG         | Spirix         | two's complement negate, XOR secondary            | no             |
-//! | 14  | ABS         | Spirix         | wrapping absolute value                           | YES            |
-//! | 15  | BSWAP       | chaos          | byte-swap fraction                                | no             |
-//! | 16  | MIN         | Spirix         | signed min(a, b)                                  | YES            |
-//! | 17  | MAX         | Spirix         | signed max(a, b)                                  | YES            |
-//! | 18  | POPCNT      | chaos          | low byte ← popcount(val^sec), top byte preserved  | YES (8b loss)  |
-//! | 19  | SAT_ADD     | chaos          | saturating add (clamp at MAX/MIN)                 | YES            |
-//! | 20  | SAT_SUB     | chaos          | saturating subtract                                | YES            |
-//! | 21  | CSWAP       | chaos          | branch on `frac_a < frac_b`, swap-rotate or XOR   | branch entropy |
-//! | 22  | GFMUL       | chaos          | GF(2⁸) multiply on low byte (AES polynomial)      | no (algebraic) |
-//! | 23  | PARITY      | chaos          | XOR-fold val to 1 bit, paint across all 24 bits   | EXTREME (23b)  |
-//! | 24  | BREV        | chaos          | bit-reverse fraction                               | no             |
-//! | 25  | NREV        | chaos          | nibble-reverse within bytes                        | no             |
-//! | 26  | AVG         | chaos          | rounded average of (a, b)                          | YES            |
-//! | 27  | LFSR_TICK   | chaos          | Galois LFSR step (taps 0xB400)                     | no             |
-//! | 28  | EXPAND_LO   | chaos          | replicate low byte across word                     | YES (8b loss)  |
-//! | 29  | SQUEEZE     | chaos          | XOR all bytes → 1 byte, paint across               | EXTREME (16b)  |
-//! | 30  | ZIP         | chaos          | bit-interleave low bytes of (val, secondary)       | no             |
-//! | 31  | PCNT_REPLACE| chaos          | bytes ← popcounts of val/secondary/exp parts       | EXTREME (16b)  |
+//! | 0   | ADD         | Spirix         | `frac_a + frac_b`, `exp_a + exp_b` (wrapping)   | no             | | 1   | SUB         | Spirix         | wrapping subtract                                | no             | | 2   | MUL_LO      | Spirix         | wrapping multiply (low half)                     | no             | | 3   | AND         | Spirix         | bitwise AND                                      | YES            | | 4   | OR          | Spirix         | bitwise OR                                       | YES            | | 5   | XOR         | Spirix         | bitwise XOR                                      | no             | | 6   | ANDN        | Spirix         | `a & ~b`                                         | YES            | | 7   | NOT         | Spirix         | `~a ^ b`                                         | no             | | 8   | SHL         | Spirix         | left shift by secondary low 4 bits               | YES            | | 9   | SHR         | Spirix         | right shift by secondary low 4 bits              | YES            | | 10  | ROL_B       | Spirix         | rotate left by secondary low 4                   | no             | | 11  | ROR_B       | Spirix         | rotate right by secondary low 4                  | no             | | 12  | ROL_S       | chaos          | rotate left by self low 4 (high path entropy)    | no             | | 13  | NEG         | Spirix         | two's complement negate, XOR secondary            | no             | | 14  | ABS         | Spirix         | wrapping absolute value                           | YES            | | 15  | BSWAP       | chaos          | byte-swap fraction                                | no             | | 16  | MIN         | Spirix         | signed min(a, b)                                  | YES            | | 17  | MAX         | Spirix         | signed max(a, b)                                  | YES            | | 18  | POPCNT      | chaos          | low byte ← popcount(val^sec), top byte preserved  | YES (8b loss)  | | 19  | SAT_ADD     | chaos          | saturating add (clamp at MAX/MIN)                 | YES            | | 20  | SAT_SUB     | chaos          | saturating subtract                                | YES            | | 21  | CSWAP       | chaos          | branch on `frac_a < frac_b`, swap-rotate or XOR   | branch entropy | | 22  | GFMUL       | chaos          | GF(2⁸) multiply on low byte (AES polynomial)      | no (algebraic) | | 23  | PARITY      | chaos          | XOR-fold val to 1 bit, paint across all 24 bits   | EXTREME (23b)  | | 24  | BREV        | chaos          | bit-reverse fraction                               | no             | | 25  | NREV        | chaos          | nibble-reverse within bytes                        | no             | | 26  | AVG         | chaos          | rounded average of (a, b)                          | YES            | | 27  | LFSR_TICK   | chaos          | Galois LFSR step (taps 0xB400)                     | no             | | 28  | EXPAND_LO   | chaos          | replicate low byte across word                     | YES (8b loss)  | | 29  | SQUEEZE     | chaos          | XOR all bytes → 1 byte, paint across               | EXTREME (16b)  | | 30  | ZIP         | chaos          | bit-interleave low bytes of (val, secondary)       | no             | | 31  | PCNT_REPLACE| chaos          | bytes ← popcounts of val/secondary/exp parts       | EXTREME (16b)  |
 //!
 //! # Path-entropy claim
 //!
@@ -286,8 +252,7 @@ fn round(state: &mut ChaosStateV2, round_idx: usize) {
     let snap = *state;
     let rc = ROUND_CONSTS[round_idx];
 
-    // Phase 1: data-dependent op selection on (val, fixed-offset secondary).
-    // 5-bit op selection (0..31) from val[4:0].
+    // Phase 1: data-dependent op selection on (val, fixed-offset secondary). 5-bit op selection (0..31) from val[4:0].
     let mut tmp = [0u32; BUCKETS];
     for i in 0..BUCKETS {
         let val = snap[i];

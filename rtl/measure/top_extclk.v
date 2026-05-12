@@ -1,7 +1,6 @@
 // top_extclk.v — pure frequency counter for an external RC-oscillator clock.
 //
-// Pot wired between ext_clk (E16) and osc_drive (F15). FPGA inverts ext_clk
-// onto osc_drive, forming an RC oscillator whose frequency is set by the pot.
+// Pot wired between ext_clk (E16) and osc_drive (F15). FPGA inverts ext_clk onto osc_drive, forming an RC oscillator whose frequency is set by the pot.
 //
 // Each frame (60 Hz, 1/60 sec window):
 //   1. SAMPLE         — counter accumulates ext_clk edges for SNAP_INTERVAL
@@ -14,18 +13,13 @@
 //   4. RESET          — async-reset the counter back to zero.
 //   5. RECONNECT      — re-enable counter input, restart the window.
 //
-// count_snap × K >> 32 = milli-MHz integer (K calibrated so 25 MHz reads
-// 25.000). Double-dabble produces 7 BCD digits → glyph render → OLED.
+// count_snap × K >> 32 = milli-MHz integer (K calibrated so 25 MHz reads 25.000). Double-dabble produces 7 BCD digits → glyph render → OLED.
 //
-// Below the digits, a 32-cell × 16-row binary ruler shows count_snap with
-// light-grey blocks for 1s and dark-grey blocks for 0s, MSB on the left.
+// Below the digits, a 32-cell × 16-row binary ruler shows count_snap with light-grey blocks for 1s and dark-grey blocks for 0s, MSB on the left.
 //
-// All display values are latched into display_* registers on snap_pulse so
-// the OLED only changes at frame boundaries.
+// All display values are latched into display_* registers on snap_pulse so the OLED only changes at frame boundaries.
 //
-// Build with `-DPLL_TEST` to replace ext_clk with a 25→400 MHz PLL output
-// (sanity-check that the counter matches a known reference). RC osc still
-// runs but its output is ignored.
+// Build with `-DPLL_TEST` to replace ext_clk with a 25→400 MHz PLL output (sanity-check that the counter matches a known reference). RC osc still runs but its output is ignored.
 
 module top_extclk #(
     parameter integer CLK_DIV = 7   // SSD1306 I2C SCL divisor (25 MHz / 7 ≈ 3.57 MHz)
@@ -60,8 +54,7 @@ module top_extclk #(
     wire global_reset = btn_held | ~por_done;
 
     // =========================================================================
-    // RC oscillator: osc_drive = ~ext_clk_pin (combinational inverter).
-    // External pot between the two pins forms the feedback delay.
+    // RC oscillator: osc_drive = ~ext_clk_pin (combinational inverter). External pot between the two pins forms the feedback delay.
     // =========================================================================
     assign osc_drive = ~ext_clk;
     assign ntsc_sync = 1'b0;
@@ -71,16 +64,9 @@ module top_extclk #(
 `ifndef RING_STAGES
   `define RING_STAGES 32
 `endif
-    // PIPE divergence from spirix: single-inverter ring oscillator.
-    // Stage 0 is a NOT (LUT4 INIT=h5555 → Z=~A); stages 1..N-1 are BUFs
-    // (LUT4 INIT=hAAAA → Z=A). Exactly one inversion per loop, so the ring
-    // oscillates regardless of total stage count. RING_STAGES can be any
-    // integer ≥ 1, no parity restriction.
+    // PIPE divergence from spirix: single-inverter ring oscillator. Stage 0 is a NOT (LUT4 INIT=h5555 → Z=~A); stages 1..N-1 are BUFs (LUT4 INIT=hAAAA → Z=A). Exactly one inversion per loop, so the ring oscillates regardless of total stage count. RING_STAGES can be any integer ≥ 1, no parity restriction.
     //
-    // (* keep *) on each LUT4 prevents yosys from optimizing the BUFs away
-    // (their function reduces to a wire) or collapsing the loop to a constant.
-    // (* noglobal *) on count_clk prevents nextpnr from promoting it to a
-    // DCCA global clock buffer (which would inject 3-5 ns into the loop).
+    // (* keep *) on each LUT4 prevents yosys from optimizing the BUFs away (their function reduces to a wire) or collapsing the loop to a constant. (* noglobal *) on count_clk prevents nextpnr from promoting it to a DCCA global clock buffer (which would inject 3-5 ns into the loop).
     (* noglobal *) wire [`RING_STAGES-1:0] ring_q;
 
     (* keep *) LUT4 #(.INIT(16'h5555)) ring_inv (
@@ -105,8 +91,7 @@ module top_extclk #(
 `ifndef PLL_FBDIV
   `define PLL_FBDIV 32
 `endif
-    // 25 MHz × PLL_FBDIV = VCO = CLKOP (CLKOP_DIV=1, CPHASE=0).
-    // Datasheet VCO spec: 400-800 MHz (FBDIV 16-32). Beyond is silicon-lottery.
+    // 25 MHz × PLL_FBDIV = VCO = CLKOP (CLKOP_DIV=1, CPHASE=0). Datasheet VCO spec: 400-800 MHz (FBDIV 16-32). Beyond is silicon-lottery.
     wire pll_clk;
     wire pll_locked;
     (* FREQUENCY_PIN_CLKI="25" *)
@@ -153,10 +138,7 @@ module top_extclk #(
 `ifndef DDS_K
   `define DDS_K 32'h4000_0000
 `endif
-    // 25 MHz × DDS_PLL_FBDIV = high-freq PLL (default 1000 MHz, FBDIV=40)
-    // 32-bit DDS phase accumulator clocked at PLL rate.
-    // Output (count_clk) = MSB of accumulator, average freq = K × PLL / 2^32.
-    // Jitter ±1 PLL cycle on individual edges, but average freq is exact.
+    // 25 MHz × DDS_PLL_FBDIV = high-freq PLL (default 1000 MHz, FBDIV=40) 32-bit DDS phase accumulator clocked at PLL rate. Output (count_clk) = MSB of accumulator, average freq = K × PLL / 2^32. Jitter ±1 PLL cycle on individual edges, but average freq is exact.
     wire dds_pll_clk;
     wire dds_pll_locked;
     (* FREQUENCY_PIN_CLKI="25" *)
@@ -204,8 +186,7 @@ module top_extclk #(
         if (teror_press)  dds_k_reg <= dds_k_reg - K_STEP_1MHZ;
     end
 
-    // Sync K into dds_pll_clk domain (single FF — partial-update glitches are
-    // harmless for DDS, just adds 1 cycle of phase noise at update time).
+    // Sync K into dds_pll_clk domain (single FF — partial-update glitches are harmless for DDS, just adds 1 cycle of phase noise at update time).
     reg [31:0] dds_k_pll;
     always @(posedge dds_pll_clk) dds_k_pll <= dds_k_reg;
 
@@ -220,20 +201,11 @@ module top_extclk #(
     // =========================================================================
     // DUT_BLAKE3 — single-phase BLAKE3 silicon Fmax bench (PIPE Phase C)
     //
-    // Hashes continuously on bench_clk (= pll_clk if PLL_TEST, else 25 MHz clk).
-    // LFSR-derived inputs feed i_mblock; o_hash XOR-folded to 32b; rotate-XOR
-    // accumulator integrates over ACCUM_LEN samples then latches result_reg
-    // and starts over. result_reg is deterministic at any frequency where
-    // timing closes; it changes when timing fails.
+    // Hashes continuously on bench_clk (= pll_clk if PLL_TEST, else 25 MHz clk). LFSR-derived inputs feed i_mblock; o_hash XOR-folded to 32b; rotate-XOR accumulator integrates over ACCUM_LEN samples then latches result_reg and starts over. result_reg is deterministic at any frequency where timing closes; it changes when timing fails.
     //
-    // Methodology: build at low frequency (e.g., raw 25 MHz, no PLL) → record
-    // displayed result_reg as ground truth. Build at higher frequencies → if
-    // displayed value matches ground truth, timing closes; if it changes,
-    // timing fails. Binary-search for the boundary.
+    // Methodology: build at low frequency (e.g., raw 25 MHz, no PLL) → record displayed result_reg as ground truth. Build at higher frequencies → if displayed value matches ground truth, timing closes; if it changes, timing fails. Binary-search for the boundary.
     //
-    // result_reg displayed via the existing 60 Hz windowed FSM by overriding
-    // count_snap source (see line further below). The displayed number is NOT
-    // milli-MHz in this mode; it's a stable signature of the computation.
+    // result_reg displayed via the existing 60 Hz windowed FSM by overriding count_snap source (see line further below). The displayed number is NOT milli-MHz in this mode; it's a stable signature of the computation.
     // =========================================================================
 `ifdef DUT_BLAKE3
     `ifdef PLL_TEST
@@ -318,8 +290,7 @@ module top_extclk #(
     endfunction
     wire [31:0] b3_hash_fold = b3_fold(b3_hash);
 
-    // 17-bit cycle counter → ACCUM_LEN = 131072 cycles per result loop.
-    // At 50 MHz that's 2.6 ms per result_reg update — comfortably faster than 60 Hz refresh.
+    // 17-bit cycle counter → ACCUM_LEN = 131072 cycles per result loop. At 50 MHz that's 2.6 ms per result_reg update — comfortably faster than 60 Hz refresh.
     reg [16:0] b3_cyc        = 0;
     reg [31:0] b3_accum      = 0;
     reg [31:0] b3_result_reg = 0;
@@ -339,8 +310,7 @@ module top_extclk #(
         end
     end
 
-    // CDC: 2-flop sync into 25 MHz clk domain (b3_result_reg only changes
-    // every ACCUM_LEN cycles, so the sync window is huge — no metastability risk).
+    // CDC: 2-flop sync into 25 MHz clk domain (b3_result_reg only changes every ACCUM_LEN cycles, so the sync window is huge — no metastability risk).
     reg [31:0] b3_result_sync1 = 0;
     reg [31:0] b3_result_sync2 = 0;
     always @(posedge clk) begin
@@ -351,10 +321,7 @@ module top_extclk #(
 `endif
 
     // =========================================================================
-    // Keypad — pure combinational decoder for ter (p44+p62) and teror (p44+p49).
-    // Drive p44 LOW continuously; tristate every other matrix pin. Only buttons
-    // connecting to p44 can pull a column LOW, so column reads directly identify
-    // ter/teror with no scan, no FSM, no settle wait, no clock counters.
+    // Keypad — pure combinational decoder for ter (p44+p62) and teror (p44+p49). Drive p44 LOW continuously; tristate every other matrix pin. Only buttons connecting to p44 can pull a column LOW, so column reads directly identify ter/teror with no scan, no FSM, no settle wait, no clock counters.
     // =========================================================================
     wire [9:0] kp_in;
     // pin_t[i] = 1 → tristate. p44 (idx 2) is the only driven row; everything else high-Z.
@@ -387,13 +354,9 @@ module top_extclk #(
     end
 
     // =========================================================================
-    // Counter — 32-stage async ripple, gated by `counter_enable`,
-    // async-resettable via `counter_reset`. Both signals are driven from the
-    // 25 MHz reference domain and synchronized into count_clk before use.
+    // Counter — 32-stage async ripple, gated by `counter_enable`, async-resettable via `counter_reset`. Both signals are driven from the 25 MHz reference domain and synchronized into count_clk before use.
     //
-    // The buffer LUT on count_clk_buf isolates the counter chain's load from
-    // the bare ext_clk pin, so any backwards-driven activity in the counter
-    // logic doesn't perturb the RC oscillator loop.
+    // The buffer LUT on count_clk_buf isolates the counter chain's load from the bare ext_clk pin, so any backwards-driven activity in the counter logic doesn't perturb the RC oscillator loop.
     // =========================================================================
     reg counter_enable = 1;
     reg counter_reset  = 0;
@@ -495,8 +458,7 @@ module top_extclk #(
     wire [22:0] milli_mhz = product[54:32];
 
     // =========================================================================
-    // Double-dabble: 23-bit milli_mhz → 7 BCD digits (28 bits)
-    // 23 cycles to complete; kicks off one cycle after snap_pulse.
+    // Double-dabble: 23-bit milli_mhz → 7 BCD digits (28 bits) 23 cycles to complete; kicks off one cycle after snap_pulse.
     // =========================================================================
     reg snap_pulse_d = 0;
     always @(posedge clk) snap_pulse_d <= snap_pulse;
@@ -548,8 +510,7 @@ module top_extclk #(
     end
 
     // =========================================================================
-    // Glyph ROM — 11 glyphs × 12 wide × 16 tall × 8bpp = 2112 bytes.
-    // No padding: each tile is exactly the inked content. addr = slot*192 + gy*12 + gx.
+    // Glyph ROM — 11 glyphs × 12 wide × 16 tall × 8bpp = 2112 bytes. No padding: each tile is exactly the inked content. addr = slot*192 + gy*12 + gx.
     // =========================================================================
     reg [7:0] glyph_rom [0:2111];
     initial $readmemh("decimal_glyphs.mem", glyph_rom);
@@ -565,10 +526,7 @@ module top_extclk #(
 
 `ifdef BENCH
     // =========================================================================
-    // Bench harness — count_clk (= PLL) domain
-    // Phase: IDLE → GOLD (CE=1/256) → SWITCH (LFSR replay) → TEST (CE=1) → DONE
-    // 18-bit protocol counter: warmup [0..32767], accumulate [32768..131071]
-    // 32-bit accumulator captures gold then test; mismatch = gold ^ test
+    // Bench harness — count_clk (= PLL) domain Phase: IDLE → GOLD (CE=1/256) → SWITCH (LFSR replay) → TEST (CE=1) → DONE 18-bit protocol counter: warmup [0..32767], accumulate [32768..131071] 32-bit accumulator captures gold then test; mismatch = gold ^ test
     // =========================================================================
     localparam [2:0] PH_IDLE   = 3'd0,
                      PH_GOLD   = 3'd1,
@@ -771,8 +729,7 @@ module top_extclk #(
     end
 `endif
 
-    // 12-wide tiles. addr = slot*192 + gy*12 + gx_in_cell (gx_in_cell is 0..11).
-    // gy*12 = gy*8 + gy*4 (no multiplier needed).
+    // 12-wide tiles. addr = slot*192 + gy*12 + gx_in_cell (gx_in_cell is 0..11). gy*12 = gy*8 + gy*4 (no multiplier needed).
     reg [11:0] slot_offset;
     always @(*) begin
         case (freq_slot)
@@ -797,8 +754,7 @@ module top_extclk #(
                               ? glyph_pixel : 8'h00;
 
     // ----- Bit display (32 cells × 4 px wide) -----
-    // Alternating bright/dark pairs per bit position so adjacent bits are
-    // always visually distinct AND the bit value is readable at a glance:
+    // Alternating bright/dark pairs per bit position so adjacent bits are always visually distinct AND the bit value is readable at a glance:
     //   even bit index: 0 → 0   (black),     1 → 191 (light grey)
     //   odd  bit index: 0 → 32  (dark grey), 1 → 255 (white)
     wire [4:0] bit_idx       = wr_col[6:2];                  // 0..31
@@ -1041,9 +997,7 @@ module top_extclk #(
     end
 
     // =========================================================================
-    // LED — solid ON (active-low). Eliminates power-rail perturbation that a
-    // blinking LED was causing on the RC oscillator (~0.15% frequency wiggle).
-    // The OLED already indicates the bitstream is alive.
+    // LED — solid ON (active-low). Eliminates power-rail perturbation that a blinking LED was causing on the RC oscillator (~0.15% frequency wiggle). The OLED already indicates the bitstream is alive.
     // =========================================================================
     always @(posedge clk) led <= 1'b0;
 

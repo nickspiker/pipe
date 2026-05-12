@@ -5,8 +5,7 @@
 //   github.com/6a-62/blake3_vhdl  (BSD-3-Clause, Copyright 6a-62)
 // Translation copyright released under same BSD-3-Clause terms.
 //
-// Implements the BLAKE3 compression function ONLY.
-// Tree structure, chunking, padding, and root finalization are the caller's responsibility.
+// Implements the BLAKE3 compression function ONLY. Tree structure, chunking, padding, and root finalization are the caller's responsibility.
 //
 // Port description:
 //   i_chain    [255:0]  Chaining value: 8 x 32-bit words, word 0 in [31:0]
@@ -310,8 +309,7 @@ always @(posedge i_clk or negedge i_reset) begin
                 r_round <= 3'd0;
                 r_state <= S_OUTPUT;
             end else begin
-                // Apply message permutation σ before next round.
-                // σ = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8}
+                // Apply message permutation σ before next round. σ = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8}
                 r_mblock[ 0*32 +: 32] <= r_mblock[ 2*32 +: 32];
                 r_mblock[ 1*32 +: 32] <= r_mblock[ 6*32 +: 32];
                 r_mblock[ 2*32 +: 32] <= r_mblock[ 3*32 +: 32];

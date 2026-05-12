@@ -22,10 +22,7 @@ pub struct Ft232h {
 }
 
 impl Ft232h {
-    /// Open the FT232H and initialise MPSSE at `clock_hz`. Resets the chip,
-    /// disables event/error chars (which would otherwise corrupt the byte
-    /// stream), and runs the MPSSE sync handshake to flush any residual
-    /// state from prior MPSSE clients (e.g., openFPGALoader).
+    /// Open the FT232H and initialise MPSSE at `clock_hz`. Resets the chip, disables event/error chars (which would otherwise corrupt the byte stream), and runs the MPSSE sync handshake to flush any residual state from prior MPSSE clients (e.g., openFPGALoader).
     pub fn open(clock_hz: u32) -> Result<Self, ftdi_nusb::Error> {
         let mut dev = FtdiDevice::open(FT232H_VID, FT232H_PID)?;
         dev.usb_reset()?;
@@ -42,8 +39,7 @@ impl Ft232h {
         Ok(Self { dev, mpsse })
     }
 
-    /// Drive ADBUS pin directions and values on the low byte.
-    /// `direction`: 1 bit per pin (1 = output, 0 = input).
+    /// Drive ADBUS pin directions and values on the low byte. `direction`: 1 bit per pin (1 = output, 0 = input).
     pub fn set_low(&mut self, value: u8, direction: u8) -> Result<(), ftdi_nusb::Error> {
         self.mpsse.set_gpio_low(&mut self.dev, value, direction)
     }
@@ -83,8 +79,7 @@ impl Ft232h {
         Ok(buf[0])
     }
 
-    /// Hold an ADBUS configuration for `ms` milliseconds, then release all
-    /// pins back to input.
+    /// Hold an ADBUS configuration for `ms` milliseconds, then release all pins back to input.
     pub fn hold_drive(
         &mut self,
         value: u8,

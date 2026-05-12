@@ -2,10 +2,7 @@
 // slot_clk.v — Bit-slot clock generator for the PIPE wire
 // =============================================================================
 //
-// Divides enclave_clk down to slot_rate. One slot = one bit-time on the wire.
-// At enclave_clk ≈ 600 kHz and DIV = 12, slot_rate ≈ 50 kbps — slow enough for
-// a host-side FT232H bit-bang to oversample cleanly, fast enough that the
-// heartbeat is visible on a multimeter / scope without waiting forever.
+// Divides enclave_clk down to slot_rate. One slot = one bit-time on the wire. At enclave_clk ≈ 600 kHz and DIV = 12, slot_rate ≈ 50 kbps — slow enough for a host-side FT232H bit-bang to oversample cleanly, fast enough that the heartbeat is visible on a multimeter / scope without waiting forever.
 //
 // Outputs:
 //   slot_tick   pulses 1 enclave_clk cycle on each slot boundary (the moment

@@ -2,11 +2,7 @@
 // chaos_amp.v — PIPE chaos amplifier v1 (Dragonfly)
 // =============================================================================
 //
-// Bit-exact silicon implementation of `pipe::chaos_amp::chaos_amp`. The Rust
-// crate at /mnt/Octopus/Code/pipe/enclave/src/chaos_amp.rs is the single source
-// of algorithmic truth; this module's outputs MUST match the Rust reference
-// for every input. The testbench at sim/tb_chaos_amp.v validates this against
-// vectors emitted by `cargo run --bin gen-test-vectors`.
+// Bit-exact silicon implementation of `pipe::chaos_amp::chaos_amp`. The Rust crate at /mnt/Octopus/Code/pipe/enclave/src/chaos_amp.rs is the single source of algorithmic truth; this module's outputs MUST match the Rust reference for every input. The testbench at sim/tb_chaos_amp.v validates this against vectors emitted by `cargo run --bin gen-test-vectors`.
 //
 // =============================================================================
 // Algorithm (12 rounds, 5 phases per round)
@@ -19,29 +15,21 @@
 //     LOSE         — destroy 6 bits in one bucket via popcount mixing
 //     SEASON       — XOR Dragonfly round constant into bucket 0
 //
-// Path entropy: 16 × 5 bits/round × 12 rounds = 960 bits ≈ 10^289 paths.
-// Information loss: 6 bits/round × 12 rounds = 72 bits irrecoverable.
+// Path entropy: 16 × 5 bits/round × 12 rounds = 960 bits ≈ 10^289 paths. Information loss: 6 bits/round × 12 rounds = 72 bits irrecoverable.
 //
 // =============================================================================
 // Microarchitecture
 // =============================================================================
 //
-// One full round per clock. Total latency = 12 cycles from `start` pulse to
-// `done` assertion. State is held in 16 × 32-bit registers; the next-state
-// function is a flat combinational block computing all five phases in series.
+// One full round per clock. Total latency = 12 cycles from `start` pulse to `done` assertion. State is held in 16 × 32-bit registers; the next-state function is a flat combinational block computing all five phases in series.
 //
-// At a 25 MHz enclave_clk the 12-round critical path of S-box + add + variable
-// rotate + popcount is the timing bottleneck; should close comfortably below
-// the 125 MHz BLAKE3 silicon Fmax measured in Phase C.
+// At a 25 MHz enclave_clk the 12-round critical path of S-box + add + variable rotate + popcount is the timing bottleneck; should close comfortably below the 125 MHz BLAKE3 silicon Fmax measured in Phase C.
 //
 // =============================================================================
 // I/O conventions
 // =============================================================================
 //
-// `in_data` and `state_out` are 512-bit packed vectors. Bucket i occupies bits
-// [i*32 +: 32], stored little-endian with respect to the byte stream
-// (input[i*4 + 0] = bucket[7:0]). Same convention as Rust's
-// `chaos_amp::state_to_bytes` / input absorption.
+// `in_data` and `state_out` are 512-bit packed vectors. Bucket i occupies bits [i*32 +: 32], stored little-endian with respect to the byte stream (input[i*4 + 0] = bucket[7:0]). Same convention as Rust's `chaos_amp::state_to_bytes` / input absorption.
 //
 // =============================================================================
 
@@ -60,14 +48,7 @@ module chaos_amp (
     localparam integer ROUNDS    = 12;
 
     // =========================================================================
-    // AES S-box (8 → 8 bijection). Compiled to LUT logic — yosys with wide-LUT
-    // mode (synth_ecp5 *without* -nowidelut) packs the 8-input function into
-    // ~16 LUT4-equivalent per byte using LUT5/LUT6/LUT7 SLICE combiners. With
-    // 64 parallel byte reads (16 buckets × 4 bytes) that's roughly 1 k LUT4
-    // for the S-box layer — fits comfortably. `ram_style = "block"` would map
-    // to BRAM but requires clocked read ports; chaos_amp's round logic uses
-    // combinational reads so BRAM mapping is incompatible without pipelining
-    // the substitute phase into its own cycle.
+    // AES S-box (8 → 8 bijection). Compiled to LUT logic — yosys with wide-LUT mode (synth_ecp5 *without* -nowidelut) packs the 8-input function into ~16 LUT4-equivalent per byte using LUT5/LUT6/LUT7 SLICE combiners. With 64 parallel byte reads (16 buckets × 4 bytes) that's roughly 1 k LUT4 for the S-box layer — fits comfortably. `ram_style = "block"` would map to BRAM but requires clocked read ports; chaos_amp's round logic uses combinational reads so BRAM mapping is incompatible without pipelining the substitute phase into its own cycle.
     // =========================================================================
     reg [7:0] sbox [0:255];
     initial begin
@@ -138,8 +119,7 @@ module chaos_amp (
     end
 
     // =========================================================================
-    // Round constants — blake3("PIPE chaos amp v1 - Dragonfly") (verified bit-
-    // exact by enclave/src/chaos_amp.rs::round_consts_match_blake3).
+    // Round constants — blake3("PIPE chaos amp v1 - Dragonfly") (verified bit- exact by enclave/src/chaos_amp.rs::round_consts_match_blake3).
     // =========================================================================
     reg [31:0] round_const [0:11];
     initial begin
@@ -223,8 +203,7 @@ module chaos_amp (
         end
     endgenerate
 
-    // LOSE: target = (round * 7) & 15. For target bucket only, replace top 6
-    // bits with popcount(v ^ neighbor). Other buckets unchanged.
+    // LOSE: target = (round * 7) & 15. For target bucket only, replace top 6 bits with popcount(v ^ neighbor). Other buckets unchanged.
     wire [3:0] lose_target = (round * 4'd7) & 4'hF;
 
     function automatic [5:0] popcount32;

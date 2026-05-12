@@ -5,9 +5,7 @@
 // External interface:
 //   pipe_pad — single bidirectional IO pin (the entire PIPE wire)
 //
-// No external clock input. No reset input.
-// POR comes from ECP5 CFGPOR (config-time POR — not a clock primitive) feeding
-// a ring-osc-cycle counter.
+// No external clock input. No reset input. POR comes from ECP5 CFGPOR (config-time POR — not a clock primitive) feeding a ring-osc-cycle counter.
 //
 // Block diagram:
 //

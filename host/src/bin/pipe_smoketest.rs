@@ -24,8 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Throw away the first batch (contains the 0xFA 0xAB bad-cmd echo).
     let _ = ft.sample_low(64)?;
 
-    // Per-batch capture: time and edge-count each batch independently so the
-    // frequency reading isn't poisoned by inter-batch USB gaps.
+    // Per-batch capture: time and edge-count each batch independently so the frequency reading isn't poisoned by inter-batch USB gaps.
     let mut total_edges_wire = 0u64;
     let mut total_within_batch_secs = 0.0f64;
     let mut total_samples = 0usize;

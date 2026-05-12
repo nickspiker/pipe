@@ -58,8 +58,7 @@ mod tests {
 
     #[test]
     fn frequency_25khz_at_6mhz_sample() {
-        // 25 kHz wave at 6 Msps = 240 samples/period = 120 samples/half. Run a
-        // long enough capture (60 ms) so boundary-truncation error is < 1%.
+        // 25 kHz wave at 6 Msps = 240 samples/period = 120 samples/half. Run a long enough capture (60 ms) so boundary-truncation error is < 1%.
         let half = 6_000_000 / 25_000 / 2; // 120
         let total = 60 * 6_000;            // 360_000 samples = 60 ms
         let samples: Vec<u8> = (0..total)

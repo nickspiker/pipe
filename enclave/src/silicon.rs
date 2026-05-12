@@ -2,10 +2,7 @@
 //!
 //! Models the post-boot state of the PIPE silicon: an eFuse (silicon's birth identity, OTP, set at manufacture) and a boot_nonce (TRNG burst captured during boot_fsm). From these, the boot FSM derives two distinct 256-bit keys that live in two write-once key registers and feed two parallel ragu pipelines:
 //!
-//! ```text
-//! anchor_key  = BLAKE3(eFuse)              — stable across power cycles
-//! session_key = BLAKE3(eFuse, boot_nonce)  — fresh per power cycle
-//! ```
+//! ```text anchor_key  = BLAKE3(eFuse)              — stable across power cycles session_key = BLAKE3(eFuse, boot_nonce)  — fresh per power cycle ```
 //!
 //! Both registers populate during boot. The kernel then invokes either:
 //!

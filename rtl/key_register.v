@@ -2,14 +2,9 @@
 // key_register.v — A#256-bit write-once secret store
 // =============================================================================
 //
-// Holds the boot-derived attestation secret. Written EXACTLY ONCE per power-on
-// by boot_fsm.v during the LOCK_KEY transition. After lock asserts, no further
-// writes are accepted — the only way to clear the lock is full power loss
-// (the register itself loses state on power loss; there is no soft reset).
+// Holds the boot-derived attestation secret. Written EXACTLY ONCE per power-on by boot_fsm.v during the LOCK_KEY transition. After lock asserts, no further writes are accepted — the only way to clear the lock is full power loss (the register itself loses state on power loss; there is no soft reset).
 //
-// The output port `key_out` connects to blake3.i_chain ONLY. No other consumer
-// in the netlist. This is the structural foundation of the unextractability
-// claim: the secret has no path to any IO pin, data bus, RAM, or multiplexer.
+// The output port `key_out` connects to blake3.i_chain ONLY. No other consumer in the netlist. This is the structural foundation of the unextractability claim: the secret has no path to any IO pin, data bus, RAM, or multiplexer.
 //
 // HARD INVARIANTS (enforced by netlist_assertions.py after synthesis):
 //   1. fanout(key_register.key_out) == 1
@@ -60,8 +55,7 @@ module key_register (
             key      <= key_in;
             locked_r <= 1'b1;
         end
-        // After locked_r is set, no further writes accepted.
-        // No path to clear locked_r short of POR.
+        // After locked_r is set, no further writes accepted. No path to clear locked_r short of POR.
     end
 
     assign key_out = key;

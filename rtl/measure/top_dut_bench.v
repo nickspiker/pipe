@@ -1,11 +1,8 @@
 // Single-instance CE-gated BLAKE3 self-test for Colorlight 5A-75B v8.0
 //
-// One blake3 instance, run twice: slow CE (gold, guaranteed correct) then
-// fast CE (test, full PLL speed). Counter-based protocol ensures both
-// phases process identical PRNG sequences. Compare accumulated hashes.
+// One blake3 instance, run twice: slow CE (gold, guaranteed correct) then fast CE (test, full PLL speed). Counter-based protocol ensures both phases process identical PRNG sequences. Compare accumulated hashes.
 //
-// CRT shows: gold hash (bottom strip), test hash (top strip, flipped CRT).
-// Output: J1 pin 1 (R0, C4) = sync, J1 pin 2 (G0, D4) = video
+// CRT shows: gold hash (bottom strip), test hash (top strip, flipped CRT). Output: J1 pin 1 (R0, C4) = sync, J1 pin 2 (G0, D4) = video
 
 module top_dut_bench (
     input  wire clk,       // 25 MHz oscillator (P6)
@@ -28,11 +25,7 @@ module top_dut_bench (
     wire      por_done = &por_cnt;
 
 `ifdef RING_STAGES
-    // Single-inverter ring oscillator drives sys_clk. The 25 MHz crystal
-    // (clk) is reserved for OLED display + windowed freq counter only.
-    // Stage 0 = NOT (LUT4 INIT=h5555). Stages 1..N-1 = BUFs (INIT=hAAAA).
-    // (* keep *) prevents BUF optimization. (* noglobal *) prevents nextpnr
-    // from inserting a DCCA buffer into the loop.
+    // Single-inverter ring oscillator drives sys_clk. The 25 MHz crystal (clk) is reserved for OLED display + windowed freq counter only. Stage 0 = NOT (LUT4 INIT=h5555). Stages 1..N-1 = BUFs (INIT=hAAAA). (* keep *) prevents BUF optimization. (* noglobal *) prevents nextpnr from inserting a DCCA buffer into the loop.
     (* noglobal *) wire [`RING_STAGES-1:0] ring_q;
 
     (* keep *) LUT4 #(.INIT(16'h5555)) ring_inv (
@@ -51,22 +44,9 @@ module top_dut_bench (
         end
     endgenerate
 
-    // Explicitly buffer ring_q[0] through a DCCA (global clock network)
-    // for low-skew distribution to all sys_clk-clocked FFs (blake3, FSM,
-    // accumulator, ...). Without DCCA, sys_clk is direct-routed and the
-    // skew across blake3's wide datapath causes setup/hold failures even
-    // at frequencies far below silicon Fmax. The (* noglobal *) on ring_q
-    // keeps the oscillator loop itself fast (no DCCA delay inside the ring).
+    // Explicitly buffer ring_q[0] through a DCCA (global clock network) for low-skew distribution to all sys_clk-clocked FFs (blake3, FSM, accumulator, ...). Without DCCA, sys_clk is direct-routed and the skew across blake3's wide datapath causes setup/hold failures even at frequencies far below silicon Fmax. The (* noglobal *) on ring_q keeps the oscillator loop itself fast (no DCCA delay inside the ring).
 `ifdef RING_DIV
-    // Arbitrary integer divider: sys_clk = ring_freq / RING_DIV. RING_DIV
-    // must be ≥ 2 and even (odd values get floor-rounded — half-period =
-    // RING_DIV/2 input cycles). Implemented as count-to-half + toggle on
-    // rollover: the counter walks 0..HALF-1, and on hitting HALF-1 wraps
-    // to 0 and toggles the output flip-flop. Output is REGISTERED with
-    // exact 50% duty cycle for even RING_DIV, glitch-free by construction
-    // (the FF only changes on its own clock edge). Two DCCAs consumed:
-    // one buffers the raw ring onto the global net (so the counter is
-    // reliably clocked), one buffers the toggle output as final sys_clk.
+    // Arbitrary integer divider: sys_clk = ring_freq / RING_DIV. RING_DIV must be ≥ 2 and even (odd values get floor-rounded — half-period = RING_DIV/2 input cycles). Implemented as count-to-half + toggle on rollover: the counter walks 0..HALF-1, and on hitting HALF-1 wraps to 0 and toggles the output flip-flop. Output is REGISTERED with exact 50% duty cycle for even RING_DIV, glitch-free by construction (the FF only changes on its own clock edge). Two DCCAs consumed: one buffers the raw ring onto the global net (so the counter is reliably clocked), one buffers the toggle output as final sys_clk.
     wire sys_clk_raw;
     (* keep *) DCCA dcca_ring_raw (
         .CLKI(ring_q[0]),
@@ -156,8 +136,7 @@ module top_dut_bench (
     //     propagate, ~26000 cycles at our 617 kHz target.
     //   - Display latency is one window = 16.67 ms, invisible to the eye.
     //
-    // count_snap × MULT_K >> 32 = milli-MHz integer. MULT_K unchanged from
-    // the old design: the window period is identical, just measured cleanly.
+    // count_snap × MULT_K >> 32 = milli-MHz integer. MULT_K unchanged from the old design: the window period is identical, just measured cleanly.
     // =========================================================================
     localparam integer FC_SNAP_INTERVAL = 25_000_000 / 60;  // 416666
 
@@ -212,16 +191,13 @@ module top_dut_bench (
     always @(posedge clk) begin
         snap_pulse <= 1'b0;
         if (fc_window_at_top) begin
-            // snap_sync2 holds the count from the PREVIOUS window — by now
-            // it has had a full 16.67 ms to propagate through CDC at any
-            // sys_clk we care about. One-window display lag is invisible.
+            // snap_sync2 holds the count from the PREVIOUS window — by now it has had a full 16.67 ms to propagate through CDC at any sys_clk we care about. One-window display lag is invisible.
             count_snap <= snap_sync2;
             snap_pulse <= 1'b1;
         end
     end
 
-    // count_snap × MULT_K >> 32 = milli-MHz integer.
-    // K = ceil(25,000 × 2^32 / 416,666) = 257,698,453.
+    // count_snap × MULT_K >> 32 = milli-MHz integer. K = ceil(25,000 × 2^32 / 416,666) = 257,698,453.
     localparam [27:0] FC_MULT_K = 28'd257_698_453;
     wire [59:0] fc_product   = count_snap * FC_MULT_K;
     wire [22:0] milli_mhz    = fc_product[54:32];
@@ -274,10 +250,7 @@ module top_dut_bench (
     // =========================================================================
     // Constants
     // =========================================================================
-    // gold CE divider — should be MUCH larger than the DUT's cycles-per-call
-    // so PH_GOLD's wall-time is dominated by the slow CE pacing rather than by
-    // DUT throughput. blake3 takes ~30 cycles → 256 gives ~8.5:1. chaos_amp_v2
-    // takes 514 cycles → 8 × 514 = 4112 gives exact 8:1 effective ratio.
+    // gold CE divider — should be MUCH larger than the DUT's cycles-per-call so PH_GOLD's wall-time is dominated by the slow CE pacing rather than by DUT throughput. blake3 takes ~30 cycles → 256 gives ~8.5:1. chaos_amp_v2 takes 514 cycles → 8 × 514 = 4112 gives exact 8:1 effective ratio.
 `ifdef DUT_CHAOS_AMP_V2
     localparam CE_GOLD_DIV = 4112;  // 8 × 514 cycles per chaos_amp_v2 call
 `else
@@ -288,9 +261,7 @@ module top_dut_bench (
     //   [0..32767]                       warmup (LFSR runs, no accumulation)
     //   [32768..65535] + [98304..131071] accumulate (65536 cycles total)
     //   bit 17 high                      → done (≥131072)
-    // The accumulate window has a 32K hole at counts 65536..98303 because the
-    // bit-tap selects bit 15 (proto_hi[6]) directly instead of doing a ≥32768
-    // comparison. Symmetric across gold/test so the comparison stays valid.
+    // The accumulate window has a 32K hole at counts 65536..98303 because the bit-tap selects bit 15 (proto_hi[6]) directly instead of doing a ≥32768 comparison. Symmetric across gold/test so the comparison stays valid.
     localparam PROTO_BITS = 18;
 
     // =========================================================================
@@ -360,8 +331,7 @@ module top_dut_bench (
     reg [15:0] combo_tested = 0;  // 1 = this combo has been tested
 `endif
 
-    // CE generator (registered for clean fanout at high freq). Width tracks
-    // CE_GOLD_DIV so it accommodates whichever DUT-specific value is chosen.
+    // CE generator (registered for clean fanout at high freq). Width tracks CE_GOLD_DIV so it accommodates whichever DUT-specific value is chosen.
     reg [$clog2(CE_GOLD_DIV)-1:0] ce_div = 0;
     reg                            ce    = 0;
     always @(posedge sys_clk) begin
@@ -370,10 +340,7 @@ module top_dut_bench (
     end
 
     // =========================================================================
-    // PRNG: 64-bit Galois LFSR (maximal length, period 2^64-1)
-    // Critical path: lfsr[0] → 1 LUT (AND tap) → FF.  ~0.7ns.
-    // Taps: x^64 + x^63 + x^61 + x^60  (maximal, from Xilinx XAPP052)
-    // Output: lfsr[31:0] window
+    // PRNG: 64-bit Galois LFSR (maximal length, period 2^64-1) Critical path: lfsr[0] → 1 LUT (AND tap) → FF.  ~0.7ns. Taps: x^64 + x^63 + x^61 + x^60  (maximal, from Xilinx XAPP052) Output: lfsr[31:0] window
     // =========================================================================
     localparam [63:0] LFSR_SEED  = 64'hCAFE_BABE_DEAD_BEEF;
     localparam [63:0] LFSR_SEED2 = 64'h0123_4567_89AB_CDEF;
@@ -390,12 +357,7 @@ module top_dut_bench (
     // =========================================================================
     // DUT — switchable via defines
     //
-    // DUT_SPIRIX_FMA (default), DUT_SPIRIX_MUL, DUT_SPIRIX_MUL_PIPE2,
-    // DUT_SPIRIX_DIV_ITER, DUT_SPIRIX_DIVMOD_NR, DUT_SPIRIX_SQRT_NR,
-    // DUT_SPIRIX_NR_DIV, DUT_SPIRIX_NR_SQRT, DUT_SPIRIX_SQRT_ITER,
-    // DUT_HF_FMA, DUT_HF_MUL, DUT_HF_ADD, DUT_HF_DIV, DUT_HF_SQRT,
-    // DUT_FPN_FMA, DUT_FPN_MUL, DUT_FPN_ADD, DUT_FPN_DIV, DUT_FPN_SQRT
-    // All produce: 32-bit mul_fold. Iterative DUTs also define dut_advance.
+    // DUT_SPIRIX_FMA (default), DUT_SPIRIX_MUL, DUT_SPIRIX_MUL_PIPE2, DUT_SPIRIX_DIV_ITER, DUT_SPIRIX_DIVMOD_NR, DUT_SPIRIX_SQRT_NR, DUT_SPIRIX_NR_DIV, DUT_SPIRIX_NR_SQRT, DUT_SPIRIX_SQRT_ITER, DUT_HF_FMA, DUT_HF_MUL, DUT_HF_ADD, DUT_HF_DIV, DUT_HF_SQRT, DUT_FPN_FMA, DUT_FPN_MUL, DUT_FPN_ADD, DUT_FPN_DIV, DUT_FPN_SQRT All produce: 32-bit mul_fold. Iterative DUTs also define dut_advance.
     // =========================================================================
 
     // Second LFSR for 3-operand DUTs (FMA)
@@ -954,10 +916,7 @@ module top_dut_bench (
     wire signed  [7:0] dut_r_exp;
     wire dut_busy_w, dut_done_w;
 
-    // Block iter_start during PH_IDLE/PH_SWITCH for parity with FPnew reset
-    // gating. Without this, an iter_start in PH_SWITCH samples stale gold-phase
-    // lfsr (captured_seed assignment hasn't taken effect yet), contaminating
-    // the first test-phase result and causing repeatable gold≠test mismatches.
+    // Block iter_start during PH_IDLE/PH_SWITCH for parity with FPnew reset gating. Without this, an iter_start in PH_SWITCH samples stale gold-phase lfsr (captured_seed assignment hasn't taken effect yet), contaminating the first test-phase result and causing repeatable gold≠test mismatches.
     reg iter_busy = 0;
     reg iter_start = 0;
     always @(posedge sys_clk) begin
@@ -1126,9 +1085,7 @@ module top_dut_bench (
     reg iter_start = 0;
     always @(posedge sys_clk) begin
         iter_start <= 0;
-        // Clear iter_busy whenever DUT is in reset — otherwise an iter_start
-        // pulse fired during PH_IDLE/PH_SWITCH (when ce ticks but DUT ignores
-        // it) leaves iter_busy stuck at 1 forever and the handshake deadlocks.
+        // Clear iter_busy whenever DUT is in reset — otherwise an iter_start pulse fired during PH_IDLE/PH_SWITCH (when ce ticks but DUT ignores it) leaves iter_busy stuck at 1 forever and the handshake deadlocks.
         if (btn_held_sys || !por_done || !fpn_div_rst_n)
             iter_busy <= 0;
         else if (ce && !iter_busy && fpn_ready)
@@ -1208,10 +1165,7 @@ module top_dut_bench (
 
 `elsif DUT_BLAKE3
     // ----- BLAKE3 compression core (iterative, ~30 cycles per hash) -----
-    // 256-bit chain (BLAKE3 IV), 512-bit message tiled from lfsr/lfsr2,
-    // counter=0, numbytes=64, dflags = ROOT|CHUNK_END|CHUNK_START.
-    // Reset gated through PH_IDLE/PH_SWITCH so internal state doesn't leak
-    // gold→test (parity with FPnew div/sqrt iter pattern, see SYNTH_NOTES.md).
+    // 256-bit chain (BLAKE3 IV), 512-bit message tiled from lfsr/lfsr2, counter=0, numbytes=64, dflags = ROOT|CHUNK_END|CHUNK_START. Reset gated through PH_IDLE/PH_SWITCH so internal state doesn't leak gold→test (parity with FPnew div/sqrt iter pattern, see SYNTH_NOTES.md).
     wire [255:0] b3_chain_in = {
         32'h5BE0CD19, 32'h1F83D9AB, 32'h9B05688C, 32'h510E527F,
         32'hA54FF53A, 32'h3C6EF372, 32'hBB67AE85, 32'h6A09E667
@@ -1237,9 +1191,7 @@ module top_dut_bench (
     always @(posedge sys_clk) begin
         iter_start <= 0;
         b3_ready_d <= b3_ready;
-        // Clear iter_busy whenever DUT is in reset — same defensive pattern
-        // as fpn_div: prevents handshake deadlock if iter_start fired during
-        // PH_IDLE/PH_SWITCH while DUT was held in reset.
+        // Clear iter_busy whenever DUT is in reset — same defensive pattern as fpn_div: prevents handshake deadlock if iter_start fired during PH_IDLE/PH_SWITCH while DUT was held in reset.
         if (btn_held_sys || !por_done || !blake3_rst_n)
             iter_busy <= 0;
         else if (ce && !iter_busy && b3_ready)
@@ -1248,11 +1200,7 @@ module top_dut_bench (
             iter_busy <= 0;
     end
 
-    // i_ce held high so blake3's internal FSM advances every sys_clk inside
-    // a hash. CE-gating happens at iter_start (matches spirix_divide_iter and
-    // FPnew div/sqrt pattern). Without this, blake3 deadlocks: iter_start is a
-    // 1-cycle pulse, but blake3.i_ce is only high 1/256 cycles in PH_GOLD, so
-    // blake3 misses the i_valid window and stays stuck in S_IDLE forever.
+    // i_ce held high so blake3's internal FSM advances every sys_clk inside a hash. CE-gating happens at iter_start (matches spirix_divide_iter and FPnew div/sqrt pattern). Without this, blake3 deadlocks: iter_start is a 1-cycle pulse, but blake3.i_ce is only high 1/256 cycles in PH_GOLD, so blake3 misses the i_valid window and stays stuck in S_IDLE forever.
     blake3 dut_blake3 (
         .i_clk     (sys_clk),
         .i_reset   (blake3_rst_n),
@@ -1287,8 +1235,7 @@ module top_dut_bench (
 
 `elsif DUT_CHAOS_AMP_V2
     // ----- chaos_amp v2 — Dragonfly 32-op data-dep ALU, 1 bucket/cycle, ~514 cycles per call -----
-    // 64-byte input drawn from lfsr/lfsr2 concatenations; 384-bit state output
-    // gets XOR-folded to 32 bits to feed the dual-CE accumulator.
+    // 64-byte input drawn from lfsr/lfsr2 concatenations; 384-bit state output gets XOR-folded to 32 bits to feed the dual-CE accumulator.
     wire [511:0] ca_in_data = {
         ~lfsr,
         lfsr ^ 64'hAAAA_AAAA_AAAA_AAAA,
@@ -1347,8 +1294,7 @@ module top_dut_bench (
 
 `elsif DUT_SPIRIX_ADDBIT
     // ----- Spirix ALU addbit (combinational + output reg, 5 ops, 64-bit datapath) -----
-    // ADD/SUB/AND/OR/XOR with close/far split + shared barrel.
-    // Full 64-bit inputs, random width + op selection from LFSR.
+    // ADD/SUB/AND/OR/XOR with close/far split + shared barrel. Full 64-bit inputs, random width + op selection from LFSR.
 
     wire signed [63:0] ab_a_frac = lfsr[63:0];
     wire signed [63:0] ab_a_exp  = lfsr2[63:0];
@@ -1618,8 +1564,7 @@ module top_dut_bench (
                      CS_EXEC = 3'd3, CS_WAIT  = 3'd4, CS_READ  = 3'd5;
     reg [2:0] core_state = CS_IDLE;
 
-    // Instruction from LFSR: random opcode 0..19 (skip RNG — TRNG is non-deterministic,
-    // gold/test phases would get different random values and never match)
+    // Instruction from LFSR: random opcode 0..19 (skip RNG — TRNG is non-deterministic, gold/test phases would get different random values and never match)
     wire [4:0] raw_opcode = lfsr2[36:32];
     wire [4:0] sc_opcode = (raw_opcode >= 5'd20) ? (raw_opcode - 5'd20) : raw_opcode;
     wire [17:0] sc_instr = {sc_opcode, 3'd0, 3'd1, 3'd2, combo_actual[1:0], combo_actual[3:2]};
@@ -1654,8 +1599,7 @@ module top_dut_bench (
         end else case (core_state)
             CS_IDLE: begin
                 if (ce && !sc_busy && !sc_iter_done) begin
-                    // Load R0 frac/exp from LFSR (guard: !sc_iter_done prevents
-                    // loading from pre-advance LFSR when dut_advance fires same cycle)
+                    // Load R0 frac/exp from LFSR (guard: !sc_iter_done prevents loading from pre-advance LFSR when dut_advance fires same cycle)
                     sc_ext_addr  <= 3'd0;
                     sc_ext_wfrac <= lfsr[63:0];
                     sc_ext_wexp  <= lfsr2[63:0];
@@ -1742,29 +1686,19 @@ module top_dut_bench (
     // Protocol counter + accumulator + phase FSM
     // =========================================================================
 
-    // Split counter: registered carry between halves to break the carry chain.
-    // Each half is 9 bits (4-5 CCU2C stages), ~1ns carry — good to 500+ MHz.
+    // Split counter: registered carry between halves to break the carry chain. Each half is 9 bits (4-5 CCU2C stages), ~1ns carry — good to 500+ MHz.
     //
-    // Total cycles = 2^12 = 4096. Done fires when proto_hi reaches 8 (proto_hi[3]
-    // set), i.e. after 8 × 512 = 4096 advances. Warmup = first 1024 cycles
-    // (proto_hi 0..1), accumulate = cycles 1024..4095 (proto_hi 2..7), giving
-    // the same 25%/75% warmup/accumulate split as the original 2^17 design.
+    // Total cycles = 2^12 = 4096. Done fires when proto_hi reaches 8 (proto_hi[3] set), i.e. after 8 × 512 = 4096 advances. Warmup = first 1024 cycles (proto_hi 0..1), accumulate = cycles 1024..4095 (proto_hi 2..7), giving the same 25%/75% warmup/accumulate split as the original 2^17 design.
     reg [8:0] proto_lo;
     reg [8:0] proto_hi;
     reg       proto_carry;  // registered carry from lo to hi
     wire       proto_done = proto_hi[3];             // bit tap: done at 4096
-    // `accumulating` = "proto_hi >= 2", a single contiguous window from
-    // sample 1024 to 4095. (proto_hi[2] | proto_hi[1]) covers proto_hi
-    // values 2..7; ANDing with ~proto_done masks proto_hi ≥ 8 (which we
-    // never actually reach since the counter stops at done).
+    // `accumulating` = "proto_hi >= 2", a single contiguous window from sample 1024 to 4095. (proto_hi[2] | proto_hi[1]) covers proto_hi values 2..7; ANDing with ~proto_done masks proto_hi ≥ 8 (which we never actually reach since the counter stops at done).
     wire       accumulating = (proto_hi[2] | proto_hi[1]) & ~proto_done;
     reg [31:0] accum;
     reg [31:0] gold_reg = 0, test_reg = 0;
     reg        test_done_sys = 0;
-    // Toggles on each PH_TEST → PH_DONE transition. CDC'd to clk for edge-
-    // detect so display_miss latches exactly once per real capture (not
-    // continuously, which would let it transiently show garbage during the
-    // next cycle's PH_GOLD accumulation).
+    // Toggles on each PH_TEST → PH_DONE transition. CDC'd to clk for edge- detect so display_miss latches exactly once per real capture (not continuously, which would let it transiently show garbage during the next cycle's PH_GOLD accumulation).
     reg        capture_tick = 0;
 
     always @(posedge sys_clk) begin
@@ -1809,8 +1743,7 @@ module top_dut_bench (
             // =================================================================
             case (phase)
                 PH_IDLE: begin
-                    // Button just released (or first run after POR):
-                    // XOR entropy counter into LFSR for unique seed each run
+                    // Button just released (or first run after POR): XOR entropy counter into LFSR for unique seed each run
                     captured_seed  <= lfsr ^ entropy;
                     captured_seed2 <= lfsr2 ^ entropy;
                     lfsr           <= lfsr ^ entropy;
@@ -1861,9 +1794,7 @@ module top_dut_bench (
                         phase         <= PH_IDLE;
                     end
 `else
-                    // Continuous-run mode: restart for live pass/fail flicker on
-                    // marginal frequencies. test_done_sys stays high until next test
-                    // captures, so display reflects the most recent comparison.
+                    // Continuous-run mode: restart for live pass/fail flicker on marginal frequencies. test_done_sys stays high until next test captures, so display reflects the most recent comparison.
                     proto_lo <= 0; proto_hi <= 0; proto_carry <= 0;
                     accum    <= 0;
                     phase    <= PH_IDLE;
@@ -1905,11 +1836,7 @@ module top_dut_bench (
         done_sync2 <= done_sync1;
     end
 
-    // Single-bit phase indicators (sys_clk domain) → CDC into clk for the
-    // top-row debug pixels. `accumulating` is already a wire (proto_hi[6] &&
-    // !proto_hi[8]) — it goes high once the warmup phase has passed and the
-    // mul_fold output is being XORed into accum. That's the warmup→captured
-    // transition the top-right pixel needs to display.
+    // Single-bit phase indicators (sys_clk domain) → CDC into clk for the top-row debug pixels. `accumulating` is already a wire (proto_hi[6] && !proto_hi[8]) — it goes high once the warmup phase has passed and the mul_fold output is being XORed into accum. That's the warmup→captured transition the top-right pixel needs to display.
     wire in_gold_sys = (phase == PH_GOLD);
     wire in_test_sys = (phase == PH_TEST);
     reg [1:0] gold_sync  = 0;
@@ -1966,12 +1893,7 @@ module top_dut_bench (
         end
     end
 
-    // Keypad LED: LATCHED pass/fail. Drives off the buffered display_miss
-    // (which only updates at the per-capture PH_DONE edge), so the LED
-    // reports the *last completed* gold-vs-test comparison and stays steady
-    // between captures. Previously this was a live `gold_reg == test_reg`
-    // comparison that flickered through every cycle as the registers were
-    // being mutated — useless for visual pass/fail.
+    // Keypad LED: LATCHED pass/fail. Drives off the buffered display_miss (which only updates at the per-capture PH_DONE edge), so the LED reports the *last completed* gold-vs-test comparison and stays steady between captures. Previously this was a live `gold_reg == test_reg` comparison that flickered through every cycle as the registers were being mutated — useless for visual pass/fail.
     assign ext_led = (display_miss == 32'd0);
 
     // =========================================================================
@@ -2029,8 +1951,7 @@ module top_dut_bench (
         .scl(oled_scl), .sda(oled_sda)
     );
 `else
-    // Greyscale framebuffer + temporal dither (ported from top_extclk.v).
-    // 4 bands × 32 cells × 4-px-wide bit cells, even/odd brightness pairs.
+    // Greyscale framebuffer + temporal dither (ported from top_extclk.v). 4 bands × 32 cells × 4-px-wide bit cells, even/odd brightness pairs.
     //   Band 0 (rows  0..15): mul_fold (live DUT output)
     //   Band 1 (rows 16..31): gold_reg (slow-CE accumulated hash)
     //   Band 2 (rows 32..47): test_reg (full-speed accumulated hash)
@@ -2049,16 +1970,11 @@ module top_dut_bench (
     wire [31:0] display_gold_live = gold_sync2;
     wire [31:0] display_test_live = test_sync2;
 
-    // Latch display values at OLED frame boundary (page wrap 7→0). Without this,
-    // mul_fold updates every clk cycle and band 0 fills with horizontal streaks
-    // since the framebuffer writer races the OLED reader. One snapshot per
-    // ~30 Hz frame → coherent bitmap.
+    // Latch display values at OLED frame boundary (page wrap 7→0). Without this, mul_fold updates every clk cycle and band 0 fills with horizontal streaks since the framebuffer writer races the OLED reader. One snapshot per ~30 Hz frame → coherent bitmap.
     reg [31:0] display_mul  = 0;
     reg [31:0] display_gold = 0;
     reg [31:0] display_test = 0;
-    // display_miss is latched separately and ONLY updates when phase enters
-    // PH_DONE — otherwise band 3 transiently shows "fail" during PH_GOLD when
-    // gold_reg has accumulated but test_reg is still zero.
+    // display_miss is latched separately and ONLY updates when phase enters PH_DONE — otherwise band 3 transiently shows "fail" during PH_GOLD when gold_reg has accumulated but test_reg is still zero.
     reg [31:0] display_miss = 0;
 
     // 32-bit Galois LFSR for per-pixel temporal dither.
@@ -2088,9 +2004,7 @@ module top_dut_bench (
     wire [7:0]  bit_pixel   = bit_pos_odd ? (bit_value ? 8'd255 : 8'd32)
                                           : (bit_value ? 8'd191 : 8'd0);
 
-    // Top band (rows 0..15) renders 8 BCD digit slots: 4 digits + '.' + 3 digits
-    // = 96 px wide, centered cols 16..112. Layout: NNN.NNN MHz with leading-zero
-    // suppression on the first 3 integer-position digits.
+    // Top band (rows 0..15) renders 8 BCD digit slots: 4 digits + '.' + 3 digits = 96 px wide, centered cols 16..112. Layout: NNN.NNN MHz with leading-zero suppression on the first 3 integer-position digits.
     localparam integer FC_DIGIT_AREA_START = 16;
     localparam integer FC_DIGIT_AREA_END   = 16 + 8 * 12;  // 112
     wire fc_in_digit_area = (wr_col >= FC_DIGIT_AREA_START[6:0])
@@ -2111,13 +2025,7 @@ module top_dut_bench (
     end
     wire [3:0] fc_gy = wr_row[3:0];
 
-    // kHz integer display: 7 BCD digits, right-justified in slots 1..7.
-    // Slot 0 is always empty. Leading zeros suppressed up through slot 6;
-    // slot 7 (BCD[3:0]) always visible so a "0" reading shows as "0" not
-    // blank. Underlying milli_mhz == kHz (1 milli-MHz = 1 kHz), so the
-    // displayed integer IS the frequency in kHz. No decimal point — at
-    // ring/divider operating points we don't have sub-kHz resolution
-    // anyway (1/60 sec window → ±1 kHz LSB).
+    // kHz integer display: 7 BCD digits, right-justified in slots 1..7. Slot 0 is always empty. Leading zeros suppressed up through slot 6; slot 7 (BCD[3:0]) always visible so a "0" reading shows as "0" not blank. Underlying milli_mhz == kHz (1 milli-MHz = 1 kHz), so the displayed integer IS the frequency in kHz. No decimal point — at ring/divider operating points we don't have sub-kHz resolution anyway (1/60 sec window → ±1 kHz LSB).
     wire fc_suppress_p0 = (display_bcd[27:24] == 4'd0);
     wire fc_suppress_p1 = fc_suppress_p0 && (display_bcd[23:20] == 4'd0);
     wire fc_suppress_p2 = fc_suppress_p1 && (display_bcd[19:16] == 4'd0);
@@ -2164,8 +2072,7 @@ module top_dut_bench (
                                  ? fc_glyph_pixel : 8'h00;
 
     wire [7:0] fb_wr_pixel_base = in_band0 ? fc_freq_pixel : bit_pixel;
-    // Debug pixels — top corners, overlaid above the freq display (digit area
-    // is cols 16..112, so cols 0 and 127 row 0 are safe to use):
+    // Debug pixels — top corners, overlaid above the freq display (digit area is cols 16..112, so cols 0 and 127 row 0 are safe to use):
     //   top-left  (col 0,   row 0): WHITE during PH_GOLD, BLACK during PH_TEST
     //   top-right (col 127, row 0): WHITE during warmup (proto count < 32 k,
     //                                                    accum not yet sampling),
@@ -2184,8 +2091,7 @@ module top_dut_bench (
         fb_wr_addr     <= fb_wr_addr + 1;
     end
 
-    // I2C clock-enable (one ce pulse per CLK_DIV ref cycles).
-    // CLK_DIV=7 matches working top_extclk.v setting (25 MHz/7 ≈ 3.57 MHz SCL — well above spec).
+    // I2C clock-enable (one ce pulse per CLK_DIV ref cycles). CLK_DIV=7 matches working top_extclk.v setting (25 MHz/7 ≈ 3.57 MHz SCL — well above spec).
     localparam OLED_CLK_DIV = 7;
     reg [$clog2(OLED_CLK_DIV)-1:0] oled_cnt = 0;
     wire oled_at_top = (oled_cnt == OLED_CLK_DIV - 1);
@@ -2255,18 +2161,10 @@ module top_dut_bench (
         display_mul  <= display_mul_live;
         display_gold <= display_gold_live;
         display_test <= display_test_live;
-        // display_gold / display_test continuously sample the live values
-        // (so the gold/test bands stay lively as accumulation runs). But
-        // display_miss must NOT continuously update — between captures
-        // gold_reg gets reset/refilled while test_reg still holds the prior
-        // cycle, so a live XOR would show transient "fail" patterns.
-        // → see the always block below: latch exactly once per real capture.
+        // display_gold / display_test continuously sample the live values (so the gold/test bands stay lively as accumulation runs). But display_miss must NOT continuously update — between captures gold_reg gets reset/refilled while test_reg still holds the prior cycle, so a live XOR would show transient "fail" patterns. → see the always block below: latch exactly once per real capture.
     end
 
-    // Per-test latch on display_miss. Fires when capture_pulse goes high
-    // (one clk cycle per PH_TEST → PH_DONE transition, edge-detected through
-    // a toggle CDC). At that moment both gold_reg and test_reg are stable
-    // and reflect the SAME cycle's gold/test accumulators.
+    // Per-test latch on display_miss. Fires when capture_pulse goes high (one clk cycle per PH_TEST → PH_DONE transition, edge-detected through a toggle CDC). At that moment both gold_reg and test_reg are stable and reflect the SAME cycle's gold/test accumulators.
     always @(posedge clk) begin
         if (capture_pulse) display_miss <= display_gold_live ^ display_test_live;
     end

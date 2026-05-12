@@ -2,13 +2,7 @@
 // top_pipe_latch.v — Wire latch for bidirectional smoke test
 // =============================================================================
 //
-// The FPGA drives the wire with a 1-bit "latched" register most of the time;
-// every 256 enclave_clk cycles it tristates for one cycle to sample what the
-// wire actually looks like, and updates the latch from that sample. The
-// 400 Ω series resistor is on the FPGA side, so when the FPGA is driving its
-// own pin sits at the driven voltage regardless of what the host does on the
-// other end of the resistor — only the brief tristate window exposes the
-// wire's true voltage to the input buffer.
+// The FPGA drives the wire with a 1-bit "latched" register most of the time; every 256 enclave_clk cycles it tristates for one cycle to sample what the wire actually looks like, and updates the latch from that sample. The 400 Ω series resistor is on the FPGA side, so when the FPGA is driving its own pin sits at the driven voltage regardless of what the host does on the other end of the resistor — only the brief tristate window exposes the wire's true voltage to the input buffer.
 //
 // Behaviour as observed by the host:
 //   • At rest, the wire holds the last sampled value (high or low).
@@ -82,10 +76,7 @@ module top_pipe_latch (
     always @(posedge enclave_clk) if (!por_done) por_cnt <= por_cnt + 1'b1;
 
     // -------------------------------------------------------------------------
-    // Sample-phase scheduler. Tristate for 8 cycles (≈13 µs at 600 kHz),
-    // latch on cycle 7, then drive for the remaining (SAMPLE_PERIOD - 8)
-    // cycles. The long tristate gives the pad time to settle and the input
-    // synchronizer two clean cycles to propagate the external voltage.
+    // Sample-phase scheduler. Tristate for 8 cycles (≈13 µs at 600 kHz), latch on cycle 7, then drive for the remaining (SAMPLE_PERIOD - 8) cycles. The long tristate gives the pad time to settle and the input synchronizer two clean cycles to propagate the external voltage.
     // -------------------------------------------------------------------------
     localparam integer CNT_W = $clog2(`SAMPLE_PERIOD);
     localparam integer SAMPLE_WIDE = 8;

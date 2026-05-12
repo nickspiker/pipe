@@ -29,9 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec!["PIPE"]
     };
 
-    // LINE_GAP: extra pixels of empty space between consecutive lines on top of fontdue's measured glyph-run height. Default 2.
-    // LINE_HEIGHT: if set, override the per-line vertical advance entirely (uniform grid regardless of glyph extents).
-    // Y_START: vertical offset of the first baseline-ish position from row 0.
+    // LINE_GAP: extra pixels of empty space between consecutive lines on top of fontdue's measured glyph-run height. Default 2. LINE_HEIGHT: if set, override the per-line vertical advance entirely (uniform grid regardless of glyph extents). Y_START: vertical offset of the first baseline-ish position from row 0.
     let line_gap: f32 = env::var("LINE_GAP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let line_height_override: Option<f32> = env::var("LINE_HEIGHT").ok().and_then(|s| s.parse().ok());
     let y_start: f32 = env::var("Y_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);

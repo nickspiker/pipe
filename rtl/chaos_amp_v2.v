@@ -2,16 +2,11 @@
 // chaos_amp_v2.v — PIPE chaos amplifier v2 (Dragonfly v2)
 // =============================================================================
 //
-// Bit-exact silicon implementation of `pipe::chaos_amp_v2::chaos_amp_v2`. See
-// PROTOCOL.md and enclave/src/chaos_amp_v2.rs for the algorithmic spec.
+// Bit-exact silicon implementation of `pipe::chaos_amp_v2::chaos_amp_v2`. See PROTOCOL.md and enclave/src/chaos_amp_v2.rs for the algorithmic spec.
 //
-// Where v1 burned ~22k LUT4 on parallel AES S-box decode, v2 uses a 32-op
-// data-dependent ALU menu serialized one bucket at a time. The 32-way mux
-// happens in one shared instance feeding the regfile rather than 16 parallel
-// copies — trades cycles for area.
+// Where v1 burned ~22k LUT4 on parallel AES S-box decode, v2 uses a 32-op data-dependent ALU menu serialized one bucket at a time. The 32-way mux happens in one shared instance feeding the regfile rather than 16 parallel copies — trades cycles for area.
 //
-// State: 16 buckets × 24 bits (F16E8: 16-bit fraction + 8-bit exponent).
-// Total state = 384 bits, stored as a packed `[23:0]` array.
+// State: 16 buckets × 24 bits (F16E8: 16-bit fraction + 8-bit exponent). Total state = 384 bits, stored as a packed `[23:0]` array.
 //
 // FSM (serial, 1 bucket/cycle):
 //   IDLE     → wait for `start`
@@ -21,8 +16,7 @@
 //   (PHASE1+PHASE2 loop 16 rounds = 16×32 = 512 cycles for the rounds)
 //   FINISH   → assert `done`, return to IDLE
 //
-// Total cycles per chaos_amp_v2 call: 1 + 512 + 1 = 514 cycles.
-// At ring-osc-divided 50 MHz that's ~10 µs — negligible at PIPE protocol rates.
+// Total cycles per chaos_amp_v2 call: 1 + 512 + 1 = 514 cycles. At ring-osc-divided 50 MHz that's ~10 µs — negligible at PIPE protocol rates.
 // =============================================================================
 
 `timescale 1ns / 1ps
@@ -40,10 +34,7 @@ module chaos_amp_v2 (
     localparam integer ROUNDS  = 16;
 
     // =========================================================================
-    // Round constants — `blake3("PIPE chaos amp v2 - Dragonfly")` first 12 +
-    // `blake3("PIPE chaos amp v2 - Dragonfly - more")` next 4. Verified bit-
-    // exact by enclave/src/chaos_amp_v2.rs::round_consts_match_blake3.
-    // Stored as 32-bit values; only low 24 bits feed the round XOR.
+    // Round constants — `blake3("PIPE chaos amp v2 - Dragonfly")` first 12 + `blake3("PIPE chaos amp v2 - Dragonfly - more")` next 4. Verified bit- exact by enclave/src/chaos_amp_v2.rs::round_consts_match_blake3. Stored as 32-bit values; only low 24 bits feed the round XOR.
     // =========================================================================
     reg [31:0] round_const [0:ROUNDS-1];
     initial begin
@@ -84,8 +75,7 @@ module chaos_amp_v2 (
     // Helper functions
     // =========================================================================
 
-    // pos_const(i, r) = ((i * 0x9E3779B9) ^ (r * 0x517CC1B7)) & 0x00FFFFFF.
-    // Cheap arithmetic; yosys reduces multiply by constant to shift+add chain.
+    // pos_const(i, r) = ((i * 0x9E3779B9) ^ (r * 0x517CC1B7)) & 0x00FFFFFF. Cheap arithmetic; yosys reduces multiply by constant to shift+add chain.
     function [23:0] pos_const;
         input [4:0] i;
         input [4:0] r;
@@ -219,8 +209,7 @@ module chaos_amp_v2 (
     endfunction
 
     // =========================================================================
-    // 32-op ALU — combinational on (op_idx, val, secondary).
-    // Matches enclave/src/chaos_amp_v2.rs::op_apply.
+    // 32-op ALU — combinational on (op_idx, val, secondary). Matches enclave/src/chaos_amp_v2.rs::op_apply.
     // =========================================================================
     function [23:0] op_apply;
         input [4:0] op_idx;
@@ -366,8 +355,7 @@ module chaos_amp_v2 (
                     new_exp  = uea ^ ueb;
                 end
                 5'd31: begin                                                                              // PCNT_REPLACE
-                    // Each popcount16 returns 5 bits; zero-extend to 8 so two byte fields concat cleanly into a 16-bit frac.
-                    // The exp popcount must include the 9th bit of (uea + ueb) — Rust does the add in u16 first then popcounts, so we add in 9-bit context (1 carry bit) then popcount the full 9 bits.
+                    // Each popcount16 returns 5 bits; zero-extend to 8 so two byte fields concat cleanly into a 16-bit frac. The exp popcount must include the 9th bit of (uea + ueb) — Rust does the add in u16 first then popcounts, so we add in 9-bit context (1 carry bit) then popcount the full 9 bits.
                     new_frac = {{3'd0, popcount16(ufb)}, {3'd0, popcount16(ufa)}};
                     new_exp  = {3'd0, popcount16({7'b0, uea} + {7'b0, ueb})};
                 end

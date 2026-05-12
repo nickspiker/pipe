@@ -4,9 +4,7 @@
 //!
 //! PIPE silicon is a *primitive*, not a protocol:
 //!
-//! ```text
-//! ragu = BLAKE3_keyed(key, chaos_amp(64-byte input) || input)
-//! ```
+//! ```text ragu = BLAKE3_keyed(key, chaos_amp(64-byte input) || input) ```
 //!
 //! - `key` is the 256-bit secret in the silicon's write-once register
 //! - `input` is whatever the kernel hands the silicon — semantics are policy

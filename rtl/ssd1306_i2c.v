@@ -1,12 +1,8 @@
-// I2C bit-bang driver (write-only, no ACK check)
-// Clocked at 25 MHz, generates ~390 kHz SCL (divide by 64)
+// I2C bit-bang driver (write-only, no ACK check) Clocked at 25 MHz, generates ~390 kHz SCL (divide by 64)
 //
-// Interface: load a byte into `data`, pulse `start`. Driver shifts it out
-// MSB-first with proper I2C framing. `busy` high while transmitting.
-// `send_start`/`send_stop` control I2C START/STOP conditions.
+// Interface: load a byte into `data`, pulse `start`. Driver shifts it out MSB-first with proper I2C framing. `busy` high while transmitting. `send_start`/`send_stop` control I2C START/STOP conditions.
 //
-// Between bytes (no STOP), SCL stays low and `busy` drops so the next
-// byte can be loaded. This avoids spurious STOP/START glitches.
+// Between bytes (no STOP), SCL stays low and `busy` drops so the next byte can be loaded. This avoids spurious STOP/START glitches.
 
 module ssd1306_i2c #(
     parameter CLK_DIV = 64   // 25 MHz / 64 = ~390 kHz SCL
