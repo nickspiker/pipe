@@ -172,18 +172,92 @@ In practice, `effective[s]` looks like:
 
 The CDR PLL needs τ wide enough to coast through the worst case (alternating enclave data → 50% edges) without unlocking, which is easy: a few slots of edge dropout doesn't budge a properly-tuned loop.
 
-## Layer 3 — framing (per-application)
+## Layer 3 — messaging and authentication (protocol v0)
 
-Mirror-XOR is a stream code; it does not impose framing. For attestation, the convention is:
+Mirror-XOR is a stream code; it does not impose framing. Layer 3 provides framing, mode signaling, integrity, freshness, and recovery — all built from BLAKE3, XOR, and bitwise complement. No HMAC construction, no length fields, no opcodes. Two message shapes only.
 
-- **Idle:** both data streams = 0.
-- **Host attestation request:** stream `1` (start bit) || 256 challenge bits || `0…`.
-- **Enclave response (when host's start bit is detected):** capture next 256 bits as challenge, compute `r = ragu(key, kernel_layered_input(challenge))`, stream `1` (start bit) || 256 ragu bits || `0…`.
-- **Host (when enclave's start bit is detected):** capture next 256 bits as ragu, verify.
+**Threat model assumed.** Eavesdropping is out of scope — the wire is on-die or close to it. Injection requires inside-package physical access, which is also out of scope. The protocol defends against: replay across sessions, single-bit corruption inside a session (detected via hash mismatch → fresh-session reset), and reuse of an attestation across the SESSION/PERMANENT modes.
 
-Total transaction = 257 bits each direction = 514 slots. At a 1 MHz slot rate, ~514 µs. Both directions can stream concurrently — host is allowed to begin its 257-bit request while the enclave is still finishing a previous response, and vice versa.
+### State (each side maintains)
 
-The single `1` start bit is sufficient because a noise-induced bit-error rate over a short PCB-level wire is effectively zero. For an isolated/optical embodiment with non-zero BER, this layer is replaced by a longer sync sequence (e.g., a Barker code) — Layer 1 doesn't change.
+```
+session_secret : 256 bits   — root of the current session
+H_req          : 256 bits   — XOR pad for the "message" half of next exchange
+H_resp         : 256 bits   — XOR pad for the "hash" half of next exchange
+```
+
+`H_req` and `H_resp` ratchet on every verified exchange (see below). All three reset on fresh-session.
+
+### Message shape A — fresh-session (host → enclave, then enclave → host)
+
+Host signal: a single `1` followed by 255 zeros in the host's data stream — a 256-bit pattern of `1, 0, 0, …, 0`.
+
+Enclave response:
+```
+session_secret ← TRNG.draw(256)
+H_req          ← BLAKE3(session_secret)
+H_resp         ← BLAKE3(~session_secret)
+```
+Enclave emits `session_secret` (256 bits) in its data stream.
+
+Host, on receiving the 256-bit secret, performs the same `H_req` / `H_resp` derivation. Both sides are now synchronized.
+
+Detection: enclave buffers the host's first 256 data bits after idle. If they are exactly `1, 0, 0, …, 0` it is a fresh-session request; any other pattern is the start of a message-B exchange (probability of message B accidentally matching: 2⁻²⁵⁵).
+
+### Message shape B — authenticated exchange (512 bits each direction)
+
+Host's request, 512 bits sent over 512 host slots:
+
+```
+bits   0..255 :  X1 = message_req  XOR  H_req
+bits 256..511 :  X2 =  BLAKE3(message_req)  XOR  H_resp        (mode = SESSION)
+                 X2 = ~BLAKE3(message_req)  XOR  H_resp        (mode = PERMANENT)
+```
+
+Enclave verifies by recovering `message_req = X1 XOR H_req`, computing `BLAKE3(message_req)`, and checking which of `BLAKE3(message_req) XOR H_resp` or `~BLAKE3(message_req) XOR H_resp` equals `X2`. The matching case determines mode. No match → corruption → drop, do not advance pads (host will retry or fresh-session).
+
+Enclave computes:
+```
+active_key   = session_secret    (SESSION)
+             = permanent_key     (PERMANENT, eFuse-backed; burn-on-first-use)
+message_resp = BLAKE3.keyed(active_key, message_req)
+```
+
+Enclave's response, 512 bits sent over 512 enclave slots, mirrors the requested mode:
+
+```
+bits   0..255 :  X1 = message_resp  XOR  H_req
+bits 256..511 :  X2 =  BLAKE3(message_resp)  XOR  H_resp        (SESSION echo)
+                 X2 = ~BLAKE3(message_resp)  XOR  H_resp        (PERMANENT echo)
+```
+
+Host verifies the same way the enclave did. On successful verification both sides advance:
+```
+H_req  ← BLAKE3(message_req)
+H_resp ← BLAKE3(message_resp)
+```
+
+A mismatch on either side is detected at verify time. The corrupted exchange is dropped, pads are *not* advanced, the other side will be desynced on next attempt → host issues fresh-session and both sides reset.
+
+### Properties
+
+- **One escape hatch for everything.** Bit error, lost response, suspicious payload, host software lost state, enclave hung mid-burn — fresh-session resets all of it. No partial-recovery protocol to design.
+- **Forward secrecy after exchange 1.** Pads ratchet via one-way hashes; recovering state at exchange N reveals nothing about exchanges < N.
+- **Cross-session repetition hidden after exchange 1.** Two sessions doing the same exchange-2 produce entirely different wire bytes because `H_req` and `H_resp` at exchange 2 depend on session-specific exchange-1 message hashes. (Exchange 1 leaks `msg XOR BLAKE3(msg) XOR K_session` to anyone computing X1 XOR X2 — this is the known residue of the dual-init from a single seed, intentionally accepted because eavesdropping is out of scope.)
+- **Mode-confusion immune.** Same `message_req` under SESSION vs PERMANENT produces different second-halves (hash vs bit-flipped hash). An attacker cannot replay a SESSION response as a PERMANENT response.
+- **Burn timing observable but unexploitable.** First PERMANENT request takes ~1–2 s (entropy spin-up + TRNG-randomized burn timing + read-verify), subsequent requests are ~ms. The wire reveals "the burn happened around now" but not "when within that window each fuse blew" or "what bits got burned."
+- **Bandwidth-bounded.** At 50 kHz slot rate, one exchange (~2 × 1024 slots after counting both directions) is ~40 ms. Brute-forcing a 256-bit key over the wire is ≈ 2²⁵⁶ × 0.04 s = beyond cosmological. Slow is the security property.
+- **Statistically uniform.** Every bit on the wire is either TRNG output, BLAKE3 output, an XOR of two such, or a bit-flip thereof. No structure for an eavesdropper to lock onto, even if eavesdropping returned to scope.
+
+### What about the first authenticated exchange after fresh-session?
+
+`H_req XOR H_resp = BLAKE3(session_secret) XOR BLAKE3(~session_secret)`, a session-specific 256-bit constant. So for exchange 1 in any session, `X1 XOR X2 = message_req XOR BLAKE3(message_req) XOR (that constant)`. The constant cancels across exchanges within the session, leaving a per-message fingerprint visible to anyone computing `X1 XOR X2`. The fingerprint is unique per message and gives no other information; under the stated threat model it is invisible. From exchange 2 onward the chain replaces the per-session constant with per-message hashes, killing even this residue.
+
+If eavesdropping ever moves into scope, the fix is one extra hash at session init: derive `H_req = BLAKE3(session_secret || 0x00)` and `H_resp = BLAKE3(session_secret || 0x01)` instead, so the two pads are unrelated derivations. Same wire shape, marginally more init cost, fingerprint gone.
+
+### Why this is v0
+
+This is the simplest protocol we found that hits the threat model exactly. v1 is what we will need when someone discovers a real flaw or when the threat model widens (eavesdropping in scope, link-level errors common, mutual auth needed, etc.). Naming it v0 keeps the door open for breaking changes without anyone arguing about whether they are "really breaking" — every version bump is breaking; that is the point of the number.
 
 ## Reference encode/decode
 
