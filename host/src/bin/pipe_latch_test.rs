@@ -1,8 +1,6 @@
 //! Bidirectional PIPE wire smoke test (host ↔ enclave).
 //!
-//! Prerequisite: FPGA flashed with `build_pipe_latch.sh --program`. The FPGA
-//! continuously samples the wire and drives it with the last sampled value;
-//! whatever the host writes persists after the host releases.
+//! Prerequisite: FPGA flashed with `build_pipe_latch.sh --program`. The FPGA continuously samples the wire and drives it with the last sampled value; whatever the host writes persists after the host releases.
 //!
 //! This test:
 //!   1. Sample wire — record V0.
@@ -12,8 +10,7 @@
 //!   5. Sample — expect LOW.
 //!   6. Drive HIGH again, sample, expect HIGH.
 //!
-//! All steps via MPSSE on FT232H ADBUS7 (the bit physically connected to the
-//! bridged E16/F15 pad through 400 Ω + header D7).
+//! All steps via MPSSE on FT232H ADBUS7 (the bit physically connected to the bridged E16/F15 pad through 400 Ω + header D7).
 
 use pipe_host::ft232h::{Ft232h, PIPE_ADBUS_BIT, PIPE_PIN_MASK};
 use std::thread::sleep;
@@ -23,8 +20,7 @@ const MPSSE_CLOCK_HZ: u32 = 6_000_000;
 const HOLD_MS: u64 = 20;
 
 fn sample(ft: &mut Ft232h) -> Result<u8, ftdi_nusb::Error> {
-    // Read once, but throw away a couple of samples first to let the chip
-    // settle after a direction change.
+    // Read once, but throw away a couple of samples first to let the chip settle after a direction change.
     let _ = ft.sample_low(8)?;
     let s = ft.sample_low(16)?;
     let bit = s.last().copied().unwrap_or(0) & PIPE_PIN_MASK;

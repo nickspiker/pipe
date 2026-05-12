@@ -1,12 +1,8 @@
 //! FT232H wrapper for PIPE wire I/O via MPSSE.
 //!
-//! This board's FT232H has a blank/uninitialised EEPROM, so async bit-bang
-//! mode doesn't deliver bulk IN data. MPSSE works (openFPGALoader uses it
-//! for SVF programming). We sample/drive the wire by batching GET_BITS_LOW
-//! and SET_BITS_LOW commands.
+//! This board's FT232H has a blank/uninitialised EEPROM, so async bit-bang mode doesn't deliver bulk IN data. MPSSE works (openFPGALoader uses it for SVF programming). We sample/drive the wire by batching GET_BITS_LOW and SET_BITS_LOW commands.
 //!
-//! Wiring (discovered by polling): FPGA pin E16 (bridged to F15) → 400 Ω →
-//! header pin D7 → FT232H **ADBUS7**.
+//! Wiring (discovered by polling): FPGA pin E16 (bridged to F15) → 400 Ω → header pin D7 → FT232H **ADBUS7**.
 
 use ftdi_nusb::{mpsse::MpsseContext, BitMode, FtdiDevice};
 
@@ -52,10 +48,7 @@ impl Ft232h {
         self.mpsse.set_gpio_low(&mut self.dev, value, direction)
     }
 
-    /// Combine SET_BITS_LOW (configure dir + drive), then GET_BITS_LOW after a
-    /// short MPSSE no-op, in a single USB write. Useful for "drive briefly,
-    /// release, sample once" patterns where USB round-trip latency would
-    /// otherwise miss the FPGA's response window. Returns the sampled byte.
+    /// Combine SET_BITS_LOW (configure dir + drive), then GET_BITS_LOW after a short MPSSE no-op, in a single USB write. Useful for "drive briefly, release, sample once" patterns where USB round-trip latency would otherwise miss the FPGA's response window. Returns the sampled byte.
     pub fn drive_then_sample(
         &mut self,
         drive_value: u8,
@@ -109,13 +102,7 @@ impl Ft232h {
         self.mpsse.get_gpio_low(&mut self.dev)
     }
 
-    /// Issue `count` back-to-back GET_BITS_LOW commands in a single MPSSE
-    /// transaction (one USB write, then drain reads). At the FT232H's
-    /// internal MPSSE rate this gives a continuous sample window — the
-    /// chip's TX buffer (~1 KB) gates the chip but every byte returned
-    /// represents an evenly-spaced sample. Returns the raw stream; the
-    /// caller should be prepared for a couple of 0xFA-tagged bad-command
-    /// echo bytes at the very start of the first call after `open()`.
+    /// Issue `count` back-to-back GET_BITS_LOW commands in a single MPSSE transaction (one USB write, then drain reads). At the FT232H's internal MPSSE rate this gives a continuous sample window — the chip's TX buffer (~1 KB) gates the chip but every byte returned represents an evenly-spaced sample. Returns the raw stream; the caller should be prepared for a couple of 0xFA-tagged bad-command echo bytes at the very start of the first call after `open()`.
     pub fn sample_low(&mut self, count: usize) -> Result<Vec<u8>, ftdi_nusb::Error> {
         if count == 0 {
             return Ok(Vec::new());

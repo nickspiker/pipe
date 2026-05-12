@@ -1,8 +1,6 @@
 //! Wire-side edge counting and frequency measurement.
 //!
-//! For the TX-only smoke test, the FPGA drives a square wave at slot_rate / 2.
-//! Sampling at ~6 Msps, we count transitions on each ADBUS bit, pick the
-//! noisiest pin (= the one wired to the FPGA), and convert edge count to Hz.
+//! For the TX-only smoke test, the FPGA drives a square wave at slot_rate / 2. Sampling at ~6 Msps, we count transitions on each ADBUS bit, pick the noisiest pin (= the one wired to the FPGA), and convert edge count to Hz.
 
 pub fn count_edges(samples: &[u8], bit_index: u8) -> u64 {
     let mask = 1u8 << bit_index;

@@ -1,17 +1,10 @@
 //! Host-side PIPE protocol smoke test.
 //!
-//! Talks to `top_pipe_codec.v` via FT232H MPSSE in batched form: one big USB
-//! write programs an entire run (drive + sample + drive + sample × N) at
-//! slot-rate timing using MPSSE "Clock For N Bytes" as a precise delay
-//! primitive. Reads the queued GET_BITS_LOW responses back, walks them
-//! through `Codec::host()`, and prints decoded bytes.
+//! Talks to `top_pipe_codec.v` via FT232H MPSSE in batched form: one big USB write programs an entire run (drive + sample + drive + sample × N) at slot-rate timing using MPSSE "Clock For N Bytes" as a precise delay primitive. Reads the queued GET_BITS_LOW responses back, walks them through `Codec::host()`, and prints decoded bytes.
 //!
 //! Sequence:
-//!   1. Sample 64 slots with host driving 0 (idle) — verify wire shows the
-//!      enclave's 1010 idle pattern.
-//!   2. Inject host_tx=1 at slot 64 and idle thereafter — verify the
-//!      enclave's echo (tx_data <- rx_data) shifts subsequent slot
-//!      emissions, and that the host codec recovers the response bit.
+//!   1. Sample 64 slots with host driving 0 (idle) — verify wire shows the enclave's 1010 idle pattern.
+//!   2. Inject host_tx=1 at slot 64 and idle thereafter — verify the enclave's echo (tx_data <- rx_data) shifts subsequent slot emissions, and that the host codec recovers the response bit.
 
 use pipe_host::codec::Codec;
 use pipe_host::ft232h::{Ft232h, PIPE_PIN_MASK};
@@ -23,19 +16,43 @@ const INJECT_AT: usize = 16;       // host injects a 1 at this slot index
 
 const MPSSE_SET_BITS_LOW: u8 = 0x80;
 const MPSSE_GET_BITS_LOW: u8 = 0x81;
-const MPSSE_CLOCK_BYTES: u8 = 0x8F;
+const MPSSE_CLOCK_BYTES: u8 = 0x8F;  // length unit = 8 MPSSE clocks
+const MPSSE_CLOCK_BITS: u8 = 0x8E;   // length unit = 1 MPSSE clock (max 8/cmd)
 const MPSSE_SEND_IMMEDIATE: u8 = 0x87;
 
-fn clock_for(bytes: u16) -> [u8; 3] {
-    let n = bytes - 1;
-    [MPSSE_CLOCK_BYTES, (n & 0xFF) as u8, ((n >> 8) & 0xFF) as u8]
+/// Emit MPSSE commands that consume exactly `target_clocks` MPSSE clock cycles of TCK time (used purely as a calibrated delay). Combines 0x8F (byte-granular, 8 clocks/unit) and 0x8E (bit-granular, 1 clock/unit, ≤ 8 clocks per cmd) so we can hit any target ≥ 2. The 0x8E fine-tune cmd can fill 2..9 clocks; if the byte-granular chunk leaves a 0- or 1-clock remainder, we back off one byte cycle so the remainder lands in [8, 9] (still reachable by 0x8E with N=6 or 7).
+fn delay_cmds(target_clocks: u32) -> Vec<u8> {
+    let mut cmds = Vec::new();
+    if target_clocks < 2 {
+        return cmds;
+    }
+    let mut rem = target_clocks;
+    // 0x8F: 1 setup + 8*(N+1) clocks.
+    if rem >= 9 {
+        let mut n = ((rem - 9) / 8).min(0xFFFF);
+        let mut consumed = 8 * (n + 1) + 1;
+        // If the leftover would be < 2, 0x8E can't finish — back off one byte cycle so the leftover lands in [8, 9].
+        if rem - consumed < 2 && n > 0 {
+            n -= 1;
+            consumed = 8 * (n + 1) + 1;
+        }
+        cmds.push(MPSSE_CLOCK_BYTES);
+        cmds.push((n & 0xFF) as u8);
+        cmds.push(((n >> 8) & 0xFF) as u8);
+        rem -= consumed;
+    }
+    // 0x8E: 1 setup + (N+1) clocks, N in [0, 7].
+    if rem >= 2 {
+        let bits = (rem - 1).min(8);
+        let n = bits - 1;
+        cmds.push(MPSSE_CLOCK_BITS);
+        cmds.push(n as u8);
+    }
+    cmds
 }
 
 fn calibrate_half_slot_bytes(ft: &mut Ft232h) -> Result<u16, ftdi_nusb::Error> {
-    // Sample 4096 bytes back-to-back. Each GET_BITS_LOW in this batch takes
-    // a fixed number of MPSSE cycles; measure the *average bit period* on
-    // ADBUS7 (the wire) to figure out how many GET_BITS_LOW commands
-    // correspond to one FPGA half-slot.
+    // Sample 4096 bytes back-to-back. Each GET_BITS_LOW in this batch takes a fixed number of MPSSE cycles; measure the average bit period on ADBUS7 (the wire) to figure out how many GET_BITS_LOW commands correspond to one FPGA half-slot.
     // Build a chunked sample stream that fits the FT232H's TX FIFO (~1 KB).
     let mut samples = Vec::new();
     for _ in 0..4 {
@@ -61,8 +78,9 @@ fn calibrate_half_slot_bytes(ft: &mut Ft232h) -> Result<u16, ftdi_nusb::Error> {
         }
     }
     if edge_positions.len() < 4 {
-        eprintln!("Calibration: only {} edges; using default 8", edge_positions.len());
-        return Ok(8);
+        // The codec bitstream tristates during host slots; without the host driving, the wire shows no edges in pure sample-only mode. Fall back to the empirical value (56 ± a few clocks at SLOT_DIV=12, room temperature, this ring osc).
+        eprintln!("Calibration: only {} edges; falling back to 56 clocks/half-slot", edge_positions.len());
+        return Ok(56);
     }
     // Mean gap between edges = number of GET_BITS_LOW per half-slot.
     let mut gaps: Vec<usize> = edge_positions.windows(2).map(|w| w[1] - w[0]).collect();
@@ -74,11 +92,7 @@ fn calibrate_half_slot_bytes(ft: &mut Ft232h) -> Result<u16, ftdi_nusb::Error> {
         valid.len(),
         median_gap
     );
-    // The MPSSE Clock-For-N-Bytes command and the GET_BITS_LOW command are
-    // each one byte-time on the chip, so 1 GET_BITS_LOW + N+1 "clock-for"
-    // byte cycles takes N+2 byte times. Use one Clock-For-N command to
-    // generate a delay equal to the median gap, accounting for the
-    // GET_BITS_LOW byte itself (≈ 1).
+    // The MPSSE Clock-For-N-Bytes command and the GET_BITS_LOW command are each one byte-time on the chip, so 1 GET_BITS_LOW + N+1 "clock-for" byte cycles takes N+2 byte times. Use one Clock-For-N command to generate a delay equal to the median gap, accounting for the GET_BITS_LOW byte itself (≈ 1).
     let half = median_gap.saturating_sub(1).max(1) as u16;
     eprintln!("→ half_slot_bytes = {}", half);
     Ok(half)
@@ -95,17 +109,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Build the command sequence ------------------------------------
     // Each slot pair:
-    //   * Host slot: SET_BITS_LOW drive(host_tx) PIPE_PIN_MASK,
-    //                Clock For half_slot_bytes,
-    //                SET_BITS_LOW 0 0 (release),
-    //                Clock For half_slot_bytes.
-    //   * Enclave slot: GET_BITS_LOW,
-    //                Clock For half_slot_bytes,
-    //                GET_BITS_LOW,
-    //                Clock For half_slot_bytes.
-    //   The enclave-slot samples bracket the slot so we can correlate
-    //   phase. The first GET captures the early enclave drive; the second
-    //   captures the late enclave drive (after host released).
+    //   * Host slot: SET_BITS_LOW drive(host_tx) PIPE_PIN_MASK, Clock For half_slot_bytes, SET_BITS_LOW 0 0 (release), Clock For half_slot_bytes.
+    //   * Enclave slot: GET_BITS_LOW, Clock For half_slot_bytes, GET_BITS_LOW, Clock For half_slot_bytes.
+    //   The enclave-slot samples bracket the slot so we can correlate phase. The first GET captures the early enclave drive; the second captures the late enclave drive (after host released).
 
     let mut cmds: Vec<u8> = Vec::new();
     let mut host_codec = Codec::host();
@@ -118,25 +124,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // delay's `bytes` arg should be half_slot_bytes - 1 (so its execution
     // time is half_slot_bytes; the 4 setup cycles for SET/GET commands
     // amount to the slack absorbed by leaving N slightly under target).
-    // The calibration counts MPSSE *clock* cycles per half-slot (each
-    // GET_BITS_LOW takes 1 clock cycle). Clock-For-N+1 generates (N+1)×8
-    // MPSSE clock cycles, plus ~1 cycle command setup. SET_BITS_LOW and
-    // GET_BITS_LOW also take 1 clock cycle each.
+    // Per pair: 4 SET/GET commands (1 clock cycle each) + 4 waits. Target = 2 FPGA slots = 4 × half_slot_clocks. So each wait should be half_slot_clocks - 1 clock cycles. With bit-granular delay_cmds() we can hit any integer value exactly.
     //
-    // Per loop iteration: 4 cmds (~4 clock cycles) + 4 waits. To total
-    // exactly 2 × half_slot_clocks × 2 = 4 × half_slot_clocks, each wait
-    // should consume (half_slot_clocks - 1) clock cycles → bytes value
-    // is round((half_slot_clocks - 1) / 8) - 1 (since each clock_for(bytes)
-    // generates 8*bytes clock cycles + 1 cmd cycle = 8*bytes + 1).
-    let half_clocks = half_slot_bytes as u32; // calibration is in clock cycles
-    let target_wait_clocks = half_clocks.saturating_sub(1); // leave 1 cycle for the framing cmd
-    let bytes = (target_wait_clocks / 8).max(1) as u16;
-    let delay_bytes = bytes;
+    // Empirically, calibration tends to count slightly short (each GET_BITS_LOW takes a little more than 1 MPSSE clock to execute on this chip), so the same N edges span N+ε clock cycles. We add a small wait-time offset to compensate; if you see the wire pattern walk through phases, sweep WAIT_OFFSET ± a few clocks.
+    let half_clocks = half_slot_bytes as u32;
+    let wait_offset: i32 = std::env::var("WAIT_OFFSET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let target_wait_clocks = (half_clocks as i32 - 1 + wait_offset).max(2) as u32;
+    let delay_payload = delay_cmds(target_wait_clocks);
     eprintln!(
-        "half-slot ≈ {} clock cycles → delay_bytes = {} (≈ {} clock cycles per wait)",
+        "half-slot ≈ {} clk → wait = {} clk (offset {:+}), delay payload {} bytes",
         half_clocks,
-        delay_bytes,
-        delay_bytes as u32 * 8 + 1
+        target_wait_clocks,
+        wait_offset,
+        delay_payload.len()
     );
 
     for i in 0..PAIR_SLOTS {
@@ -148,15 +151,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Host slot: drive, wait half-slot, release, wait half-slot.
         cmds.extend_from_slice(&[MPSSE_SET_BITS_LOW, drive_value, PIPE_PIN_MASK]);
-        cmds.extend_from_slice(&clock_for(delay_bytes));
+        cmds.extend_from_slice(&delay_payload);
         cmds.extend_from_slice(&[MPSSE_SET_BITS_LOW, 0x00, 0x00]);
-        cmds.extend_from_slice(&clock_for(delay_bytes));
+        cmds.extend_from_slice(&delay_payload);
 
         // Enclave slot: tristate (input), sample twice.
         cmds.extend_from_slice(&[MPSSE_GET_BITS_LOW]);
-        cmds.extend_from_slice(&clock_for(delay_bytes));
+        cmds.extend_from_slice(&delay_payload);
         cmds.extend_from_slice(&[MPSSE_GET_BITS_LOW]);
-        cmds.extend_from_slice(&clock_for(delay_bytes));
+        cmds.extend_from_slice(&delay_payload);
     }
     cmds.push(MPSSE_SEND_IMMEDIATE);
 
@@ -168,8 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ---- Execute ------------------------------------------------------
-    // ftdi-nusb's write_data tops out at writebuffer_chunksize per call;
-    // for >65k bytes we'd need to chunk. We're well under that.
+    // ftdi-nusb's write_data tops out at writebuffer_chunksize per call; for >65k bytes we'd need to chunk. We're well under that.
     use std::time::Instant;
     let t0 = Instant::now();
     ft_write_all(&mut ft, &cmds)?;
@@ -183,9 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ---- Decode -------------------------------------------------------
-    // responses[2k]   = early sample of enclave slot k (right after host released)
-    // responses[2k+1] = late sample of enclave slot k (well into the enclave drive)
-    // Use the late sample for the codec's wire_in.
+    // responses[2k] = early sample of enclave slot k (right after host released). responses[2k+1] = late sample (well into the enclave drive). Use the late sample for the codec's wire_in.
     let enclave_samples: Vec<u8> = responses
         .chunks_exact(2)
         .map(|p| (p[1] >> 7) & 1)

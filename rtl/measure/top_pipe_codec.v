@@ -2,20 +2,13 @@
 // top_pipe_codec.v — Real PIPE protocol on the wire (enclave side)
 // =============================================================================
 //
-// Instantiates the slot-based codec from rtl/codec.v with drive_en gated to
-// my_slot, so the enclave only drives its own slots and tristates during
-// host slots. This avoids the FPGA-vs-host wire contention that broke the
-// latch-style experiments.
+// Instantiates the slot-based codec from rtl/codec.v with drive_en gated to my_slot, so the enclave only drives its own slots and tristates during host slots. This avoids the FPGA-vs-host wire contention that broke the latch-style experiments.
 //
 // Echo policy: tx_data mirrors the last decoded RX bit. So:
-//   • Host idle  → host_codec drives 0 in its slot → enclave decodes 0 →
-//                  tx_data stays 0 → enclave drives OWN_IDLE = 1 in its slot.
-//   • Host injects 1 → enclave decodes 1 → next enclave slot, the encoding
-//                  XORs in other_last=1, shifting the wire pattern → the
-//                  host_codec recovers the 1 as `rx_data`.
+//   • Host idle  → host_codec drives 0 in its slot → enclave decodes 0 → tx_data stays 0 → enclave drives OWN_IDLE = 1 in its slot.
+//   • Host injects 1 → enclave decodes 1 → next enclave slot, the encoding XORs in other_last=1, shifting the wire pattern → the host_codec recovers the 1 as `rx_data`.
 //
-// SLOT_DIV chosen by build script. Default 12 → ~50 kHz slot rate at
-// enclave_clk ≈ 600 kHz.
+// SLOT_DIV chosen by build script. Default 12 → ~50 kHz slot rate at enclave_clk ≈ 600 kHz.
 //
 // =============================================================================
 
@@ -80,8 +73,7 @@ module top_pipe_codec (
     always @(posedge enclave_clk) if (!por_done) por_cnt <= por_cnt + 1'b1;
 
     // -------------------------------------------------------------------------
-    // Slot clock — generates slot_tick (one enclave_clk pulse per slot) and
-    // my_slot (alternates each tick). The codec is clocked off slot_tick.
+    // Slot clock — generates slot_tick (one enclave_clk pulse per slot) and my_slot (alternates each tick). The codec is clocked off slot_tick.
     // -------------------------------------------------------------------------
     wire slot_tick;
     wire my_slot;

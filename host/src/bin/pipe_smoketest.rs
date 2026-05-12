@@ -1,12 +1,8 @@
 //! TX-only PIPE wire smoke test.
 //!
-//! Samples ADBUS7 via batched MPSSE GET_BITS_LOW commands, counts edges, and
-//! converts to wire frequency. Expected: ~25 kHz (slot rate / 2) at default
-//! SLOT_DIV=12.
+//! Samples ADBUS7 via batched MPSSE GET_BITS_LOW commands, counts edges, and converts to wire frequency. Expected: ~25 kHz (slot rate / 2) at default SLOT_DIV=12.
 //!
-//! Hardware: FPGA E16 (bridged to F15) → 400 Ω → header D7 → FT232H ADBUS7.
-//! Bit-bang doesn't work on this FT232H (blank EEPROM), so we use MPSSE
-//! batched polling instead. Effective sample rate ≈ MPSSE_CLOCK_HZ / 5.
+//! Hardware: FPGA E16 (bridged to F15) → 400 Ω → header D7 → FT232H ADBUS7. Bit-bang doesn't work on this FT232H (blank EEPROM), so we use MPSSE batched polling instead. Effective sample rate ≈ MPSSE_CLOCK_HZ / 5.
 
 use pipe_host::cdr;
 use pipe_host::ft232h::{Ft232h, PIPE_ADBUS_BIT};
