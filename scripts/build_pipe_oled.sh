@@ -39,6 +39,8 @@ echo "--- Synthesise ---"
 cd "$BUILD"
 yosys -p "
     read_verilog $RTL/ssd1306_i2c.v
+    read_verilog $RTL/freq_counter.v
+    read_verilog $RTL/bin_to_bcd.v
     read_verilog $MEASURE/top_pipe_oled.v
     synth_ecp5 -nowidelut -abc2 -top top_pipe_oled -json $BUILD/pipe_oled.json
     stat
