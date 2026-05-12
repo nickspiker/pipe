@@ -11,5 +11,9 @@ description = "Rasterise variable-width text into an 8bpp 128×64 framebuffer du
 name = "oled-bake"
 path = "src/main.rs"
 
+[[bin]]
+name = "oled-bake-atlas"
+path = "src/atlas.rs"
+
 [dependencies]
 fontdue = "0.9"

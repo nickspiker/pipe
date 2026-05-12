@@ -23,26 +23,16 @@ mkdir -p "$BUILD"
 
 FONT="${FONT:-/mnt/Chiton/MEGA/fonts/Merriweather/static/Merriweather_24pt-Bold.ttf}"
 FONT_PX="${FONT_PX:-12}"
-LINE1="${LINE1:-PIPE}"
-LINE2="${LINE2:-EFUSED: NO}"
-LINE3="${LINE3:-REQ: 0xDEADBEEF}"
-LINE4="${LINE4:-OUT: 0x12345678}"
 
 echo "================================================================"
-echo " pipe OLED bring-up (Phase 2A: static text from $FONT)"
-echo "   size: ${FONT_PX}px"
-echo "   text:"
-echo "     1) $LINE1"
-echo "     2) $LINE2"
-echo "     3) $LINE3"
-echo "     4) $LINE4"
+echo " pipe OLED bring-up (Phase 2C: 95-char atlas + runtime renderer)"
+echo "   font: $FONT  @ ${FONT_PX}px"
 echo "================================================================"
 
 echo ""
-echo "--- Rasterise text ---"
-( cd "$ROOT" && cargo run -p oled-bake --release --quiet -- \
-    "$FONT" "$FONT_PX" "$BUILD/oled_text.mem" \
-    "$LINE1" "$LINE2" "$LINE3" "$LINE4" )
+echo "--- Bake glyph atlas ---"
+( cd "$ROOT" && cargo run -p oled-bake --release --quiet --bin oled-bake-atlas -- \
+    "$FONT" "$FONT_PX" "$BUILD" --pow2 )
 
 echo ""
 echo "--- Synthesise ---"
