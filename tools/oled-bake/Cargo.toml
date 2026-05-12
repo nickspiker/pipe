@@ -1,0 +1,15 @@
+[package]
+name = "oled-bake"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Rasterise variable-width text into an 8bpp 128×64 framebuffer dump for $readmemh."
+
+[[bin]]
+name = "oled-bake"
+path = "src/main.rs"
+
+[dependencies]
+fontdue = "0.9"

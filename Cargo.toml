@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["enclave", "host"]
+members = ["enclave", "host", "tools/oled-bake"]
 
 [workspace.package]
 version = "0.0.0"

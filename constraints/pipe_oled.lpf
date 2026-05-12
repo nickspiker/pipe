@@ -1,0 +1,21 @@
+# =============================================================================
+# pipe_oled.lpf — OLED bring-up constraints
+# =============================================================================
+# Uses the dev board's standard pin assignments (same as fpga/constraints):
+#   clk      → P6   (external 25 MHz crystal)
+#   oled_scl → P2
+#   oled_sda → R2
+#   led      → T6   (active-low onboard LED)
+# =============================================================================
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
