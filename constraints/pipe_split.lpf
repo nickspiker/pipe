@@ -1,0 +1,21 @@
+# =============================================================================
+# pipe_split.lpf — split tx/rx on the shorted E16/F15 pair
+# =============================================================================
+#
+# E16 = pipe_tx_pad (output-capable), drives the wire.
+# F15 = pipe_rx_pad (input only), always reads the wire.
+#
+# Even though E16 and F15 are solder-bridged at the package, they each have
+# their own ECP5 IO buffer. With F15 as a pure IBUF (no OBUF enable), it
+# reports the voltage at its bond — which is the same node E16's OBUF sees,
+# but read independently of E16's own drive state.
+# =============================================================================
+
+LOCATE COMP "pipe_tx_pad" SITE "E16";
+IOBUF PORT "pipe_tx_pad" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+
+LOCATE COMP "pipe_rx_pad" SITE "F15";
+IOBUF PORT "pipe_rx_pad" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;

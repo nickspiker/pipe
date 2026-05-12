@@ -14,3 +14,4 @@ path = "src/lib.rs"
 [dependencies]
 pipe-enclave = { path = "../enclave" }
 blake3 = "1.5"
+ftdi-nusb = "0.1"

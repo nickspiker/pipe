@@ -1,0 +1,22 @@
+# =============================================================================
+# pipe_test.lpf — TX-only wire smoke test constraints
+# =============================================================================
+#
+# Maps pipe_pad to the E16/F15 ball pair (physically bridged on the board with
+# solder, then driven through a 400Ω series resistor to header pin D7). Only
+# one of the two FPGA balls is wired here — the other is left floating; the
+# external solder bridge ties them together at the package, so driving either
+# one drives both.
+#
+# Reference: pin_id scan identified columns 14 and 19 as the two stuck
+# (shorted) columns on the OLED ruler. From fpga/constraints/pin_id.lpf:
+#   p14 = E16   p19 = F15
+#
+# Liveness LED is the on-board T6 (same pin used everywhere).
+# =============================================================================
+
+LOCATE COMP "pipe_pad" SITE "E16";
+IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=NONE;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
