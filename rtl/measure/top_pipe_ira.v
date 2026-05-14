@@ -29,6 +29,8 @@ module top_pipe_ira (
     input  wire clk,           // 25 MHz crystal (P6)
     output wire kp_row,        // dozenal keypad p51 (P14) — driven LOW
     input  wire kp_col,        // dozenal keypad p56 (R13) — Enter triggers provision
+    output wire oled_scl,      // SSD1306 I2C clock (P2)
+    output wire oled_sda,      // SSD1306 I2C data  (R2)
     output reg  led,           // T6 onboard LED — ceremony status
     output reg  ext_led        // T2 J4 LED — FUCKED indicator
 );
@@ -357,5 +359,114 @@ module top_pipe_ira (
             ext_led <= 1'b0;
         end
     end
+
+    // =========================================================================
+    // OLED hex-display of ira
+    //
+    // 8 KB byte-greyscale framebuffer shared between the text renderer (write
+    // port) and the SSD1306 driver (read port). The renderer paints 4 lines of
+    // 16 hex chars each = the 64 nibbles of recovered_ira[255:0] (MSB at top
+    // left, descending row-major). On every ceremony_done pulse the renderer
+    // is re-triggered with the freshly-burned ira string.
+    // =========================================================================
+    localparam integer FB_W = 128;
+    localparam integer FB_H = 64;
+    localparam integer N_LINES            = 4;
+    localparam integer MAX_CHARS_PER_LINE = 24;
+    localparam integer STR_LEN            = N_LINES * MAX_CHARS_PER_LINE;
+
+    reg [7:0]  fb [0:FB_W*FB_H-1];
+    initial begin : fb_init
+        integer fbi;
+        for (fbi = 0; fbi < FB_W*FB_H; fbi = fbi + 1) fb[fbi] = 8'h00;
+    end
+
+    wire        rend_we;
+    wire [12:0] rend_waddr;
+    wire  [7:0] rend_wdata;
+    wire [12:0] oled_raddr;
+    reg   [7:0] oled_rdata;
+
+    always @(posedge clk) begin
+        if (rend_we) fb[rend_waddr] <= rend_wdata;
+        oled_rdata <= fb[oled_raddr];
+    end
+
+    // -------------------------------------------------------------------------
+    // ira → 64 ASCII hex chars. Nibble k (k=0..63) sits at recovered_ira
+    // [255 - 4*k -: 4] so the leftmost glyph is the MSB nibble.
+    // -------------------------------------------------------------------------
+    wire [STR_LEN*8-1:0] strings_flat;
+    genvar gh;
+    generate
+        for (gh = 0; gh < 64; gh = gh + 1) begin : hex_chars
+            // Place the 64 hex chars in column-major within each 16-char line:
+            //   line = gh / 16    char_in_line = gh % 16
+            //   slot = line*MAX_CHARS_PER_LINE + char_in_line
+            localparam integer LINE = gh / 16;
+            localparam integer COL  = gh % 16;
+            localparam integer SLOT = LINE * MAX_CHARS_PER_LINE + COL;
+            wire [3:0] nib = recovered_ira[255 - 4*gh -: 4];
+            assign strings_flat[SLOT*8 +: 8] = (nib < 4'd10)
+                ? (8'h30 + {4'b0, nib})           // '0'..'9'
+                : (8'h41 + {4'b0, nib} - 8'd10);  // 'A'..'F'
+        end
+        // Pad remaining slots (chars 16..23 of each line, plus any lines beyond 3) with 0.
+        for (gh = 0; gh < STR_LEN; gh = gh + 1) begin : pad
+            if (((gh % MAX_CHARS_PER_LINE) >= 16) || (gh / MAX_CHARS_PER_LINE) >= 4) begin
+                assign strings_flat[gh*8 +: 8] = 8'h00;
+            end
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // Re-render request: pulse on every ceremony_done. Also pulse once
+    // shortly after reset so the boot screen (all-zeros ira before
+    // provisioning) renders the placeholder "0000...".
+    // -------------------------------------------------------------------------
+    reg [3:0] re_render_init_cnt;
+    reg       re_render_req;
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            re_render_init_cnt <= 4'd0;
+            re_render_req      <= 1'b0;
+        end else begin
+            re_render_req <= 1'b0;
+            if (re_render_init_cnt != 4'd15) begin
+                re_render_init_cnt <= re_render_init_cnt + 4'd1;
+                if (re_render_init_cnt == 4'd14)
+                    re_render_req <= 1'b1;
+            end
+            if (ceremony_done) re_render_req <= 1'b1;
+        end
+    end
+
+    oled_text_renderer #(
+        .FB_W              (FB_W),
+        .FB_H              (FB_H),
+        .N_LINES           (N_LINES),
+        .MAX_CHARS_PER_LINE(MAX_CHARS_PER_LINE)
+    ) u_renderer (
+        .clk          (clk),
+        .reset_n      (reset_n),
+        .re_render_req(re_render_req),
+        .strings_flat (strings_flat),
+        .render_done  (),
+        .fb_we        (rend_we),
+        .fb_waddr     (rend_waddr),
+        .fb_wdata     (rend_wdata)
+    );
+
+    oled_greyscale_driver #(
+        .CLK_DIV    (7),
+        .BUSFREE_LEN(10)
+    ) u_oled (
+        .clk        (clk),
+        .oled_scl   (oled_scl),
+        .oled_sda   (oled_sda),
+        .frame_pulse(),
+        .fb_raddr   (oled_raddr),
+        .fb_rdata   (oled_rdata)
+    );
 
 endmodule
