@@ -91,20 +91,6 @@ module inverted_pair_verify #(
     assign all_virgin  = (pair_virgin == 4'b1111);
 
     // -------------------------------------------------------------------------
-    // Agreement check: for every pair (i, j) with i < j where BOTH are valid,
-    // their A slots must be equal. If any disagree → agreement fails.
-    // -------------------------------------------------------------------------
-    wire diff_01 = pair_valid[0] & pair_valid[1] & (slot[0] != slot[1]);
-    wire diff_02 = pair_valid[0] & pair_valid[2] & (slot[0] != slot[2]);
-    wire diff_03 = pair_valid[0] & pair_valid[3] & (slot[0] != slot[3]);
-    wire diff_12 = pair_valid[1] & pair_valid[2] & (slot[1] != slot[2]);
-    wire diff_13 = pair_valid[1] & pair_valid[3] & (slot[1] != slot[3]);
-    wire diff_23 = pair_valid[2] & pair_valid[3] & (slot[2] != slot[3]);
-
-    assign agreement_ok = ~(diff_01 | diff_02 | diff_03 | diff_12 | diff_13 | diff_23);
-    assign byzantine_ok = (valid_count >= 3'd2) & agreement_ok;
-
-    // -------------------------------------------------------------------------
     // Recovered ira: lowest-indexed valid pair's A. When no pair is valid,
     // this resolves to all-zeros — meaningless, gated by byzantine_ok.
     // -------------------------------------------------------------------------
@@ -113,6 +99,23 @@ module inverted_pair_verify #(
                : pair_valid[2] ? slot[2]
                : pair_valid[3] ? slot[3]
                : {SLOT_BITS{1'b0}};
+
+    // -------------------------------------------------------------------------
+    // Agreement check: each valid pair's A must equal the canonical (`ira`).
+    // Corrupt and virgin pairs are skipped (pair_valid[i] gate). The
+    // canonical's own pair satisfies the equality trivially. This is the
+    // 4-comparison form of the 6-pair round-robin — same correctness, ~33%
+    // less LUT cost than the all-pairs-pairwise version.
+    // -------------------------------------------------------------------------
+    wire [3:0] disagree;
+    generate
+        for (k = 0; k < 4; k = k + 1) begin : agree_check
+            assign disagree[k] = pair_valid[k] & (slot[k] != ira);
+        end
+    endgenerate
+
+    assign agreement_ok = ~(|disagree);
+    assign byzantine_ok = (valid_count >= 3'd2) & agreement_ok;
 
     // -------------------------------------------------------------------------
     // 5-state classification
