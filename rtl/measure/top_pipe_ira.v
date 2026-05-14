@@ -387,9 +387,30 @@ module top_pipe_ira (
     wire [12:0] oled_raddr;
     reg   [7:0] oled_rdata;
 
+    // CE divider matching oled_greyscale_driver's CLK_DIV=7. The driver
+    // advances per-CE, so its combinational fb_raddr also changes per-CE.
+    // We MUST gate the framebuffer read with this same CE pulse — otherwise
+    // fb_rdata races ahead each clock and the driver captures the WRONG
+    // byte at each CE pulse (verified by top_oled_diag: ungated per-clk
+    // read causes bytes 0..7 to wrap to 1..7,0, producing a mirror-reflect
+    // pattern around bit 4 in each OLED page byte). Per-clk read works for
+    // random data (ring scope) but fails for structured data (hex glyphs).
+    localparam integer OLED_CLK_DIV = 7;
+    reg [2:0] ce_cnt = 3'b0;
+    wire ce_at_top = (ce_cnt == OLED_CLK_DIV - 1);
+    always @(posedge clk) ce_cnt <= ce_at_top ? 3'b0 : ce_cnt + 3'd1;
+    reg ce_pulse = 1'b0;
+    always @(posedge clk) ce_pulse <= ce_at_top;
+
+    // Separate always blocks for write and read ports — forces yosys to
+    // infer true dual-port BRAM (DP16KD with W port + R port) rather than
+    // a single-port + read-or-write arbiter, which would corrupt OLED
+    // reads during renderer writes.
     always @(posedge clk) begin
         if (rend_we) fb[rend_waddr] <= rend_wdata;
-        oled_rdata <= fb[oled_raddr];
+    end
+    always @(posedge clk) begin
+        if (ce_pulse) oled_rdata <= fb[oled_raddr];
     end
 
     // -------------------------------------------------------------------------

@@ -1,0 +1,13 @@
+# oled_diag.lpf — minimal OLED diagnostic pinout
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 25 MHz;
+
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
