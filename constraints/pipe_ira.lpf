@@ -1,0 +1,25 @@
+# =============================================================================
+# pipe_ira.lpf — first-silicon ira ceremony constraints
+# =============================================================================
+#   clk     → P6   (25 MHz crystal)
+#   kp_row  → P14  (dozenal keypad p51 — driven LOW)
+#   kp_col  → R13  (dozenal keypad p56 — Enter, active-low)
+#   led     → T6   (onboard LED, active-low)
+#   ext_led → T2   (J4 pin 6 LED via buffer — FUCKED indicator)
+# =============================================================================
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 25 MHz;
+
+LOCATE COMP "kp_row" SITE "P14";
+IOBUF PORT "kp_row" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_col" SITE "R13";
+IOBUF PORT "kp_col" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "ext_led" SITE "T2";
+IOBUF PORT "ext_led" IO_TYPE=LVCMOS33;
