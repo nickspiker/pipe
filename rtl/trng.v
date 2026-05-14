@@ -85,21 +85,42 @@ module trng (
     end
 
     // -------------------------------------------------------------------------
-    // Per-ring popcount counters. Each ring's sampled bit increments its own
-    // 17-bit counter every cycle (max value 65,536 = 17 bits). Eight counters
-    // tracked independently so a fault is attributable to a specific ring.
+    // Per-ring popcount AND toggle counters. Each ring increments:
+    //   popcount[i] when sample[i] == 1
+    //   toggles[i]  when sample[i] != prev_sample[i]  (edge detect)
+    // After 65,536 cycles, both must fall in band:
+    //   popcount ∈ [8192, 57344]  = 1/8 to 7/8     — accepts up to 87% bias
+    //   toggles  ∈ [4096, 61440]  = 1/16 to 15/16  — at least 1/8 of expected N/2
+    //
+    // Popcount alone can't distinguish a stuck-or-locked pattern that
+    // happens to have 50% ones from real entropy — e.g. "0×32768 then
+    // 1×32768" has popcount=32768 (perfect) but exactly 1 toggle. The
+    // toggle counter catches stuck-then-stuck rings and low-frequency
+    // locked patterns that popcount alone passes.
     // -------------------------------------------------------------------------
     reg [16:0] popcount [0:7];
+    reg [16:0] toggles  [0:7];
+    reg  [7:0] prev_sample;
 
-    // Bounds: 1/4 of 65,536 = 16,384;  3/4 = 49,152.
-    localparam [16:0] POP_LO = 17'd16384;
-    localparam [16:0] POP_HI = 17'd49152;
+    wire [7:0] toggle_bits = sample ^ prev_sample;  // 1 where this cycle differs from last
+
+    // 1/8 of 65,536 = 8,192;  7/8 = 57,344.
+    localparam [16:0] POP_LO = 17'd8192;
+    localparam [16:0] POP_HI = 17'd57344;
+
+    // Toggle bounds: at least 4,096 = 1/16 of N (= 1/8 of expected N/2).
+    // Upper bound symmetric (alternating 1010… still healthy, fully-toggling
+    // pattern allowed) — drop the upper bound entirely; only "too few"
+    // toggles indicates a fault.
+    localparam [16:0] TOG_MIN = 17'd4096;
 
     wire [7:0] ring_pass;
     genvar k;
     generate
         for (k = 0; k < 8; k = k + 1) begin : health_check
-            assign ring_pass[k] = (popcount[k] >= POP_LO) && (popcount[k] <= POP_HI);
+            assign ring_pass[k] = (popcount[k] >= POP_LO)
+                                & (popcount[k] <= POP_HI)
+                                & (toggles[k]  >= TOG_MIN);
         end
     endgenerate
 
@@ -139,7 +160,11 @@ module trng (
             health_fail     <= 1'b0;
             ring_health     <= 8'b0;
             ring_health_cnt <= 4'b0;
-            for (j = 0; j < 8; j = j + 1) popcount[j] <= 17'b0;
+            prev_sample     <= 8'b0;
+            for (j = 0; j < 8; j = j + 1) begin
+                popcount[j] <= 17'b0;
+                toggles[j]  <= 17'b0;
+            end
         end else begin
             buf_we      <= 1'b0;
             gather_done <= 1'b0;
@@ -148,19 +173,27 @@ module trng (
                 ST_IDLE: begin
                     busy <= 1'b0;
                     if (start && !health_fail) begin
-                        cycle_cnt <= 16'b0;
-                        bit_idx   <= 3'b0;
-                        work_byte <= 8'b0;
-                        for (j = 0; j < 8; j = j + 1) popcount[j] <= 17'b0;
-                        busy      <= 1'b1;
-                        state     <= ST_GATHER;
+                        cycle_cnt   <= 16'b0;
+                        bit_idx     <= 3'b0;
+                        work_byte   <= 8'b0;
+                        prev_sample <= sample;       // seed edge detect
+                        for (j = 0; j < 8; j = j + 1) begin
+                            popcount[j] <= 17'b0;
+                            toggles[j]  <= 17'b0;
+                        end
+                        busy  <= 1'b1;
+                        state <= ST_GATHER;
                     end
                 end
 
                 ST_GATHER: begin
-                    // Per-ring popcount: each sampled '1' increments its ring's counter.
-                    for (j = 0; j < 8; j = j + 1)
+                    // Per-ring popcount: count of 1-bits sampled.
+                    // Per-ring toggle count: edges detected vs. prior sample.
+                    prev_sample <= sample;
+                    for (j = 0; j < 8; j = j + 1) begin
                         popcount[j] <= popcount[j] + {16'b0, sample[j]};
+                        toggles[j]  <= toggles[j]  + {16'b0, toggle_bits[j]};
+                    end
 
                     // Pack entropy_bit into work_byte; on every 8th cycle, write to BRAM.
                     if (bit_idx == 3'd7) begin

@@ -265,8 +265,8 @@ module ira_ceremony_tb;
         $display("  All 8 OTP slots burned: burned_mask=%b", otp_burned_mask);
 
         // Wait for verify to re-sweep on the post-burn slot contents.
-        // The sweep is 257 cycles; wait 600 cycles to ensure ≥1 fresh latch.
-        repeat (600) @(posedge clk);
+        // The sweep is 2049 cycles (low-and-slow); wait 5000 to cover two.
+        repeat (5000) @(posedge clk);
         $display("[t=%0t] Post-ceremony + resweep: chip_state=%0d (expect 4=HEALTHY), chip_fucked=%b",
                  $time, chip_state, chip_fucked);
         $display("  pair_valid=%b, byzantine_ok=%b", pair_valid, byzantine_ok);

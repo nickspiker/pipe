@@ -53,12 +53,13 @@ module inverted_pair_verify_tb;
     endtask
 
     // Wait long enough for the popcount sweep to refresh after a slot_flat
-    // change. 257 cycles per sweep; pick 600 to comfortably cover two sweeps
-    // (the in-flight one may be using stale data; the next one picks up new).
+    // change. 2049 cycles per sweep (8 slots × 256 bits + 1); pick 5000 to
+    // comfortably cover two sweeps (the in-flight one may be using stale
+    // data; the next one picks up new).
     task automatic wait_for_resweep;
         integer cycles;
         begin
-            for (cycles = 0; cycles < 600; cycles = cycles + 1)
+            for (cycles = 0; cycles < 5000; cycles = cycles + 1)
                 @(posedge clk);
         end
     endtask
@@ -193,9 +194,9 @@ module inverted_pair_verify_tb;
         $finish;
     end
 
-    // Safety timeout — generous for the 11 scenarios at 600 cycles each
+    // Safety timeout — generous for the 11 scenarios at 5000 cycles each
     initial begin
-        #500_000;
+        #5_000_000;
         $display("");
         $display("  *** TIMEOUT *** ");
         $finish;
