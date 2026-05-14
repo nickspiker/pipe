@@ -156,8 +156,12 @@ module ira_ceremony_tb;
     wire [255:0] recovered_ira;
     wire [3:0]   pair_valid;
 
+    wire verify_state_valid;
     inverted_pair_verify u_verify (
+        .clk         (clk),
+        .reset_n     (reset_n),
         .slot_flat   (all_slots),
+        .state_valid (verify_state_valid),
         .pair_virgin (),
         .pair_valid  (pair_valid),
         .pair_corrupt(),
@@ -218,7 +222,10 @@ module ira_ceremony_tb;
         reset_n = 1;
         #10;
 
-        $display("[t=%0t] After reset: chip_state=%0d (expect 0=VIRGIN), chip_fucked=%b",
+        // Wait for the sequential popcount sweep to complete its first pass.
+        wait (verify_state_valid);
+        @(posedge clk);
+        $display("[t=%0t] After reset + first sweep: chip_state=%0d (expect 0=VIRGIN), chip_fucked=%b",
                  $time, chip_state, chip_fucked);
         if (chip_state !== 3'd0)
             $display("  FAIL: expected VIRGIN at boot, got state=%0d", chip_state);
@@ -257,8 +264,10 @@ module ira_ceremony_tb;
                  $time, t_ceremony_done - t_start, (t_ceremony_done - t_start) / 10);
         $display("  All 8 OTP slots burned: burned_mask=%b", otp_burned_mask);
 
-        #20;
-        $display("[t=%0t] Post-ceremony: chip_state=%0d (expect 4=HEALTHY), chip_fucked=%b",
+        // Wait for verify to re-sweep on the post-burn slot contents.
+        // The sweep is 257 cycles; wait 600 cycles to ensure ≥1 fresh latch.
+        repeat (600) @(posedge clk);
+        $display("[t=%0t] Post-ceremony + resweep: chip_state=%0d (expect 4=HEALTHY), chip_fucked=%b",
                  $time, chip_state, chip_fucked);
         $display("  pair_valid=%b, byzantine_ok=%b", pair_valid, byzantine_ok);
         $display("  recovered_ira=%h", recovered_ira);
