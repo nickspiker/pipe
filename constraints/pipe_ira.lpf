@@ -10,7 +10,13 @@
 
 LOCATE COMP "clk" SITE "P6";
 IOBUF PORT "clk" IO_TYPE=LVCMOS33;
-FREQUENCY PORT "clk" 25 MHz;
+# Loosened from 25 MHz to 5 MHz. PIPE is correctness-driven, not real-time —
+# the only clock-rate-sensitive subsystem (OLED I²C) tolerates >10× variation,
+# and production silicon clocks from a ring with ±10% PVT drift anyway. 5 MHz
+# = 200 ns budget gives PnR comfortable room while ensuring the design doesn't
+# end up with pathologically slow paths. The crystal still runs at 25 MHz so
+# we get 5× margin in practice.
+FREQUENCY PORT "clk" 5 MHz;
 
 LOCATE COMP "kp_row" SITE "P14";
 IOBUF PORT "kp_row" IO_TYPE=LVCMOS33 PULLMODE=UP;

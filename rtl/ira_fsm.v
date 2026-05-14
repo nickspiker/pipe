@@ -87,8 +87,17 @@ module ira_fsm (
         ST_BLAKE3   = 3'd2,   // blake3_tree conditioning
         ST_TAHU_A   = 3'd3,   // burn slots 0..3 (A = ira_seed)
         ST_TAHU_B   = 3'd4,   // burn slots 4..7 (B = ~ira_seed)
-        ST_DONE     = 3'd5,   // pulse ceremony_done, return to OBSERVE
-        ST_FUCKED   = 3'd6;   // latched failure; never leaves until POR
+        ST_DONE     = 3'd5,   // pulse ceremony_done, settle, return to OBSERVE
+        ST_SETTLE   = 3'd6,   // wait for verify to complete fresh post-burn sweeps
+        ST_FUCKED   = 3'd7;   // latched failure; never leaves until POR
+
+    // Wait long enough after TAHU for inverted_pair_verify to complete at
+    // least two full sweeps on the new (post-burn) slot_flat data. Sweep is
+    // 257 cycles; 1024 covers four sweeps comfortably and avoids any
+    // mid-sweep mismatched-latched-output transient propagating into a
+    // false ST_FUCKED transition.
+    localparam [9:0] SETTLE_CYCLES = 10'd1023;
+    reg [9:0]        settle_cnt;
 
     // -------------------------------------------------------------------------
     // Internal registers
@@ -116,6 +125,7 @@ module ira_fsm (
             ira_seed         <= 256'b0;
             burn_idx         <= 2'b0;
             awaiting_burn    <= 1'b0;
+            settle_cnt       <= 10'b0;
         end else begin
             // Default deassertions (one-cycle strobes)
             trng_start       <= 1'b0;
@@ -215,14 +225,33 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_DONE: ceremony complete. inverted_pair_verify now sees
-                // all 4 pairs valid → chip_state becomes HEALTHY (or
-                // DEGRADED-N if some slots disagree, which would itself
-                // indicate hardware fault).
+                // ST_DONE: ceremony complete. Pulse ceremony_done, then move
+                // to SETTLE so the verify module has time to complete fresh
+                // post-burn sweeps on the new slot_flat data — without this,
+                // a mid-sweep latched output (mixing OLD all-zero and NEW
+                // burned bits) reads as FUCKED for one sweep period and
+                // ST_OBSERVE would latch the chip into ST_FUCKED on that
+                // spurious transient.
                 // ----------------------------------------------------------
                 ST_DONE: begin
                     ceremony_done <= 1'b1;
-                    fsm_state     <= ST_OBSERVE;
+                    settle_cnt    <= SETTLE_CYCLES;
+                    fsm_state     <= ST_SETTLE;
+                end
+
+                // ----------------------------------------------------------
+                // ST_SETTLE: hold off chip_fucked / ST_FUCKED transitions for
+                // SETTLE_CYCLES cycles after the last OTP burn, giving
+                // inverted_pair_verify time to sweep the new slot data.
+                // chip_state may transiently read FUCKED during this window
+                // — we ignore it.
+                // ----------------------------------------------------------
+                ST_SETTLE: begin
+                    if (settle_cnt == 10'b0) begin
+                        fsm_state <= ST_OBSERVE;
+                    end else begin
+                        settle_cnt <= settle_cnt - 10'd1;
+                    end
                 end
 
                 // ----------------------------------------------------------
