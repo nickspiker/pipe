@@ -19,7 +19,7 @@ module trng (
     input  wire         reset_n,        // active-low POR
     input  wire         start,          // 1-cycle pulse to begin a fresh KOHI
 
-    input  wire  [7:0]  ring_in,        // 8 free-running ring oscillator outputs
+    input  wire [15:0]  ring_in,        // 16 free-running ring oscillator outputs
 
     // Buffer read port for downstream BLAKE3 conditioner.
     // Address [12:0] selects one of 8192 bytes; data appears next cycle.
@@ -27,11 +27,11 @@ module trng (
     output reg   [7:0]  buf_rdata,
 
     output reg          busy,           // high during gather + health check
-    output reg          gather_done,    // 1-cycle strobe when buffer ready (>= 4 rings healthy)
-    output reg          health_fail,    // latched when <4 rings pass bounds — FUCKED state
-    output reg   [7:0]  ring_health,    // bitmask of last-gather healthy rings (1=pass)
-    output reg   [3:0]  ring_health_cnt,// count of healthy rings 0..8 (for attestation responses)
-    output wire  [7:0]  ring_enable     // advisory: high during gather (top.v decides whether to gate)
+    output reg          gather_done,    // 1-cycle strobe when buffer ready (>= 8 rings healthy)
+    output reg          health_fail,    // latched when <8 of 16 rings pass — FUCKED state
+    output reg  [15:0]  ring_health,    // bitmask of last-gather healthy rings (1=pass)
+    output reg   [4:0]  ring_health_cnt,// count of healthy rings 0..16 (for attestation responses)
+    output wire [15:0]  ring_enable     // advisory: high during gather (top.v decides whether to gate)
 );
 
     // -------------------------------------------------------------------------
@@ -39,20 +39,20 @@ module trng (
     // into clk. Without these, the sampling FFs would see metastability and
     // propagate it into the XOR/popcount logic.
     // -------------------------------------------------------------------------
-    reg [7:0] ring_sync1;
-    reg [7:0] ring_sync2;
+    reg [15:0] ring_sync1;
+    reg [15:0] ring_sync2;
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
-            ring_sync1 <= 8'b0;
-            ring_sync2 <= 8'b0;
+            ring_sync1 <= 16'b0;
+            ring_sync2 <= 16'b0;
         end else begin
             ring_sync1 <= ring_in;
             ring_sync2 <= ring_sync1;
         end
     end
 
-    wire [7:0] sample      = ring_sync2;
-    wire       entropy_bit = ^sample;          // per-cycle 8-way XOR
+    wire [15:0] sample      = ring_sync2;
+    wire        entropy_bit = ^sample;         // per-cycle 16-way XOR
 
     // -------------------------------------------------------------------------
     // FSM
@@ -88,9 +88,18 @@ module trng (
     // Per-ring popcount AND toggle counters. Each ring increments:
     //   popcount[i] when sample[i] == 1
     //   toggles[i]  when sample[i] != prev_sample[i]  (edge detect)
-    // After 65,536 cycles, both must fall in band:
-    //   popcount ∈ [8192, 57344]  = 1/8 to 7/8     — accepts up to 87% bias
-    //   toggles  ∈ [4096, 61440]  = 1/16 to 15/16  — at least 1/8 of expected N/2
+    // After 65,536 cycles, each must fall in band:
+    //   popcount ∈ [8192, 57344]  = 1/8 to 7/8 — accepts up to 87% bias
+    //   toggles  ≥ 256            = N/256     — catches near-resonance stuck
+    //
+    // Toggle threshold derivation (see design notes):
+    //   For two stable freqs with offset Δf from sampler subharmonic,
+    //   toggles_per_sample = 2|Δf|/f_s. Over N samples, toggle count is
+    //   uniform in [0, N] under uniform-Δf distribution.
+    //   With 16 rings, 8-of-16 byzantine threshold, per-ring fail budget
+    //   is 0.79% to keep P_chip < 10⁻¹⁵ per KOHI (satellite-fleet safe).
+    //   TOG_MIN = 256 puts per-ring fail at 256/65536 = 0.39% — 2× margin
+    //   under ceiling, well clear of thermal-jitter false-positive floor.
     //
     // Popcount alone can't distinguish a stuck-or-locked pattern that
     // happens to have 50% ones from real entropy — e.g. "0×32768 then
@@ -98,49 +107,49 @@ module trng (
     // toggle counter catches stuck-then-stuck rings and low-frequency
     // locked patterns that popcount alone passes.
     // -------------------------------------------------------------------------
-    reg [16:0] popcount [0:7];
-    reg [16:0] toggles  [0:7];
-    reg  [7:0] prev_sample;
+    reg [16:0] popcount [0:15];
+    reg [16:0] toggles  [0:15];
+    reg [15:0] prev_sample;
 
-    wire [7:0] toggle_bits = sample ^ prev_sample;  // 1 where this cycle differs from last
+    wire [15:0] toggle_bits = sample ^ prev_sample;  // 1 where this cycle differs from last
 
     // 1/8 of 65,536 = 8,192;  7/8 = 57,344.
     localparam [16:0] POP_LO = 17'd8192;
     localparam [16:0] POP_HI = 17'd57344;
 
-    // Toggle bounds: at least 4,096 = 1/16 of N (= 1/8 of expected N/2).
-    // Upper bound symmetric (alternating 1010… still healthy, fully-toggling
-    // pattern allowed) — drop the upper bound entirely; only "too few"
-    // toggles indicates a fault.
-    localparam [16:0] TOG_MIN = 17'd4096;
+    // Toggle minimum: N/256.
+    localparam [16:0] TOG_MIN = 17'd256;
 
-    wire [7:0] ring_pass;
+    wire [15:0] ring_pass;
     genvar k;
     generate
-        for (k = 0; k < 8; k = k + 1) begin : health_check
+        for (k = 0; k < 16; k = k + 1) begin : health_check
             assign ring_pass[k] = (popcount[k] >= POP_LO)
                                 & (popcount[k] <= POP_HI)
                                 & (toggles[k]  >= TOG_MIN);
         end
     endgenerate
 
-    // Sum of healthy-ring bits — 4-bit result (0..8).
-    wire [3:0] healthy_cnt = {3'b0, ring_pass[0]} + {3'b0, ring_pass[1]}
-                           + {3'b0, ring_pass[2]} + {3'b0, ring_pass[3]}
-                           + {3'b0, ring_pass[4]} + {3'b0, ring_pass[5]}
-                           + {3'b0, ring_pass[6]} + {3'b0, ring_pass[7]};
+    // Sum of healthy-ring bits — 5-bit result (0..16).
+    reg [4:0] healthy_cnt;
+    integer hi;
+    always @* begin
+        healthy_cnt = 5'b0;
+        for (hi = 0; hi < 16; hi = hi + 1)
+            healthy_cnt = healthy_cnt + {4'b0, ring_pass[hi]};
+    end
 
-    // FUCKED threshold: 3 or fewer healthy rings. With 4+, entropy is still
-    // sound (XOR of independent sources is uniform whenever any one is uniform;
-    // 4 is defense-in-depth, not strict cryptographic necessity).
-    localparam [3:0] HEALTH_MIN = 4'd4;
+    // FUCKED threshold: 7 or fewer healthy rings. With 8+ of 16, byzantine
+    // safety satisfied and entropy remains cryptographically sound (XOR of
+    // independent sources is uniform whenever any one is uniform).
+    localparam [4:0] HEALTH_MIN = 5'd8;
 
     // -------------------------------------------------------------------------
     // ring_enable: advisory output for top.v gating logic. Tied to busy so
     // that — if/when top.v gets gated rings working — they only oscillate
     // during an active KOHI. While busy=0, top.v can hold the rings dark.
     // -------------------------------------------------------------------------
-    assign ring_enable = {8{busy}};
+    assign ring_enable = {16{busy}};
 
     // -------------------------------------------------------------------------
     // Main FSM
@@ -158,10 +167,10 @@ module trng (
             busy            <= 1'b0;
             gather_done     <= 1'b0;
             health_fail     <= 1'b0;
-            ring_health     <= 8'b0;
-            ring_health_cnt <= 4'b0;
-            prev_sample     <= 8'b0;
-            for (j = 0; j < 8; j = j + 1) begin
+            ring_health     <= 16'b0;
+            ring_health_cnt <= 5'b0;
+            prev_sample     <= 16'b0;
+            for (j = 0; j < 16; j = j + 1) begin
                 popcount[j] <= 17'b0;
                 toggles[j]  <= 17'b0;
             end
@@ -177,7 +186,7 @@ module trng (
                         bit_idx     <= 3'b0;
                         work_byte   <= 8'b0;
                         prev_sample <= sample;       // seed edge detect
-                        for (j = 0; j < 8; j = j + 1) begin
+                        for (j = 0; j < 16; j = j + 1) begin
                             popcount[j] <= 17'b0;
                             toggles[j]  <= 17'b0;
                         end
@@ -190,7 +199,7 @@ module trng (
                     // Per-ring popcount: count of 1-bits sampled.
                     // Per-ring toggle count: edges detected vs. prior sample.
                     prev_sample <= sample;
-                    for (j = 0; j < 8; j = j + 1) begin
+                    for (j = 0; j < 16; j = j + 1) begin
                         popcount[j] <= popcount[j] + {16'b0, sample[j]};
                         toggles[j]  <= toggles[j]  + {16'b0, toggle_bits[j]};
                     end

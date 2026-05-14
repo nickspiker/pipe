@@ -112,7 +112,10 @@ module inverted_pair_verify #(
     // -------------------------------------------------------------------------
     localparam [8:0] POP_LO = 9'd32;     // 1/8 of 256 = 32 ones minimum
     localparam [8:0] POP_HI = 9'd224;    // 7/8 of 256 = max 224 ones (= 32 zeros minimum)
-    localparam [8:0] TOG_MIN = 9'd16;    // 1/8 of expected N/2 toggles = 16 edges minimum
+    localparam [8:0] TOG_MIN = 9'd4;     // N/64; catches obvious degeneracy
+                                          // (BLAKE3 output is Gaussian-toggle-distributed
+                                          // around N/2; 4 is well below any realistic
+                                          // healthy slot but well above stuck patterns)
 
     wire [3:0] slot_sane_A;
     wire [3:0] slot_sane_B;

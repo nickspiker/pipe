@@ -34,21 +34,21 @@ module ira_ceremony_tb;
     reg provision_request = 0;
 
     // -------------------------------------------------------------------------
-    // Simulated ring oscillator outputs — 8 independent LFSRs, each seeded
+    // Simulated ring oscillator outputs — 16 independent LFSRs, each seeded
     // differently. Per-cycle LSB of each LFSR is the "ring output".
-    // This passes the 4-of-8 health check with margin.
+    // This passes the 8-of-16 health check with margin.
     // -------------------------------------------------------------------------
-    reg [31:0] lfsr [0:7];
+    reg [31:0] lfsr [0:15];
     integer i;
     initial begin
-        for (i = 0; i < 8; i = i + 1)
+        for (i = 0; i < 16; i = i + 1)
             lfsr[i] = 32'hCAFE_BABE + (i * 32'h0123_4567);
     end
 
-    wire [7:0] ring_in;
+    wire [15:0] ring_in;
     genvar r;
     generate
-        for (r = 0; r < 8; r = r + 1) begin : ring_sim
+        for (r = 0; r < 16; r = r + 1) begin : ring_sim
             always @(posedge clk) begin
                 // 32-bit Galois LFSR, taps 0x80200003 (same as oled dither)
                 if (lfsr[r][0])
@@ -66,9 +66,9 @@ module ira_ceremony_tb;
     wire [12:0] trng_buf_raddr;
     wire [7:0]  trng_buf_rdata;
     wire        trng_busy, trng_gather_done, trng_health_fail;
-    wire [7:0]  trng_ring_health;
-    wire [3:0]  trng_ring_health_cnt;
-    wire [7:0]  trng_ring_enable;
+    wire [15:0] trng_ring_health;
+    wire [4:0]  trng_ring_health_cnt;
+    wire [15:0] trng_ring_enable;
     wire        trng_start_sig;
 
     trng u_trng (

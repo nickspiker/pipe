@@ -37,10 +37,11 @@ module top_pipe_ira (
     wire btn_raw = kp_col;     // active-low button
 
     // =========================================================================
-    // 8 RING OSCILLATORS — stages 3, 5, 7, 11, 13, 17, 19, 23
+    // 16 RING OSCILLATORS — odd primes 3..59
+    //   stages: 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59
     // Same instantiation pattern proven by top_pipe_ring_scope.v.
     // =========================================================================
-    localparam integer N_RINGS = 8;
+    localparam integer N_RINGS = 16;
     wire [N_RINGS-1:0] ring_out;
 
     (* noglobal *) wire [2:0]  r0_q;
@@ -105,6 +106,70 @@ module top_pipe_ira (
     end endgenerate
     assign ring_out[7] = r7_q[0];
 
+    (* noglobal *) wire [28:0] r8_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r8_inv (.A(r8_q[28]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r8_q[0]));
+    genvar g8;
+    generate for (g8 = 1; g8 < 29; g8 = g8 + 1) begin : r8_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r8_q[g8-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r8_q[g8]));
+    end endgenerate
+    assign ring_out[8] = r8_q[0];
+
+    (* noglobal *) wire [30:0] r9_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r9_inv (.A(r9_q[30]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r9_q[0]));
+    genvar g9;
+    generate for (g9 = 1; g9 < 31; g9 = g9 + 1) begin : r9_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r9_q[g9-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r9_q[g9]));
+    end endgenerate
+    assign ring_out[9] = r9_q[0];
+
+    (* noglobal *) wire [36:0] r10_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r10_inv (.A(r10_q[36]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r10_q[0]));
+    genvar g10;
+    generate for (g10 = 1; g10 < 37; g10 = g10 + 1) begin : r10_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r10_q[g10-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r10_q[g10]));
+    end endgenerate
+    assign ring_out[10] = r10_q[0];
+
+    (* noglobal *) wire [40:0] r11_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r11_inv (.A(r11_q[40]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r11_q[0]));
+    genvar g11;
+    generate for (g11 = 1; g11 < 41; g11 = g11 + 1) begin : r11_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r11_q[g11-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r11_q[g11]));
+    end endgenerate
+    assign ring_out[11] = r11_q[0];
+
+    (* noglobal *) wire [42:0] r12_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r12_inv (.A(r12_q[42]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r12_q[0]));
+    genvar g12;
+    generate for (g12 = 1; g12 < 43; g12 = g12 + 1) begin : r12_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r12_q[g12-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r12_q[g12]));
+    end endgenerate
+    assign ring_out[12] = r12_q[0];
+
+    (* noglobal *) wire [46:0] r13_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r13_inv (.A(r13_q[46]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r13_q[0]));
+    genvar g13;
+    generate for (g13 = 1; g13 < 47; g13 = g13 + 1) begin : r13_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r13_q[g13-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r13_q[g13]));
+    end endgenerate
+    assign ring_out[13] = r13_q[0];
+
+    (* noglobal *) wire [52:0] r14_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r14_inv (.A(r14_q[52]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r14_q[0]));
+    genvar g14;
+    generate for (g14 = 1; g14 < 53; g14 = g14 + 1) begin : r14_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r14_q[g14-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r14_q[g14]));
+    end endgenerate
+    assign ring_out[14] = r14_q[0];
+
+    (* noglobal *) wire [58:0] r15_q;
+    (* keep *) LUT4 #(.INIT(16'h5555)) r15_inv (.A(r15_q[58]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r15_q[0]));
+    genvar g15;
+    generate for (g15 = 1; g15 < 59; g15 = g15 + 1) begin : r15_buf
+        (* keep *) LUT4 #(.INIT(16'hAAAA)) buf_ (.A(r15_q[g15-1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(r15_q[g15]));
+    end endgenerate
+    assign ring_out[15] = r15_q[0];
+
     // =========================================================================
     // Reset synchronizer + power-on hold (~1 ms at 25 MHz)
     // =========================================================================
@@ -143,9 +208,9 @@ module top_pipe_ira (
     wire [12:0] buf_raddr;
     wire [7:0]  buf_rdata;
     wire        trng_busy, trng_gather_done, trng_health_fail;
-    wire [7:0]  trng_ring_health;
-    wire [3:0]  trng_ring_health_cnt;
-    wire [7:0]  trng_ring_enable;
+    wire [15:0] trng_ring_health;
+    wire [4:0]  trng_ring_health_cnt;
+    wire [15:0] trng_ring_enable;
     wire        trng_start, blake3_start;
 
     trng u_trng (
