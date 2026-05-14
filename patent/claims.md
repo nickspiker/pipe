@@ -62,12 +62,12 @@ The device of Claim 2, wherein the on-chip TRNG comprises:
 - **N ≥ 5 free-running ring oscillators**, each with a distinct prime stage count, such that the resulting frequencies are mutually incommensurate;
 - **A sampling clock** derived from a further ring oscillator and divided down to a frequency at least one order of magnitude slower than the slowest entropy ring;
 - **N sampling flip-flops**, each clocked by the sampling clock and capturing one of the N entropy rings on each sampling edge;
-- **Per-ring health-check counters**, each accumulating a running popcount of its corresponding ring's samples;
+- **Per-ring health-check counters**, each accumulating one or more running statistics of its corresponding ring's samples;
 - **A combined output bit per sampling edge**, formed by the bitwise XOR of all N sampled bits;
 - **A buffer accumulating the combined output bits** across multiple sampling edges;
 - **A cryptographic conditioner** applied to the accumulated buffer at completion, producing a fixed-width output;
 
-wherein the device aborts entropy collection permanently if any per-ring popcount falls outside a predefined acceptable bias range.
+wherein the device declares entropy collection failed if fewer than a predefined threshold K of the N rings pass their health checks, and refuses to operate in this failed state.
 
 ### Claim 3a — Avoidance of fast-samples-slow regime
 
@@ -75,7 +75,24 @@ The TRNG of Claim 3, wherein the sampling clock is selected to be slower than ev
 
 ### Claim 3b — Single buffer, per-cycle XOR
 
-The TRNG of Claim 3, wherein the per-cycle bitwise XOR of all N samples is written to a single shared buffer rather than to N parallel buffers, reducing memory area by approximately N× while preserving per-ring fault attribution via the independent per-ring popcounters.
+The TRNG of Claim 3, wherein the per-cycle bitwise XOR of all N samples is written to a single shared buffer rather than to N parallel buffers, reducing memory area by approximately N× while preserving per-ring fault attribution via the independent per-ring health counters.
+
+### Claim 3c — Dual per-ring health check (popcount and toggle count)
+
+The TRNG of Claim 3, wherein each ring's per-ring health counters comprise:
+
+- **A popcount counter** accumulating the running count of 1-bits sampled from that ring over the gather window, the ring being declared healthy on this metric if and only if the final count falls within a predefined bias band (e.g., between one-eighth and seven-eighths of the gather window length);
+- **A toggle counter** accumulating the running count of transitions (sample-bit-this-cycle differs from sample-bit-prior-cycle) over the gather window, the ring being declared healthy on this metric if and only if the final count meets or exceeds a predefined minimum (e.g., one-256th of the gather window length);
+
+wherein a ring is considered healthy if and only if it passes BOTH the popcount and toggle checks, and wherein the dual check defends against patterns that satisfy popcount alone — most notably long-run "stuck-then-stuck" outputs (e.g., a sequence of half zeros followed by half ones, which has perfect 50% popcount but only one toggle) produced by a ring whose center frequency falls near an integer multiple of the sampling frequency.
+
+### Claim 3d — Byzantine-tolerant ring-set health threshold
+
+The TRNG of Claim 3, wherein the threshold K of healthy rings required for entropy collection to succeed is set to approximately N/2 (e.g., 8 healthy rings of 16 total), such that:
+
+- The device tolerates the failure of up to N − K individual rings without rejecting the entropy gather, preserving function across silicon-aging and partial-defect failure modes;
+- The per-ring failure probability budget is mathematically derivable from N, K, and the desired chip-failure rate (with N=16 and K=8, a per-ring failure rate up to approximately 0.8% keeps the per-chip failure rate below 10⁻¹⁵ per gather event);
+- The output entropy remains cryptographically uniform whenever at least one ring is healthy, because XOR of independent sources is uniform whenever any single XOR input is uniform.
 
 ### Claim 4 — Inverted-pair OTP storage with XOR verification
 
@@ -143,6 +160,24 @@ The device of Claim 3, wherein the ring oscillators are **gated off** by default
 - Electromagnetic emissions from the entropy source are present only during entropy-gathering;
 - Aging rate of the ring transistors is reduced relative to a continuously-running implementation.
 
+### Claim 9a — Silent-wire FUCKED state (no-heartbeat as honest signal)
+
+The device of Claim 6 and Claim 7, wherein upon any intrinsic silicon-level health failure — including but not limited to: failure of the per-ring TRNG health check of Claim 3 such that fewer than the threshold K rings pass; failure of the inverted-pair OTP verification of Claim 4 such that fewer than the Byzantine-majority number of pairs verify; or an interrupted OTP burn ceremony — the device permanently ceases driving the bidirectional data pin and emits no heartbeat pattern, such that:
+
+- The wire remains at its pull-down resistor's quiescent level, indistinguishable from an absent or unpowered device, with no information leakage about which fault occurred;
+- The transition to the silent-wire state is caused only by silicon-level physical truth conditions (broken rings, corrupt OTP, interrupted burn), never by any protocol command, host-authenticated message, or input bit pattern, preserving the indestructible-from-outside property of Claim 6;
+- The OTP and internal state remain intact and electrically readable for forensic analysis if the device is decapsulated, but cannot be altered through the pin interface;
+- The host's natural retry or alert behavior on detecting no response correctly identifies the device as non-functional without distinguishing whether it is broken, unpowered, or removed.
+
+### Claim 9b — Host-asks-only state reporting
+
+The device of Claim 2, wherein the device never proactively reports its internal state on the bidirectional data pin and instead:
+
+- The heartbeat pattern conveys only a binary alive/dead signal (present and alternating, or absent), with no information content beyond bare existence;
+- Any state information (e.g., current 5-state classification of Claim 4, ring-health bitmap of Claim 3c, popcount band of Claim 3) is computed continuously inside the device but is exposed on the wire only in response to an explicit host-initiated attestation request;
+- The attestation response is a cryptographic derivation (e.g., a domain-separated keyed hash) that obscures raw register fields rather than transmitting them in the clear;
+- No periodic state pings, no wakeup advertisements, no spontaneous notifications of any kind are emitted, eliminating timing-based and frequency-based side-channels that proactive state reporting would create.
+
 ### Claim 10 — wairua/ira parallel architecture
 
 The device of Claim 4a, wherein the device implements two parallel identity-storage backends:
@@ -172,7 +207,7 @@ wherein cryptographic operations requiring per-session uniqueness derive their w
 
 1. **Document local invention date** via this file's timestamp + MEGA backup timestamp. (Done by the act of writing this file before any push to public Git.)
 
-2. **File a US provisional application** capturing Claims 1-10 as a first step. Provisional doesn't require formal claim format; allows ~12 months to mature into a non-provisional. Cost ~$140 (micro entity) to ~$1600 (large entity).
+2. **File a US provisional application** capturing Claims 1-10 plus dependent claims 3a-d, 4a, 7a-b, 9a-b. Provisional doesn't require formal claim format; allows ~12 months to mature into a non-provisional. Cost ~$140 (micro entity) to ~$1600 (large entity).
 
 3. **Optionally, file a PCT** application within the priority window for international protection.
 
@@ -185,3 +220,11 @@ wherein cryptographic operations requiring per-session uniqueness derive their w
 ## Status
 
 Updated 2026-05-13 with full architectural claim cluster from the TRNG/IRA/PROTOCOL design freeze. Predecessor placeholder (broad isolation claim, now Claim 1) preserved. Awaiting attorney review and provisional filing.
+
+Updated 2026-05-14 with three additional claims surfaced during implementation work:
+
+- **Claim 3c (dual popcount+toggle health check)** — popcount alone cannot distinguish a "stuck-then-stuck" pattern (e.g., 32,768 zeros followed by 32,768 ones over the gather window) that has perfect 50% popcount but only one transition. Adding a per-ring toggle counter (count of sample-this-cycle XOR sample-last-cycle events) and requiring BOTH popcount AND toggle to pass is a novel defense against near-resonance silicon faults where a ring's center frequency falls near an integer subharmonic of the sampling clock.
+
+- **Claim 3d (Byzantine-tolerant ring threshold)** — operating with a subset of healthy rings rather than requiring all rings to pass relaxes per-ring failure budget by a large factor (roughly C(N, N−K) for threshold K of N rings), enabling silicon to remain functional under partial degradation while preserving cryptographic-grade output uniformity.
+
+- **Claims 9a/9b (silent-wire FUCKED state and host-asks-only state reporting)** — the device's response to internal health failure is to cease driving the wire entirely, producing a level indistinguishable from "absent device" rather than any informative error code. Combined with the policy that state information is never proactively broadcast and is exposed only via cryptographic derivation in response to host-initiated attestation requests, this eliminates an entire class of side-channels (timing-based, frequency-based, and DC-level-based) that informative error reporting would create.

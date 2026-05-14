@@ -12,7 +12,7 @@ For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 
 | Document | Topic |
 |---|---|
-| [TRNG.md](TRNG.md) | Entropy source — five-ring oscillator, 20-combo schedule, BLAKE3 extraction, silicon-tapeout mapping |
+| [TRNG.md](TRNG.md) | Entropy source — 16 ring oscillators, slow universal sampler, per-ring popcount+toggle dual health check, 8-of-16 byzantine threshold, BLAKE3 extraction, silicon-tapeout mapping |
 | [IRA.md](IRA.md) | The 256-bit boot secret (`ira`), 8-slot inverted-pair OTP geometry, KOHI/TATARI/TAHU provisioning ceremony, 5-state model, indestructible-from-outside principle |
 | [PROTOCOL.md](PROTOCOL.md) | Wire-layer protocol (mirror-XOR codec, slot ownership, asymmetric drive, session secrets) |
 
@@ -27,9 +27,9 @@ For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 | C | BLAKE3 silicon Fmax (125 MHz stable, 131 MHz marginal) | done — see `phase_c_results.csv` |
 | D | Ring + DCCA bringup, blake3 on ring, ring-vs-Fmax boundary (12-stage pass, 11-stage fail) | done |
 | E.1 | Wire bringup, codec, OLED instrumentation, host CDR | done |
-| E.2 | Five-ring TRNG (3/5/7/11/13 stages, 20-combo schedule, 1/4–3/4 health check, BLAKE3 extraction) | in design — see [TRNG.md](TRNG.md) |
-| E.3 | `ira_fsm` (KOHI → TATARI → TAHU), 8-slot inverted-pair OTP, 5-state classifier | in design — see [IRA.md](IRA.md) |
-| E.4 | Production PIPE bitstream (TRNG + ira_fsm + codec, no crystal) | after E.2/E.3 |
+| E.2 | 16-ring TRNG (odd primes 3..59, slow universal sampler, popcount+toggle dual health, 8-of-16 byzantine, BLAKE3 extraction) | sim PASS — see [TRNG.md](TRNG.md) |
+| E.3 | `ira_fsm` (KOHI → TATARI → TAHU), 8-slot inverted-pair OTP, 5-state classifier, FUCKED-silent wire | sim PASS — see [IRA.md](IRA.md) |
+| E.4 | Production PIPE bitstream (TRNG + ira_fsm + codec, no crystal) | synth-clean, PnR convergence WIP (top_pipe_ira) |
 
 **Key lesson from D:** any ring oscillator output that drives more than a handful of FFs needs an explicit DCCA buffer between the ring loop and the synchronous logic. The `(* noglobal *)` attribute on the loop wires keeps the oscillator fast, but downstream distribution requires DCCA — without it, fabric routing skew causes setup/hold violations far below silicon Fmax. See `rtl/ring_osc.v` header.
 
@@ -64,10 +64,12 @@ production PIPE bitstream.
 ```
 rtl/                production sources — synthesized into pipe.bit
   blake3/           vendored BLAKE3 compression core (BSD-3, 6a-62)
-  ring_osc.v        the only clock source (LUT4 NOT-cascade) — 5 instances (3/5/7/11/13 stages)
-  trng.v            five-ring metastability sampler, 20-combo XOR pool → 256b ira via BLAKE3
+  ring_osc.v        the only clock source (LUT4 NOT-cascade) — 16 instances (odd primes 3..59) inlined per top
+  trng.v            16-ring slow-sampler entropy gather, per-ring popcount + toggle health, single XOR'd buffer
+  blake3_tree.v     full BLAKE3 tree wrapper over the trng buffer (8 chunks → 4 → 2 → 1 root); spec-tested vs Rust reference
   ira_fsm.v         persistent provisioning state machine: KOHI → TATARI → TAHU → OPERATIONAL (trap)
   otp.v             8-slot inverted-pair eFuse interface (silicon: native macro; FPGA: SPI flash emulator)
+  inverted_pair_verify.v  shared 4-pair XOR-to-all-ones classifier with popcount+toggle slot sanity (used by both OTP and wairua RAM)
   key_register.v    256b write-once, fanout=1 to blake3.i_chain
   prng.v            ChaCha20 nonce generator
   ping_pong.v       blake3 ↔ shift_tx double buffer

@@ -1,25 +1,33 @@
 # TRNG — Entropy Source
 
-PIPE's entropy source. Eight ring oscillators with mutually-prime stage counts (the first 8 odd primes), sampled by `enclave_clk` (a slower 9th ring divided down to ~600 kHz). Per enclave_clk cycle: all 8 rings sampled in parallel, 8-way XOR into a single 65,536-bit buffer, 8 running popcount counters for per-ring health attribution. BLAKE3 extraction at end. Output is a 256-bit value (`ira` for permanent provisioning, `wairua` for session keys) — see [IRA.md](IRA.md) for what gets done with the output.
+PIPE's entropy source. Sixteen ring oscillators with mutually-prime stage counts (the first 16 odd primes), sampled by `enclave_clk` (a slower 17th ring divided down to ~600 kHz). Per enclave_clk cycle: all 16 rings sampled in parallel, 16-way XOR into a single 65,536-bit buffer, 16 running popcount counters AND 16 running toggle counters for per-ring health attribution. BLAKE3 extraction at end. Output is a 256-bit value (`ira` for permanent provisioning, `wairua` for session keys) — see [IRA.md](IRA.md) for what gets done with the output.
 
 This is the `KOHI` ("gather") phase of the provisioning ceremony. The downstream phases (`TATARI`, `TAHU`) are documented in [IRA.md](IRA.md).
 
-## Eight rings, prime stages
+## Sixteen rings, prime stages
 
-Eight `ring_osc` instances with stage counts **3, 5, 7, 11, 13, 17, 19, 23** — the first 8 odd primes. All mutually incommensurate, so no harmonic correlation can develop between any pair. Frequency spread ~7.4× from fastest to slowest:
+Sixteen `ring_osc` instances with stage counts **3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59** — the first 16 odd primes (we skip 2 because at 2 stages the ring period drops below ECP5 fabric distortion limits). All mutually incommensurate. Frequency spread ~25× from fastest to slowest:
 
 | Ring | Stages | Expected frequency on ECP5 speed-6 (measured 3-stage = 512 MHz) |
 |---|---|---|
-| R₀ | 3 | ~480 MHz (measured 512 MHz) |
-| R₁ | 5 | ~290 MHz |
-| R₂ | 7 | ~210 MHz |
-| R₃ | 11 | ~135 MHz |
-| R₄ | 13 | ~115 MHz |
-| R₅ | 17 | ~88 MHz |
-| R₆ | 19 | ~78 MHz |
-| R₇ | 23 | ~65 MHz |
+| R₀  | 3  | ~480 MHz (measured 512 MHz) |
+| R₁  | 5  | ~290 MHz |
+| R₂  | 7  | ~210 MHz |
+| R₃  | 11 | ~135 MHz |
+| R₄  | 13 | ~115 MHz |
+| R₅  | 17 | ~88 MHz  |
+| R₆  | 19 | ~78 MHz  |
+| R₇  | 23 | ~65 MHz  |
+| R₈  | 29 | ~52 MHz  |
+| R₉  | 31 | ~48 MHz  |
+| R₁₀ | 37 | ~40 MHz  |
+| R₁₁ | 41 | ~36 MHz  |
+| R₁₂ | 43 | ~35 MHz  |
+| R₁₃ | 47 | ~32 MHz  |
+| R₁₄ | 53 | ~28 MHz  |
+| R₁₅ | 59 | ~25 MHz  |
 
-8 is a power of 2, which makes the XOR-tree and popcount-counter widths fit cleanly into native counter sizes. R₇ at ~65 MHz is still ~108× faster than enclave_clk's 600 kHz — the slow-samples-fast regime holds for every ring.
+16 is a power of 2, which makes the XOR tree fit cleanly. R₁₅ at ~25 MHz is still ~42× faster than enclave_clk's 600 kHz — the slow-samples-fast regime holds for every ring with comfortable margin.
 
 These are nominal — actual placement varies ±10% across seeds due to fabric routing. Each ring is its own `ring_osc.v` instance with the same `(* keep *)` + `(* noglobal *)` attributes that prevent yosys from optimizing the loop away.
 
@@ -44,53 +52,75 @@ The decorrelation is *multiplicatively strong* — even if one layer were defeat
 
 Earlier drafts of this design proposed a 20-combination schedule where each ring took turns sampling each other ring. That scheme had a **fundamental flaw**: fast-clock-sampling-slow-signal produces deterministic patterns, not entropy. A 3-stage ring at ~480 MHz sampling an 11-stage ring at ~135 MHz fires 3.6× per source half-period and outputs `111000011110001110...` — the actual entropy rate collapses to ~1 bit per *ring-period of phase drift*, not per sample.
 
-The fix: **always sample slow-clock-on-fast-signal**. Use `enclave_clk` (~600 kHz, derived from a 9th ring oscillator divided by SLOT_DIV) as the sole sampling clock for all 8 entropy rings. Between two enclave_clk edges (~1.6 µs apart), each entropy ring traverses 100–800 of its own cycles — far more than a single transition's worth — so its phase walks randomly under thermal noise. Each enclave_clk edge catches each ring in essentially uniformly-random phase.
+The fix: **always sample slow-clock-on-fast-signal**. Use `enclave_clk` (~600 kHz, derived from a 17th ring oscillator divided by SLOT_DIV) as the sole sampling clock for all 16 entropy rings. Between two enclave_clk edges (~1.6 µs apart), each entropy ring traverses 40–800 of its own cycles — far more than a single transition's worth — so its phase walks randomly under thermal noise. Each enclave_clk edge catches each ring in essentially uniformly-random phase.
 
 ## Sampling, accumulation, and health check — all per-cycle, single buffer
 
 ```
 Per enclave_clk cycle (1.6 µs, ~600 kHz):
-  for i in 0..7:
+  for i in 0..15:
     sample[i]    = sample_ff(ring[i].clk_out, enclave_clk.posedge)
     popcount[i] += sample[i]                       // 17-bit running counter
+    toggles[i]  += (sample[i] != prev_sample[i])   // 17-bit running counter
+  prev_sample = sample
 
-  buffer[cycle_idx] = sample[0] ^ sample[1] ^ sample[2] ^ sample[3] ^
-                      sample[4] ^ sample[5] ^ sample[6] ^ sample[7]
+  buffer[cycle_idx] = sample[0] ^ sample[1] ^ … ^ sample[15]   // 16-way XOR
   cycle_idx        += 1
 
 After 65,536 cycles (~110 ms):
-  health_pass = (for all i: popcount[i] ∈ [16384, 49152])
+  for i in 0..15:
+    ring_pass[i] = (popcount[i] ∈ [8192, 57344])   // 1/8 to 7/8 — popcount band
+                 ∧ (toggles[i]  ≥ 256)             // N/256 — toggle floor
+  healthy_count = Σ ring_pass[i]
 
-  if health_pass:
+  if healthy_count ≥ 8:
     output = BLAKE3(buffer)[0..31]                 // 256 bits
   else:
-    abort KOHI permanently — broken silicon → STATE 1 FUCKED
+    abort KOHI permanently — broken silicon → STATE 1 FUCKED, silent wire
 ```
 
-**Memory**: one 65,536-bit buffer (8 KB BRAM) + 8 × 17-bit popcount counters (≈17 LUT-FF pairs) + 8 single-bit sampling FFs. Total fabric cost: ~8 KB BRAM + ~150 LUT4s.
+**Memory**: one 65,536-bit buffer (8 KB BRAM) + 16 × 17-bit popcount counters + 16 × 17-bit toggle counters + 16 single-bit sampling FFs + 16 single-bit prev-sample FFs. Total fabric cost: ~8 KB BRAM + ~600 LUT-FF pairs.
 
-**Why combined per-cycle XOR, not 8 parallel buffers**: 5× less RAM, identical entropy quality, identical per-ring fault attribution (the popcount counters track each ring independently regardless of how their samples get combined downstream). If any ring's popcount drifts outside [16384, 49152], we know exactly which ring failed.
+**Why combined per-cycle XOR, not 16 parallel buffers**: 16× less RAM, identical entropy quality, identical per-ring fault attribution (the popcount and toggle counters track each ring independently regardless of how their samples get combined downstream). If any ring fails either check, we know exactly which ring failed.
 
-Fixed wiring everywhere — no state-machine multiplexing, no combination schedule, no FSM N-stage counter. 8 sampling FFs each reading their own ring on every enclave_clk edge.
+Fixed wiring everywhere — no state-machine multiplexing, no combination schedule, no FSM N-stage counter. 16 sampling FFs each reading their own ring on every enclave_clk edge.
 
-## Per-ring health check — quarter-three-quarter bound
+## Per-ring dual health check — popcount AND toggle
 
-Each ring has its own running popcount counter that increments live as samples are taken. After 65,536 cycles, each ring's popcount must fall in `[16384, 49152]` — i.e., between 1/4 and 3/4 of the cycle count. Eight independent checks (one per ring), all must pass.
+Each ring has TWO running counters that increment live as samples are taken:
 
-This is a *device-health* check, not a cryptographic property. It catches:
-- Dead ring oscillator (output stuck at 0 or 1) → buffer is all-zeros or all-ones → reject
-- Crystal-influenced ring (somehow coupling to a fixed external frequency) → strongly biased pattern → reject
-- Catastrophic placement failure (ring degenerated to a constant during PnR) → reject
+1. **Popcount counter** — increments by 1 each cycle the ring's sample is 1. After 65,536 cycles, must fall in `[8192, 57344]` (1/8 to 7/8 of the cycle count, ±75% bias tolerated).
+2. **Toggle counter** — increments by 1 each cycle the ring's sample differs from its prior-cycle sample (edge detect). After 65,536 cycles, must be `≥ 256` (= N/256, at least 1/256 of expected N/2 toggles for true random).
 
-The bound is intentionally loose. A fair-coin 65,536-bit buffer has expected count 32,768 with standard deviation ~128. The 1/4–3/4 window is wider than ±125σ — it doesn't catch subtle bias, it catches *broken silicon*. Subtle bias is the XOR accumulator's and BLAKE3's job to mop up.
+A ring is healthy iff BOTH checks pass. The popcount band is wider than earlier drafts' 1/4-3/4 because rings have real PVT bias that BLAKE3 + 16-way XOR easily absorb. The toggle floor is the cryptographically meaningful test — it catches patterns that the popcount alone misses:
 
-**On health-check failure: provisioning aborts.** No retry, no fallback ring set. A failed ring is broken silicon and the device is unprovisioneable. The chip stays in STATE 0 (VIRGIN) and refuses to operate.
+**Why toggle counter matters.** Popcount alone passes "stuck-then-stuck" patterns. Consider a ring whose center frequency lands near an exact integer multiple of `enclave_clk`. With a frequency offset `Δf = 10 Hz` from the nearest subharmonic of a 1 MHz sampler, the output bit changes once every `f_sample / (2Δf) = 50,000` samples — over a 65,536-sample gather, that's **about 1 toggle total**, but popcount is ≈ 32,768 (perfect 50%). Popcount sees a "perfect ring", toggle sees "completely stuck".
+
+The math: under deterministic stable-frequency analysis with uniformly-distributed frequency offset Δf, toggle count over N samples is **uniformly** distributed in [0, N] — NOT Gaussian like popcount. So the per-ring toggle-fail probability for a threshold of TOG_MIN/N is exactly TOG_MIN/N. At N/256, that's 0.39% per ring.
+
+Real silicon has thermal jitter that knocks rings off resonance constantly, so the deterministic worst case overstates the failure rate by orders of magnitude. But the worst case is what the patent claim has to defend against, and N/256 with 8-of-16 byzantine gives a per-chip failure probability of ~10⁻¹⁵ per KOHI — satellite-fleet-safe over centuries.
+
+## Byzantine-tolerant ring threshold (8 of 16)
+
+Earlier drafts required ALL rings to pass health checks. With 16 rings, this would multiply the per-ring failure rate by 16× into the per-chip rate — unacceptable for a fleet at scale even if individual rings are very reliable.
+
+Instead: require ≥8 of 16 rings to pass. Tolerate up to 8 ring failures. Per-chip failure (≤7 healthy) requires ≥9 of 16 to fail simultaneously:
+
+```
+P(≥9 fail of 16) ≈ C(16, 9) · p⁹ = 11,440 · p⁹  for small p
+```
+
+For our target `P_chip < 10⁻¹⁵ per KOHI` (fleet-safe over 10¹² KOHIs/year × 100 years), we need per-ring failure rate `p < 7.9 × 10⁻³`. Our actual `p ≈ 0.39%` (toggle) sits comfortably under that ceiling with ~2× margin.
+
+**Why XOR'd output stays good with partial-ring health**: XOR of N independent sources is uniform if and only if at least one input is uniform. So even one healthy ring is theoretically sufficient for cryptographic uniformity; the ≥8 threshold is defense-in-depth, not strict necessity. Output ira_seed quality is unaffected by which subset of rings happen to pass.
+
+**On health-check failure: provisioning silently fails.** No retry, no fallback. The chip latches FUCKED, ceases driving its wire forever (host sees indistinguishable-from-absent), and the only paths out are physical destruction or replacement. See [IRA.md §FUCKED-silent](IRA.md#fucked-state--silent-wire) for the wire-level behavior.
 
 ## XOR accumulator
 
-The single buffer IS the conditioned pool — each bit is already the 8-way XOR of all 8 rings' samples at one enclave_clk edge. Eight-way XOR of independent thermal-noise sources averages individual-source bias toward zero:
+The single buffer IS the conditioned pool — each bit is already the 16-way XOR of all 16 rings' samples at one enclave_clk edge. Sixteen-way XOR of independent thermal-noise sources averages individual-source bias toward zero:
 
-> Residual bias after XOR of N ~independent sources, each with bias p, scales as `p^N` for small p. With 8 streams at ~5% individual bias: residual ≈ 5%⁸ ≈ 4×10⁻¹¹. Statistically indistinguishable from uniform for any reasonable use.
+> Residual bias after XOR of N ~independent sources, each with bias p, scales as `p^N` for small p. With 16 streams at ~5% individual bias: residual ≈ 5%¹⁶ ≈ 1.5×10⁻²¹. Statistically indistinguishable from uniform for any reasonable use; cosmically indistinguishable from uniform for any *unreasonable* use.
 
 The input to BLAKE3 is already close to uniformly distributed before the extractor runs.
 
@@ -123,7 +153,7 @@ Storage cost is 256 bits in OTP. Everything else is computed on demand. See IRA.
 
 ## Silicon-tapeout mapping
 
-The FPGA implementation uses 8 ring oscillators as the entropy primitive because FPGA fabric offers no other physically-noisy element accessible from RTL. At silicon, the topology stays identical (8 sources sampled by enclave_clk into one XOR'd buffer, per-ring 1/4–3/4 health check via running popcounts, 8-way per-cycle XOR, BLAKE3) but each ring is replaced with a different physics source for true source-independence:
+The FPGA implementation uses 16 ring oscillators as the entropy primitive because FPGA fabric offers no other physically-noisy element accessible from RTL. At silicon, the topology stays identical (16 sources sampled by enclave_clk into one XOR'd buffer, per-ring popcount + toggle dual health check, 16-way per-cycle XOR, BLAKE3) but each ring is replaced with a different physics source for true source-independence:
 
 | FPGA ring | Silicon replacement | Physics |
 |---|---|---|

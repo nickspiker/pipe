@@ -104,7 +104,7 @@ Rings are **gated off** by default. Five triggers can spin them up:
 
 ## KOHI — gather (the operation itself)
 
-Run the eight-ring entropy gathering described in [TRNG.md](TRNG.md). 8 rings sampled by enclave_clk in parallel, per-cycle 8-way XOR into a 65,536-bit buffer, 8 running popcount counters for per-ring 1/4–3/4 health checks, BLAKE3 extraction. Output: 256-bit value in SRAM, plus a `gather_complete` strobe.
+Run the sixteen-ring entropy gathering described in [TRNG.md](TRNG.md). 16 rings sampled by enclave_clk in parallel, per-cycle 16-way XOR into a 65,536-bit buffer, 16 running popcount counters AND 16 running toggle counters for per-ring dual health checks (popcount ∈ [N/8, 7N/8] AND toggles ≥ N/256), BLAKE3 extraction. Output: 256-bit value in SRAM, plus a `gather_complete` strobe.
 
 If any combo fails its health check: KOHI aborts permanently. The chip remains in STATE 0 and refuses to operate. No retry — failed health check means broken silicon.
 
@@ -217,11 +217,44 @@ Hosts get full visibility:
 
 No fuses spent on status. It's a live readout the chip computes anyway.
 
+## FUCKED state — silent wire
+
+When the chip enters STATE 1 (FUCKED), it **permanently ceases driving the bidirectional data pin**. No heartbeat, no slot transitions, nothing. The host's pull-down resistor holds the line at quiescent zero forever.
+
+A FUCKED PIPE is **wire-level indistinguishable from an absent or unpowered device**. Both look like "no PIPE here" to the host, which prompts identical retry/alert behavior. This is the correct outcome — for the host's purposes there is no functional difference between "chip is broken" and "no chip", because neither produces a usable attestation.
+
+**What triggers FUCKED → silent wire**:
+
+| Trigger | Source |
+|---|---|
+| Fewer than 8 of 16 ring health checks pass during KOHI | [TRNG.md §Byzantine-tolerant ring threshold](TRNG.md) |
+| Fewer than Byzantine-majority valid OTP pairs at boot | [§Boot decision logic](#boot-decision-logic) |
+| Multiple valid OTP pairs disagree on `ira` | same |
+| TAHU burn ceremony interrupted partway | [§Failure tolerance](#failure-tolerance) |
+
+All four triggers are **silicon-level truth conditions**, not protocol-driven. **No host command, no incoming wire pattern, no debug sequence, no malformed message can transition the chip into the silent-wire state**. The chip's silence describes a pre-existing physical reality; it is never a response to a remote action. This preserves the indestructible-from-outside invariant (§"Indestructible from outside") — the chip's destructibility is purely intrinsic.
+
+**Forensic accessibility**: A silent chip's OTP and internal registers remain electrically readable (e.g., via decapsulation + microprobe). The state is preserved, not destroyed. The chip is *silently-bricked-from-the-wire*, not *destroyed*. This matters for failure-mode analysis and for the warranty/RMA pipeline — manufacturers can determine the specific failure mode from a returned silent chip.
+
+**One-line implementation**: in the codec wrapper, `tx_drive_enable = !chip_fucked`, where `chip_fucked = trng.health_fail || otp_byzantine_fail || burn_interrupted_latched`. The codec is otherwise unchanged; silence is just the absence of drive.
+
+## Host asks — enclave answers (no proactive state push)
+
+The enclave **never proactively reports state on the wire**. The heartbeat carries no information beyond "I'm alive enough to drive"; the message layer is purely request-response. This is a deliberate side-channel-elimination measure:
+
+- **Heartbeat layer**: pure idle pattern. Either present (chip alive) or absent (chip FUCKED, unpowered, or unplugged). Three-way ambiguity in the absent case, by design.
+- **Message layer**: the chip transmits only in direct response to a host-initiated request, and the response is a cryptographic derivation (e.g., domain-separated keyed-BLAKE3 over the request, the relevant state, and `ira` or `wairua`), never raw register fields in the clear.
+- **No periodic state pings**, no wakeup advertisements, no auto-notifications on degradation events. A DEGRADED chip heartbeats identically to a HEALTHY chip from the wire's perspective; the host learns the degradation level only by asking for an attestation, which exposes only an opaque derivation that bakes the state into the cryptographic output but reveals nothing of the input directly.
+
+Designed-out side-channels: timing-based (no spontaneous transmissions reveal internal events), frequency-based (no periodic patterns leak clock characteristics), DC-level-based (the heartbeat is balanced and stateless). Anything the host needs to know about the chip's internal state has to be **asked for explicitly**.
+
+When designing new modules (`handshake_fsm`, attest handlers, codec wrappers), the default question is: "what does the host need to ask for to get this information?" — never "when should I send this information?"
+
 ## What we test on FPGA
 
 | Test | Validates |
 |---|---|
-| KOHI sim with behavioral clocks (Icarus) | FSM sequences 20 combos, health checks fire, XOR pool fills, BLAKE3 hand-off triggers |
+| KOHI sim with behavioral clocks (Icarus) | 16-ring parallel sample + 16-way XOR, popcount AND toggle health checks fire, XOR pool fills, BLAKE3 hand-off triggers, ceremony reaches HEALTHY |
 | TATARI delay sim | `delay_ms` derives correctly from `ira`, FSM idles for the computed duration |
 | TAHU sim with OTP emulator | Burn order correct, per-slot verify catches deliberate-corruption test injections |
 | 5-state classifier sim | Pre-seed OTP emulator with each state's signature pattern, verify boot logic classifies correctly |
