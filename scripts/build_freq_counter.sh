@@ -126,7 +126,7 @@ echo ""
 echo "--- Synthesise ---"
 cd "$BUILD"
 yosys -p "
-    read_verilog $RTL/ssd1306_i2c.v
+    read_verilog $ROOT/rtl/ssd1306_i2c.v
     ${EXTRA_VERILOG:+read_verilog $EXTRA_VERILOG}
     read_verilog $YOSYS_DEFINES $RTL/top_extclk.v
     synth_ecp5 -nowidelut -abc2 -top top_extclk -json $BUILD/freq_counter.json

@@ -8,6 +8,14 @@ This is the FPGA prototype of the same write-once-key anchor that Glyph silicon 
 
 For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 
+## Documents
+
+| Document | Topic |
+|---|---|
+| [TRNG.md](TRNG.md) | Entropy source — five-ring oscillator, 20-combo schedule, BLAKE3 extraction, silicon-tapeout mapping |
+| [IRA.md](IRA.md) | The 256-bit boot secret (`ira`), 8-slot inverted-pair OTP geometry, KOHI/TATARI/TAHU provisioning ceremony, 5-state model, indestructible-from-outside principle |
+| [PROTOCOL.md](PROTOCOL.md) | Wire-layer protocol (mirror-XOR codec, slot ownership, asymmetric drive, session secrets) |
+
 ## Status
 
 **Phase D characterization complete.** Clock architecture chosen: small fast ring + /N divider.
@@ -18,7 +26,10 @@ For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 | B | Ring osc characterization (32 stages → 46.22 MHz) | done — see `phase_b_results.csv` |
 | C | BLAKE3 silicon Fmax (125 MHz stable, 131 MHz marginal) | done — see `phase_c_results.csv` |
 | D | Ring + DCCA bringup, blake3 on ring, ring-vs-Fmax boundary (12-stage pass, 11-stage fail) | done |
-| E | Production PIPE bitstream (5-stage ring + /N divider, no crystal) | next |
+| E.1 | Wire bringup, codec, OLED instrumentation, host CDR | done |
+| E.2 | Five-ring TRNG (3/5/7/11/13 stages, 20-combo schedule, 1/4–3/4 health check, BLAKE3 extraction) | in design — see [TRNG.md](TRNG.md) |
+| E.3 | `ira_fsm` (KOHI → TATARI → TAHU), 8-slot inverted-pair OTP, 5-state classifier | in design — see [IRA.md](IRA.md) |
+| E.4 | Production PIPE bitstream (TRNG + ira_fsm + codec, no crystal) | after E.2/E.3 |
 
 **Key lesson from D:** any ring oscillator output that drives more than a handful of FFs needs an explicit DCCA buffer between the ring loop and the synchronous logic. The `(* noglobal *)` attribute on the loop wires keeps the oscillator fast, but downstream distribution requires DCCA — without it, fabric routing skew causes setup/hold violations far below silicon Fmax. See `rtl/ring_osc.v` header.
 
@@ -53,15 +64,16 @@ production PIPE bitstream.
 ```
 rtl/                production sources — synthesized into pipe.bit
   blake3/           vendored BLAKE3 compression core (BSD-3, 6a-62)
-  ring_osc.v        the only clock source (LUT4 NOT-cascade)
-  trng.v            entropy accumulator → boot secret
+  ring_osc.v        the only clock source (LUT4 NOT-cascade) — 5 instances (3/5/7/11/13 stages)
+  trng.v            five-ring metastability sampler, 20-combo XOR pool → 256b ira via BLAKE3
+  ira_fsm.v         persistent provisioning state machine: KOHI → TATARI → TAHU → OPERATIONAL (trap)
+  otp.v             8-slot inverted-pair eFuse interface (silicon: native macro; FPGA: SPI flash emulator)
   key_register.v    256b write-once, fanout=1 to blake3.i_chain
-  boot_fsm.v        WAIT_ENTROPY → HASH_SEED → LOCK_KEY → SEED_PRNG → OPERATIONAL (trap)
   prng.v            ChaCha20 nonce generator
   ping_pong.v       blake3 ↔ shift_tx double buffer
-  shift_tx.v        idle heartbeat + TX initiate
-  shift_rx.v        8x oversample CDR + RX initiate detect
-  cdc.v             2-flop synchronizer + half-duplex IO
+  codec.v           mirror-XOR codec (asymmetric pull-down drive)
+  slot_clk.v        bit-slot clock generator
+  wire_io.v         BB primitive + 2-FF input synchronizer
   top.v             integration
 
 rtl/measure/        measurement-only sources (Phase B/C bringup tools)
@@ -89,10 +101,11 @@ patent/                     claim drafts + synthesis evidence
 1. `key_register.key_out` has fanout == 1 (single sink: blake3.i_chain)
 2. Zero PCLKT pad usage (no external clock)
 3. Exactly one bidirectional IO pin (pipe_pad)
-4. boot_fsm OPERATIONAL is a trap state (no exit edge)
+4. `ira_fsm` has no transition out of OPERATIONAL (trap state) and no transition that decreases `state` value (provisioning is forward-only)
 5. Zero forbidden clock primitives (EHXPLLL, EHXPLLL_CORE, OSCG, PLLREFCS)
+6. `ira_fsm` has no input that could trigger a state-machine reset other than POR (no host-authenticated self-destruct path exists)
 
-Any commit that breaks one of these changes the threat model.
+Any commit that breaks one of these changes the threat model. See [IRA.md](IRA.md) for why the chip has no killswitch and why state transitions are forward-only.
 
 ## Conventions
 

@@ -1,0 +1,37 @@
+# =============================================================================
+# pipe_ring_scope.lpf — 8-ring entropy scope constraints
+# =============================================================================
+# Same as pipe_oled.lpf plus the user button (R7) used to trigger acquisition.
+#
+#   clk      → P6   (external 25 MHz crystal)
+#   btn      → R7   (active-low user button)
+#   oled_scl → P2
+#   oled_sda → R2
+#   led      → T6   (active-low onboard LED)
+# =============================================================================
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 25 MHz;
+
+LOCATE COMP "kp_row" SITE "P14";
+IOBUF PORT "kp_row" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_col" SITE "R13";
+IOBUF PORT "kp_col" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_col2" SITE "P12";
+IOBUF PORT "kp_col2" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
+
+# Keypad LED (J4 pin 6 via 74HC245T buffer on T2) — lit solid during XOR mode
+LOCATE COMP "ext_led" SITE "T2";
+IOBUF PORT "ext_led" IO_TYPE=LVCMOS33;
