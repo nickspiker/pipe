@@ -57,7 +57,12 @@ module otp #(
     output reg                           write_rejected,
 
     // Inspection: bitmap of slots that have been burned (1 = burned).
-    output wire [N_SLOTS-1:0]            burned_mask
+    output wire [N_SLOTS-1:0]            burned_mask,
+
+    // Parallel-slot read port — all 8 slots concatenated (slot 0 in low bits,
+    // slot 7 in high). Continuously valid. Used by inverted_pair_verify in
+    // top.v without needing hierarchical references.
+    output wire [N_SLOTS*SLOT_BITS-1:0]  all_slots_flat
 );
 
     // -------------------------------------------------------------------------
@@ -71,6 +76,13 @@ module otp #(
     assign read_data   = slot_data[read_addr];
     assign read_burned = slot_burned[read_addr];
     assign burned_mask = slot_burned;
+
+    genvar gs;
+    generate
+        for (gs = 0; gs < N_SLOTS; gs = gs + 1) begin : slot_fanout
+            assign all_slots_flat[gs*SLOT_BITS +: SLOT_BITS] = slot_data[gs];
+        end
+    endgenerate
 
     // -------------------------------------------------------------------------
     // Write logic. write_enable is sampled on the rising edge; the result
