@@ -50,6 +50,8 @@ echo "--- Synthesise ---"
     read_verilog -I $RTL $RTL/ssd1306_i2c.v
     read_verilog -I $RTL $RTL/oled_greyscale_driver.v
     read_verilog -I $RTL $RTL/oled_text_renderer.v
+    read_verilog -I $RTL $RTL/oled_mode_fsm.v
+    read_verilog -I $RTL $RTL/keypad.v
     read_verilog -I $RTL $MEASURE/top_pipe_ira.v
     synth_ecp5 -nowidelut -abc2 -top top_pipe_ira -json pipe_ira.json
     stat

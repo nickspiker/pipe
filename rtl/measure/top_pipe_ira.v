@@ -26,17 +26,26 @@
 `timescale 1ns / 1ps
 
 module top_pipe_ira (
-    input  wire clk,           // 25 MHz crystal (P6)
-    output wire kp_row,        // dozenal keypad p51 (P14) — driven LOW
-    input  wire kp_col,        // dozenal keypad p56 (R13) — Enter triggers provision
-    output wire oled_scl,      // SSD1306 I2C clock (P2)
-    output wire oled_sda,      // SSD1306 I2C data  (R2)
-    output reg  led,           // T6 onboard LED — ceremony status
-    output reg  ext_led        // T2 J4 LED — FUCKED indicator
-);
+    input  wire clk,            // 25 MHz crystal (P6)
 
-    assign kp_row = 1'b0;
-    wire btn_raw = kp_col;     // active-low button
+    // Dozenal keypad (11 bidirectional pins, all PULLMODE=UP)
+    inout  wire kp_p27,         // matrix row 0
+    inout  wire kp_p28,         // matrix row 1
+    inout  wire kp_p44,         // matrix row 2 / Decimal shared
+    inout  wire kp_p51,         // matrix row 3
+    inout  wire kp_p49,         // matrix col 0
+    inout  wire kp_p63,         // matrix col 1 / Divide shared
+    inout  wire kp_p62,         // matrix col 2 / Negate shared / Multiply special
+    inout  wire kp_p56,         // matrix col 3
+    inout  wire kp_p50,         // ad-hoc: Negate
+    inout  wire kp_p57,         // ad-hoc: Decimal
+    inout  wire kp_p58,         // ad-hoc: Divide
+
+    output wire oled_scl,       // SSD1306 I2C clock (P2)
+    output wire oled_sda,       // SSD1306 I2C data  (R2)
+    output reg  led,            // T6 onboard LED — ceremony status
+    output reg  ext_led         // T2 J4 LED — FUCKED indicator
+);
 
     // =========================================================================
     // 16 RING OSCILLATORS — odd primes 3..59
@@ -183,26 +192,48 @@ module top_pipe_ira (
     end
 
     // =========================================================================
-    // Button debounce + edge detect — same pattern as ring_scope
+    // Keypad scanner — full 18-key dozenal scanner (3-phase: Multiply detect,
+    // 4×4 matrix scan, 3 ad-hoc keys). Emits press_pulse on each new press.
     // =========================================================================
-    reg [1:0]  btn_sync = 2'b11;
-    always @(posedge clk) btn_sync <= {btn_sync[0], btn_raw};
-    wire btn_clean = btn_sync[1];        // active-low, synced
+    wire [4:0] key_code;
+    wire       key_valid;
+    wire       key_press_pulse;
+    wire       multiply_held, shift_held;
 
-    reg [3:0]  btn_stable_cnt = 0;
-    reg        btn_state      = 1'b1;    // released
-    reg        btn_state_prev = 1'b1;
-    always @(posedge clk) begin
-        if (btn_clean == btn_state) begin
-            btn_stable_cnt <= 0;
-        end else begin
-            btn_stable_cnt <= btn_stable_cnt + 4'd1;
-            if (&btn_stable_cnt) btn_state <= btn_clean;
-        end
-        btn_state_prev <= btn_state;
+    keypad u_keypad (
+        .clk          (clk),
+        .reset_n      (reset_n),
+        .p27_row0     (kp_p27),
+        .p28_row1     (kp_p28),
+        .p44_row2     (kp_p44),
+        .p51_row3     (kp_p51),
+        .p49_col0     (kp_p49),
+        .p63_col1     (kp_p63),
+        .p62_col2     (kp_p62),
+        .p56_col3     (kp_p56),
+        .p50_negate   (kp_p50),
+        .p57_decimal  (kp_p57),
+        .p58_divide   (kp_p58),
+        .o_key        (key_code),
+        .o_key_valid  (key_valid),
+        .press_pulse  (key_press_pulse),
+        .multiply_held(multiply_held),
+        .shift_held   (shift_held)
+    );
+
+    // Key role assignments:
+    //   Enter (key 15) — provision_request (run KOHI → BLAKE3 → TAHU)
+    //   Zil   (key 14) — cycle OLED display mode (mode 0 ↔ 1)
+    wire provision_request = key_press_pulse && (key_code == 5'd15);
+    wire mode_cycle_pulse  = key_press_pulse && (key_code == 5'd14);
+
+    // OLED display mode register. Cycles 0 → 1 → 0 → ... on each press of
+    // the mode-cycle key. Mode 0 = ira hex, mode 1 = status.
+    reg mode;
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n)            mode <= 1'b0;
+        else if (mode_cycle_pulse) mode <= ~mode;
     end
-
-    wire provision_request = btn_state_prev & ~btn_state;  // falling edge = press
 
     // =========================================================================
     // trng — feeds blake3_tree
@@ -414,43 +445,37 @@ module top_pipe_ira (
     end
 
     // -------------------------------------------------------------------------
-    // ira → 64 ASCII hex chars. Nibble k (k=0..63) sits at recovered_ira
-    // [255 - 4*k -: 4] so the leftmost glyph is the MSB nibble.
+    // Screen content selector. oled_mode_fsm composes the 4×24 text grid
+    // (768 bits = strings_flat) from the current mode + chip state.
     // -------------------------------------------------------------------------
     wire [STR_LEN*8-1:0] strings_flat;
-    genvar gh;
-    generate
-        for (gh = 0; gh < 64; gh = gh + 1) begin : hex_chars
-            // Place the 64 hex chars in column-major within each 16-char line:
-            //   line = gh / 16    char_in_line = gh % 16
-            //   slot = line*MAX_CHARS_PER_LINE + char_in_line
-            localparam integer LINE = gh / 16;
-            localparam integer COL  = gh % 16;
-            localparam integer SLOT = LINE * MAX_CHARS_PER_LINE + COL;
-            wire [3:0] nib = recovered_ira[255 - 4*gh -: 4];
-            assign strings_flat[SLOT*8 +: 8] = (nib < 4'd10)
-                ? (8'h30 + {4'b0, nib})           // '0'..'9'
-                : (8'h41 + {4'b0, nib} - 8'd10);  // 'A'..'F'
-        end
-        // Pad remaining slots (chars 16..23 of each line, plus any lines beyond 3) with 0.
-        for (gh = 0; gh < STR_LEN; gh = gh + 1) begin : pad
-            if (((gh % MAX_CHARS_PER_LINE) >= 16) || (gh / MAX_CHARS_PER_LINE) >= 4) begin
-                assign strings_flat[gh*8 +: 8] = 8'h00;
-            end
-        end
-    endgenerate
+
+    oled_mode_fsm #(
+        .N_LINES           (N_LINES),
+        .MAX_CHARS_PER_LINE(MAX_CHARS_PER_LINE)
+    ) u_mode_fsm (
+        .mode            (mode),
+        .ira             (recovered_ira),
+        .chip_state      (chip_state),
+        .ring_health_cnt (trng_ring_health_cnt),
+        .strings_flat    (strings_flat)
+    );
 
     // -------------------------------------------------------------------------
-    // Re-render request: pulse on every ceremony_done. Also pulse once
-    // shortly after reset so the boot screen (all-zeros ira before
-    // provisioning) renders the placeholder "0000...".
+    // Re-render request: pulse on every ceremony_done, mode change, or
+    // chip_state change. Also pulse once shortly after reset so the boot
+    // screen renders.
     // -------------------------------------------------------------------------
     reg [3:0] re_render_init_cnt;
+    reg [2:0] last_chip_state;
+    reg       last_mode;
     reg       re_render_req;
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
             re_render_init_cnt <= 4'd0;
             re_render_req      <= 1'b0;
+            last_chip_state    <= 3'd0;
+            last_mode          <= 1'b0;
         end else begin
             re_render_req <= 1'b0;
             if (re_render_init_cnt != 4'd15) begin
@@ -458,7 +483,11 @@ module top_pipe_ira (
                 if (re_render_init_cnt == 4'd14)
                     re_render_req <= 1'b1;
             end
-            if (ceremony_done) re_render_req <= 1'b1;
+            if (ceremony_done)                  re_render_req <= 1'b1;
+            if (chip_state != last_chip_state)  re_render_req <= 1'b1;
+            if (mode != last_mode)              re_render_req <= 1'b1;
+            last_chip_state <= chip_state;
+            last_mode       <= mode;
         end
     end
 

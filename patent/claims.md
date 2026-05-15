@@ -187,6 +187,17 @@ The device of Claim 4a, wherein the device implements two parallel identity-stor
 
 wherein cryptographic operations requiring per-session uniqueness derive their working keys from a domain-separated mixture of `wairua` and (if provisioned) `ira`, and the ephemeral backend's failure to verify causes the session to halt and require a fresh handshake without re-running entropy gathering on the ephemeral backend silently.
 
+### Claim 11 — Single-bit-in, 256-bits-out clean-entropy delivery
+
+The device of Claims 3, 7, 7b, and 10, wherein the act of completing a session handshake on the bidirectional data pin both (a) invariably triggers a fresh KOHI entropy gather of Claim 3 and (b) causes the first response message in the new session to be a cryptographically-conditioned derivation containing the freshly-gathered entropy, such that:
+
+- A host requesting fresh hardware entropy from the device need transmit only **one inverted slot pair** (the handshake event of Claim 7b) within the prescribed clean-idle envelope, with no command opcode, no command structure, and no protocol-stack negotiation;
+- The device's response, transmitted as a 256-bit message per Claim 7a, is a domain-separated cryptographic derivation of the form `BLAKE3("ferros-pipe/handshake" || ira || wairua)` where `wairua` is the 256-bit value just produced by KOHI per Claim 10, providing the host with 256 bits of physically-fresh, BLAKE3-conditioned, ira-bound entropy;
+- The same single-bit handshake event simultaneously establishes session-key material **and** delivers entropy to the host, eliminating the need for any separate "entropy request", "RNG read", or "get-random" command in the wire-level protocol;
+- The output is authenticated by the protocol's keyed-hash chain per Claim 7 and bound to the device's persistent identity per Claim 4, enabling the host to verify that the entropy originated from this specific device's silicon entropy source rather than from a man-in-the-middle attacker;
+- The device sustains no damage and incurs no persistent-state cost from repeated entropy requests beyond the negligible cycle count consumed by each KOHI's ring oscillation, with the per-request latency bounded above by user-perceptible delay (~110 ms at the design enclave_clk rate) and below by the entropy-gather requirement of Claim 3;
+- This property — minimum-protocol-complexity hardware entropy delivery — provides operating systems and other host-side cryptographic consumers with a kernel-CSPRNG seeding interface achievable by transmitting one bit and receiving one 256-bit message, on a single bidirectional data pin, with no host-side bus initialization, authentication phase, or structured response parsing of the kind universally required by prior-art secure-element products with separate "GET_RANDOM" or "RNG_READ" commands.
+
 ---
 
 ## Prior art table
@@ -207,7 +218,7 @@ wherein cryptographic operations requiring per-session uniqueness derive their w
 
 1. **Document local invention date** via this file's timestamp + MEGA backup timestamp. (Done by the act of writing this file before any push to public Git.)
 
-2. **File a US provisional application** capturing Claims 1-10 plus dependent claims 3a-d, 4a, 7a-b, 9a-b. Provisional doesn't require formal claim format; allows ~12 months to mature into a non-provisional. Cost ~$140 (micro entity) to ~$1600 (large entity).
+2. **File a US provisional application** capturing Claims 1-11 plus dependent claims 3a-d, 4a, 7a-b, 9a-b. Provisional doesn't require formal claim format; allows ~12 months to mature into a non-provisional. Cost ~$140 (micro entity) to ~$1600 (large entity).
 
 3. **Optionally, file a PCT** application within the priority window for international protection.
 
@@ -228,3 +239,5 @@ Updated 2026-05-14 with three additional claims surfaced during implementation w
 - **Claim 3d (Byzantine-tolerant ring threshold)** — operating with a subset of healthy rings rather than requiring all rings to pass relaxes per-ring failure budget by a large factor (roughly C(N, N−K) for threshold K of N rings), enabling silicon to remain functional under partial degradation while preserving cryptographic-grade output uniformity.
 
 - **Claims 9a/9b (silent-wire FUCKED state and host-asks-only state reporting)** — the device's response to internal health failure is to cease driving the wire entirely, producing a level indistinguishable from "absent device" rather than any informative error code. Combined with the policy that state information is never proactively broadcast and is exposed only via cryptographic derivation in response to host-initiated attestation requests, this eliminates an entire class of side-channels (timing-based, frequency-based, and DC-level-based) that informative error reporting would create.
+
+- **Claim 11 (single-bit-in, 256-bits-out clean-entropy delivery)** — surfaced while sketching the OS-side hardware-RNG interface. The handshake event of Claim 7b inherently triggers a fresh KOHI for Claim 10's wairua, and the protocol's first response message after handshake completion is a domain-separated BLAKE3 derivation that exposes that fresh entropy to the host. There is no "GET_RANDOM" command in the protocol because the architectural constraints of Claims 3+7+10 collapse handshake and entropy delivery into the same event. A host transmits one inverted slot pair on a single bidirectional pin and receives 256 bits of cryptographically-conditioned, ira-bound, MAC-authenticated hardware entropy. The minimum-protocol-complexity property — and the structural impossibility of separating "session key derivation" from "entropy delivery" once Claims 3+10 are committed to — is the novel contribution. Comparable secure-element products require I²C/SPI bus initialization, an authentication phase, a separate "GET_RANDOM" / "RNG_READ" command opcode, and structured response parsing — PIPE collapses all of this into a single bit on a single wire.

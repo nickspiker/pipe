@@ -1,11 +1,11 @@
 # =============================================================================
-# pipe_ira.lpf — first-silicon ira ceremony constraints
+# pipe_ira.lpf — first-silicon ira ceremony + OLED + 18-key dozenal keypad
 # =============================================================================
 #   clk     → P6   (25 MHz crystal)
-#   kp_row  → P14  (dozenal keypad p51 — driven LOW)
-#   kp_col  → R13  (dozenal keypad p56 — Enter, active-low)
 #   led     → T6   (onboard LED, active-low)
 #   ext_led → T2   (J4 pin 6 LED via buffer — FUCKED indicator)
+#   oled_*  → P2/R2 (SSD1306 I2C)
+#   kp_*    → 11 GPIOs for the dozenal keypad (KEYPAD.md)
 # =============================================================================
 
 LOCATE COMP "clk" SITE "P6";
@@ -18,11 +18,39 @@ IOBUF PORT "clk" IO_TYPE=LVCMOS33;
 # we get 5× margin in practice.
 FREQUENCY PORT "clk" 5 MHz;
 
-LOCATE COMP "kp_row" SITE "P14";
-IOBUF PORT "kp_row" IO_TYPE=LVCMOS33 PULLMODE=UP;
+# Dozenal keypad — all 11 pins bidirectional with internal pull-up.
+LOCATE COMP "kp_p27" SITE "H14";
+IOBUF PORT "kp_p27" IO_TYPE=LVCMOS33 PULLMODE=UP;
 
-LOCATE COMP "kp_col" SITE "R13";
-IOBUF PORT "kp_col" IO_TYPE=LVCMOS33 PULLMODE=UP;
+LOCATE COMP "kp_p28" SITE "H15";
+IOBUF PORT "kp_p28" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p44" SITE "N14";
+IOBUF PORT "kp_p44" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p51" SITE "P14";
+IOBUF PORT "kp_p51" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p49" SITE "P12";
+IOBUF PORT "kp_p49" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p63" SITE "T14";
+IOBUF PORT "kp_p63" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p62" SITE "T13";
+IOBUF PORT "kp_p62" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p56" SITE "R13";
+IOBUF PORT "kp_p56" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p50" SITE "P13";
+IOBUF PORT "kp_p50" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p57" SITE "R14";
+IOBUF PORT "kp_p57" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p58" SITE "R15";
+IOBUF PORT "kp_p58" IO_TYPE=LVCMOS33 PULLMODE=UP;
 
 LOCATE COMP "led" SITE "T6";
 IOBUF PORT "led" IO_TYPE=LVCMOS33;
