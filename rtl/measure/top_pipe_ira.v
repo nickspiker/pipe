@@ -223,16 +223,25 @@ module top_pipe_ira (
 
     // Key role assignments:
     //   Enter (key 15) — provision_request (run KOHI → BLAKE3 → TAHU)
-    //   Zil   (key 14) — cycle OLED display mode (mode 0 ↔ 1)
+    //   Zil   (key 14, "0") — OLED screen 0 (STATUS)
+    //   Zila  (key 13, "1") — OLED screen 1 (IRA HEX)
+    //   Zilor (key 12, "2") — OLED screen 2 (OTP SLOTS)
     wire provision_request = key_press_pulse && (key_code == 5'd15);
-    wire mode_cycle_pulse  = key_press_pulse && (key_code == 5'd14);
 
-    // OLED display mode register. Cycles 0 → 1 → 0 → ... on each press of
-    // the mode-cycle key. Mode 0 = ira hex, mode 1 = status.
-    reg mode;
+    // OLED display mode register. Direct addressing: each "screen key" sets
+    // the mode register to its corresponding value. Other keys don't touch it.
+    reg [1:0] mode;
     always @(posedge clk or negedge reset_n) begin
-        if (!reset_n)            mode <= 1'b0;
-        else if (mode_cycle_pulse) mode <= ~mode;
+        if (!reset_n) begin
+            mode <= 2'd1;  // boot defaults to IRA HEX (the most useful first view)
+        end else if (key_press_pulse) begin
+            case (key_code)
+                5'd14: mode <= 2'd0;  // Zil   "0" → STATUS
+                5'd13: mode <= 2'd1;  // Zila  "1" → IRA HEX
+                5'd12: mode <= 2'd2;  // Zilor "2" → OTP SLOTS
+                default: ;            // other keys leave mode alone
+            endcase
+        end
     end
 
     // =========================================================================
@@ -452,12 +461,14 @@ module top_pipe_ira (
 
     oled_mode_fsm #(
         .N_LINES           (N_LINES),
-        .MAX_CHARS_PER_LINE(MAX_CHARS_PER_LINE)
+        .MAX_CHARS_PER_LINE(MAX_CHARS_PER_LINE),
+        .SLOT_BITS         (256)
     ) u_mode_fsm (
         .mode            (mode),
         .ira             (recovered_ira),
         .chip_state      (chip_state),
         .ring_health_cnt (trng_ring_health_cnt),
+        .slot_flat       (all_slots_flat),
         .strings_flat    (strings_flat)
     );
 
