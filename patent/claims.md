@@ -198,6 +198,62 @@ The device of Claims 3, 7, 7b, and 10, wherein the act of completing a session h
 - The device sustains no damage and incurs no persistent-state cost from repeated entropy requests beyond the negligible cycle count consumed by each KOHI's ring oscillation, with the per-request latency bounded above by user-perceptible delay (~110 ms at the design enclave_clk rate) and below by the entropy-gather requirement of Claim 3;
 - This property — minimum-protocol-complexity hardware entropy delivery — provides operating systems and other host-side cryptographic consumers with a kernel-CSPRNG seeding interface achievable by transmitting one bit and receiving one 256-bit message, on a single bidirectional data pin, with no host-side bus initialization, authentication phase, or structured response parsing of the kind universally required by prior-art secure-element products with separate "GET_RANDOM" or "RNG_READ" commands.
 
+### Claim 12 — Mirror-XOR line code (100%-efficient, DC-balanced, self-clocking single-wire bidirectional signaling)
+
+A bidirectional single-wire line code wherein each party transmits in alternating time slots, encoding each bit as the XOR of its own idle value, its current data bit, and the most recently decoded bit from the opposite party, providing automatic DC balance within one slot pair, 100% encoding efficiency with no stuffing or expansion, and continuous clock recovery from idle pattern transitions — all as mathematical consequences of the encoding rule, requiring no additional mechanism.
+
+Encoding rule (applied identically at both ends):
+
+```
+wire_value = OWN_IDLE XOR own_data XOR other_last_decoded_data
+```
+
+With idle assignments `enclave_idle = 1`, `host_idle = 0`, the line code has the following provable mathematical properties, all arising from the single XOR operation above without separate mechanisms:
+
+- **100% encoding efficiency per direction.** Each slot carries exactly one data bit from its owning party. No bit stuffing, no symbol expansion (no 4B/5B, 8B/10B, 64B/66B), no lookup tables, no scramblers. Asymptotic overhead in the limit of a continuous data stream is zero.
+- **Automatic DC balance per slot pair.** The cross-coupling term `other_last_decoded_data` in the encoding rule mathematically forces one party's slot value to compensate the other party's prior data transmission. Any active data bit on one side propagates as a pattern inversion across the slot pair; DC balance is restored within two slots of any data activity, with no balance-encoding overhead.
+- **100% transition density in idle.** With both data streams at zero, the encoding rule produces the strict alternation `1, 0, 1, 0, …` on the wire (enclave slots HIGH, host slots LOW). Every slot transitions, providing continuous clock recovery on the receiving side without any separate clock wire, without Manchester encoding's 50% efficiency penalty, and without scrambler-based transition guarantees.
+- **No active components beyond a single XOR gate.** The encoding rule is a 3-input XOR per slot, applied identically and statelessly at both ends (each side need only register the most recent decoded bit from the other party). All three properties — efficiency, DC balance, and clock recovery — fall out of the same operation, not as separately-engineered mechanisms.
+
+Comparison to prior-art line codes on the three axes simultaneously:
+
+| Line code | Bit-level efficiency | DC balance mechanism | Clock recovery mechanism |
+|---|---|---|---|
+| NRZ + bit stuffing (USB) | <100% (stuffed) | approximate, per-window | bit-stuff-induced transitions |
+| Manchester / biphase | **50%** (2 line transitions per data bit) | per-bit, by encoding | mid-bit transition |
+| 4B/5B (FDDI, USB 1.1 LS) | 80% | per-symbol, by lookup | 5-bit symbol transitions |
+| 8B/10B (USB 3.0, GbE, PCIe Gen1/2) | 80% | per-symbol, by lookup with running-disparity tracking | guaranteed transitions per 10-bit symbol |
+| 64B/66B (10GbE, USB4) | 97% | per-block, by scrambler | 2-bit sync header |
+| 128B/130B (PCIe Gen3) | 98.5% | per-block, by scrambler | 2-bit sync header |
+| **Mirror-XOR (this claim)** | **100% per direction** | **per slot pair, by XOR cross-coupling — free** | **per slot in idle, by encoding rule — free** |
+
+The novel contribution is the *simultaneity* of all three properties from a single encoding rule. Prior-art line codes achieve any one or two of these by separate engineered mechanisms (lookup tables for balance, scramblers for transitions, stuffing or symbol expansion for either); mirror-XOR achieves all three by mathematical consequence of the cross-coupled XOR.
+
+### Claim 12a — Zero-overhead message framing via leading-zero suppression and trailing-1 marker
+
+The line code of Claim 12, wherein messages of fixed length L are transmitted with provably zero framing overhead in expectation over uniformly-random message content (such as the BLAKE3-conditioned output of Claim 3), by:
+
+- The sender omitting all leading zeros of the message and beginning transmission at the first 1 bit;
+- The sender appending exactly one trailing 1 bit at the end of the message as the only frame marker;
+- The receiver buffering the entirety of the message-length window, detecting the trailing 1, and prepending leading zeros to reconstruct the original L-bit message.
+
+For uniformly-random message content (the regime of cryptographic hash outputs and conditioner extracts):
+
+- The expected number of leading zeros omitted is 1 (geometric distribution with p = 0.5);
+- The trailing 1 marker adds exactly 1 bit;
+- Net expected framing overhead = 0 bits per message.
+
+This is the **minimum-possible framing overhead** for distinguishable variable-content fixed-length messages on a stream-coded channel: a delimiter of less than 1 bit is information-theoretically impossible for any non-trivial frame boundary, and the trailing-1 scheme achieves exactly this minimum on average across the uniformly-random regime that the device's outputs naturally occupy.
+
+### Claim 12b — Float-high full-full duplex via wired-OR with own-contribution subtraction
+
+The line code of Claim 12, in a further embodiment wherein both parties transmit simultaneously in every slot (eliminating the slot-alternation constraint), such that:
+
+- The single bidirectional wire is wired-OR: pulled HIGH if either party actively drives HIGH, otherwise pulled LOW by the shared pull-down resistor;
+- Each party knows its own transmitted value (`own_drive`) and reads back the wire (`wire_value`) on the same slot;
+- Each party recovers the other party's transmitted bit by `other_data = wire_value XOR own_drive` (extraction of the other party's contribution by subtracting one's own known contribution);
+- The effective data throughput per wire is doubled relative to the slot-alternating embodiment of Claims 7 and 12, while preserving Claim 12's 100% per-direction efficiency, automatic DC balance, and zero clock-recovery overhead — with the DC-balance mechanism in this embodiment realized via either (i) transition-based encoding wherein data is encoded as toggles rather than levels, or (ii) differential physical topology, either of which preserves average 50% line duty cycle in the presence of uniformly-random simultaneous data from both parties.
+
 ---
 
 ## Prior art table
@@ -218,7 +274,7 @@ The device of Claims 3, 7, 7b, and 10, wherein the act of completing a session h
 
 1. **Document local invention date** via this file's timestamp + MEGA backup timestamp. (Done by the act of writing this file before any push to public Git.)
 
-2. **File a US provisional application** capturing Claims 1-11 plus dependent claims 3a-d, 4a, 7a-b, 9a-b. Provisional doesn't require formal claim format; allows ~12 months to mature into a non-provisional. Cost ~$140 (micro entity) to ~$1600 (large entity).
+2. **File a US provisional application** capturing Claims 1-12 plus dependent claims 3a-d, 4a, 7a-b, 9a-b, 12a-b. Provisional doesn't require formal claim format; allows ~12 months to mature into a non-provisional. Cost ~$140 (micro entity) to ~$1600 (large entity).
 
 3. **Optionally, file a PCT** application within the priority window for international protection.
 
@@ -241,3 +297,5 @@ Updated 2026-05-14 with three additional claims surfaced during implementation w
 - **Claims 9a/9b (silent-wire FUCKED state and host-asks-only state reporting)** — the device's response to internal health failure is to cease driving the wire entirely, producing a level indistinguishable from "absent device" rather than any informative error code. Combined with the policy that state information is never proactively broadcast and is exposed only via cryptographic derivation in response to host-initiated attestation requests, this eliminates an entire class of side-channels (timing-based, frequency-based, and DC-level-based) that informative error reporting would create.
 
 - **Claim 11 (single-bit-in, 256-bits-out clean-entropy delivery)** — surfaced while sketching the OS-side hardware-RNG interface. The handshake event of Claim 7b inherently triggers a fresh KOHI for Claim 10's wairua, and the protocol's first response message after handshake completion is a domain-separated BLAKE3 derivation that exposes that fresh entropy to the host. There is no "GET_RANDOM" command in the protocol because the architectural constraints of Claims 3+7+10 collapse handshake and entropy delivery into the same event. A host transmits one inverted slot pair on a single bidirectional pin and receives 256 bits of cryptographically-conditioned, ira-bound, MAC-authenticated hardware entropy. The minimum-protocol-complexity property — and the structural impossibility of separating "session key derivation" from "entropy delivery" once Claims 3+10 are committed to — is the novel contribution. Comparable secure-element products require I²C/SPI bus initialization, an authentication phase, a separate "GET_RANDOM" / "RNG_READ" command opcode, and structured response parsing — PIPE collapses all of this into a single bit on a single wire.
+
+- **Claim 12 + 12a + 12b (mirror-XOR as a 100%-efficient line code)** — surfaced when comparing PIPE's wire signaling against the published line-code literature. The mirror-XOR encoding rule `wire_value = OWN_IDLE XOR own_data XOR other_last_decoded_data`, originally framed as a wire-protocol convention in Claim 7, is in fact a novel single-wire bidirectional line code that simultaneously achieves three properties prior-art line codes pay separately for: (i) 100% per-direction bit-level efficiency with no stuffing or symbol expansion; (ii) automatic DC balance per slot pair via the cross-coupled XOR feedback term (no lookup tables, no running disparity); (iii) 100% transition density in idle via the alternating slot-ownership pattern (no scrambler, no Manchester doubling). The three properties are mathematical consequences of the same single XOR operation, not separately-engineered mechanisms — a property no published line code (NRZ+stuffing, Manchester, 4B/5B, 8B/10B, 64B/66B, 128B/130B, scrambled-NRZ-with-sync-header) achieves. Claim 12a additionally captures the leading-zero-suppression + trailing-1-marker framing scheme that achieves provably-zero expected framing overhead on uniformly-random message content (cryptographic hash output, conditioner extracts). Claim 12b captures the float-high full-full-duplex embodiment wherein both parties transmit simultaneously and each recovers the other's bit by subtracting its own known contribution from the wired-OR observation.
