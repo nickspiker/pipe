@@ -52,7 +52,8 @@ run_one () {
 
     echo "=== $tb ==="
     iverilog -g2012 -o "$WORK/${tb}" $extra_rtl "$dut_v" "$tb_v"
-    OUTPUT=$(vvp "$WORK/${tb}")
+    # cd into sim/ so $readmemh in TBs can find vectors_*.mem relative to here
+    OUTPUT=$(cd "$SIM" && vvp "$WORK/${tb}")
     echo "$OUTPUT"
     echo ""
 
