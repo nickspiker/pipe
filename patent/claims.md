@@ -1,5 +1,54 @@
 # PIPE — Patent Claims (draft, 2026-05-13)
 
+## Architectural Context — Photon Transport (PT)
+
+PIPE is the chip-level embodiment of a broader transport architecture called **Photon Transport (PT)**. PT is a medium-agnostic protocol stack whose upper layers (framing, message format, cryptographic session) apply identically over single-wire (PIPE), USB-C (ferros host), fiber, or any other physical medium. Only the medium and line code change between embodiments.
+
+**The PT stack, bottom to top:**
+
+| Layer | Function | Claim coverage in this filing |
+|---|---|---|
+| **L0 — Medium** | Single bidirectional wire + pull-down (PIPE) / USB-C differential pair (ferros host) / fiber / etc. | Claims 1, 2 (single-wire, 3-pin package) |
+| **L1 — Line code** | Bit-to-medium encoding | Claim 12 (mirror-XOR, single-wire embodiment) |
+| **L2 — Framing** | Message boundaries on a stream-coded channel | Claim 12a (leading-zero suppress + trailing-1 marker) |
+| **L3 — Message format** | Structured payload + cryptographic envelope | Claim 13 (5-purpose ephemeral pubkey + ciphertext + trailing 1) |
+| **L4 — Crypto session** | ECDH key agreement + AEAD + identity binding | Claim 11 (entropy delivery + ira/wairua binding) |
+
+Each layer has one job and is independently replaceable. PT-over-USB-C reuses L2–L4 unchanged and swaps L0–L1 for the standard USB physical layer and line code. PT-over-fiber reuses L2–L4 and uses an optical L0 with NRZI or similar at L1. The novel single-wire mirror-XOR embodiment of L1 (Claim 12) is the chip-level instantiation.
+
+**Where PT improves on OSI:**
+
+The OSI seven-layer model is widely taught but doesn't match real-world protocol architecture. Specific failures relevant to PT:
+
+- **OSI forgets L0.** OSI starts at L1 ("physical") which already conflates the medium (copper, fiber, air, vacuum) with signaling on it. The medium itself is a first-class design parameter — impedance and parasitics in copper constrain achievable line codes; chromatic and modal dispersion in fiber constrain symbol rate; multipath fading in air constrains modulation. PT acknowledges L0 explicitly because PIPE's entire architecture hinges on it (single-wire-with-pull-down is the medium that makes Claim 12's mirror-XOR possible).
+- **OSI's L1 is overloaded.** OSI lumps medium, modulation, line code, and framing into one layer. PT splits these into separately-replaceable L0 (medium), L1 (line code), and L2 (framing).
+- **OSI's L5 ("session") is fictional.** No widely-deployed protocol has a clean L5 referent — session establishment happens at L4 (TCP), L6 (TLS), or L7 (application) depending on the stack. PT collapses session establishment into the first message exchange, with no separate session-setup phase.
+- **OSI has no home for authentication.** Authentication appears at L2 (802.1X), L3 (IPSec), L4 (TLS), and L7 (HTTP Basic / OAuth) in real stacks — each incompatible with the others. PT places authentication structurally in L3's message format (Claim 13's implicit-authentication property): correct decryption to a structurally-valid plaintext is the authentication signal, with no separate field or round trip.
+
+PT is a five-layer model (L0–L4), each layer with one job, each independently replaceable. OSI is a seven-layer model with two fictional layers (L5–L6), no home for authentication, and a conflated L1.
+
+**Session-establishment cost comparison:**
+
+Establishing an authenticated, identity-bound channel in the conventional TCP/IP stack requires, in order:
+
+1. DHCP DISCOVER → OFFER → REQUEST → ACK — 4 messages, no authentication
+2. ARP request/reply — 1–2 messages, no authentication
+3. DNS query/response — 1+ messages (often many for full resolution), no authentication
+4. TCP SYN → SYN-ACK → ACK — 3 messages, no authentication
+5. TLS 1.3 handshake (ClientHello → ServerHello+Cert+KeyShare → Finished) — minimum 3 messages, more for older versions
+6. Application authentication (HTTP Basic / Bearer / OAuth flow) — 1–4 additional round trips
+
+**Total: ~12–18 messages, multiple round trips, end-to-end identity binding only after the final application-layer step.**
+
+PT:
+
+1. Host transmits one inverted slot pair (the handshake event of Claim 7b) — 1 bit on the wire
+2. Device responds with one 256-bit message (ephemeral pubkey + ciphertext + trailing 1 per Claims 12a + 13) — 256 bits on the wire
+
+**Total: 1 tx + 1 rx.** Successful decryption authenticates the device by Claim 13's structural-validity property, the response is bound to the device's persistent identity by Claim 11's ira binding, and the entropy delivered in the response seeds the host CSPRNG. End-to-end authenticated, identity-bound, entropy-delivering — in two messages. The TCP/IP stack does not have a comparable primitive.
+
+---
+
 ## Independent Claim 1 (broadest — physical isolation)
 
 A processing enclave **physically isolated** from a host system, comprising:
