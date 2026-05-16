@@ -34,8 +34,24 @@ run_one () {
     if [ ! -f "$tb_v" ];  then echo "missing TB: $tb_v"; exit 2; fi
     if [ ! -f "$dut_v" ]; then echo "missing DUT: $dut_v"; exit 2; fi
 
+    # Optional extra RTL dependencies declared in the TB as `// deps: foo.v bar.v`
+    local extra_rtl=""
+    local deps_line
+    deps_line=$(grep -E "^// deps:" "$tb_v" | head -1 || true)
+    if [ -n "$deps_line" ]; then
+        # extract file list after the colon
+        local deps_files="${deps_line#// deps:}"
+        for f in $deps_files; do
+            if [ -f "$RTL/$f" ]; then
+                extra_rtl="$extra_rtl $RTL/$f"
+            else
+                echo "missing dep: $RTL/$f"; exit 2
+            fi
+        done
+    fi
+
     echo "=== $tb ==="
-    iverilog -g2012 -o "$WORK/${tb}" "$dut_v" "$tb_v"
+    iverilog -g2012 -o "$WORK/${tb}" $extra_rtl "$dut_v" "$tb_v"
     OUTPUT=$(vvp "$WORK/${tb}")
     echo "$OUTPUT"
     echo ""

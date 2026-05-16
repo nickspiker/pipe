@@ -1,0 +1,13 @@
+# Minimal LPF for the ring_scheduler Fmax synthesis bench.
+
+LOCATE COMP "clk"     SITE "P6";
+IOBUF PORT "clk"     IO_TYPE=LVCMOS33;
+
+LOCATE COMP "reset_n" SITE "R7";
+IOBUF PORT "reset_n" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "led"     SITE "T6";
+IOBUF PORT "led"     IO_TYPE=LVCMOS33;
+
+LOCATE COMP "ext_led" SITE "T2";
+IOBUF PORT "ext_led" IO_TYPE=LVCMOS33;
