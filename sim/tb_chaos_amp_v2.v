@@ -92,9 +92,11 @@ module tb_chaos_amp_v2;
             pack_input(v);
             @(posedge clk); start = 1;
             @(posedge clk); start = 0;
-            // 514 cycles per call max (1 LOAD + 16 rounds × 32 + 1 FINISH)
+            // Variable cycles with multi-cycle MUL/GFMUL: worst case
+            // 16 rounds × (16 buckets × 16 cycles MUL + 16 PHASE2) + LOAD + FINISH
+            // ≈ 4400 cycles. Pad to 50k for headroom.
             cyc = 0;
-            while (!done && cyc < 700) begin
+            while (!done && cyc < 50000) begin
                 @(posedge clk);
                 cyc = cyc + 1;
             end

@@ -65,11 +65,36 @@ module chaos_amp_v2 (
     reg [4:0]  round_idx;             // 0..15
     reg [4:0]  bucket_idx;            // 0..15
     reg [2:0]  fsm_state;             // see localparam below
-    localparam S_IDLE   = 3'd0;
-    localparam S_LOAD   = 3'd1;
-    localparam S_PHASE1 = 3'd2;
-    localparam S_PHASE2 = 3'd3;
-    localparam S_FINISH = 3'd4;
+    localparam S_IDLE       = 3'd0;
+    localparam S_LOAD       = 3'd1;
+    localparam S_PHASE1     = 3'd2;
+    localparam S_PHASE2     = 3'd3;
+    localparam S_FINISH     = 3'd4;
+    localparam S_MUL_RUN    = 3'd5;   // op 2  MUL_LO  — 16-cycle shift-add
+    localparam S_GFMUL_RUN  = 3'd6;   // op 22 GFMUL   — 8-cycle iterative GF mul
+
+    // Multi-cycle MUL_LO state
+    reg [15:0] mul_a_frac;            // multiplicand, shifts left each cycle
+    reg [15:0] mul_b_frac;            // multiplier,   shifts right each cycle
+    reg [15:0] mul_acc_frac;          // 16-bit truncated accumulator
+    reg [7:0]  mul_a_exp;
+    reg [7:0]  mul_b_exp;
+    reg [7:0]  mul_acc_exp;
+    reg [3:0]  mul_cnt;               // 0..15
+
+    // Multi-cycle GFMUL state
+    reg [7:0]  gf_a;                  // multiplicand, shifts left with x^8=0x1B reduction
+    reg [7:0]  gf_b;                  // multiplier,   shifts right
+    reg [7:0]  gf_p;                  // accumulator (XOR sum)
+    reg [3:0]  gfmul_cnt;             // 0..7
+
+    // For S_MUL_RUN / S_GFMUL_RUN we need to remember the original val[15:8]/[23:16] and secondary[15:0]/[23:16] for the final result composition (only the low-byte half goes through the slow path)
+    reg [15:0] mul_sec_frac;
+    reg [7:0]  mul_sec_exp;
+    reg [7:0]  gf_val_hi;             // ufa[15:8] for GFMUL result composition
+    reg [7:0]  gf_val_exp;            // uea
+    reg [15:0] gf_sec_frac;           // ufb (full 16 bits — high byte XORs into high byte of new_frac, low byte XORs into gf_p)
+    reg [7:0]  gf_sec_exp;            // ueb
 
     // =========================================================================
     // Helper functions
@@ -257,7 +282,7 @@ module chaos_amp_v2 (
                 // ============ Spirix-shaped (0..15) ============
                 5'd0:  begin new_frac = frac_a + frac_b;             new_exp = exp_a + exp_b;            end // ADD
                 5'd1:  begin new_frac = frac_a - frac_b;             new_exp = exp_a - exp_b;            end // SUB
-                5'd2:  begin new_frac = frac_a * frac_b;             new_exp = exp_a * exp_b;            end // MUL_LO
+                5'd2:  begin new_frac = 16'd0;                       new_exp = 8'd0;                     end // MUL_LO handled by S_MUL_RUN multi-cycle path
                 5'd3:  begin new_frac = frac_a & frac_b;             new_exp = exp_a & exp_b;            end // AND
                 5'd4:  begin new_frac = frac_a | frac_b;             new_exp = exp_a | exp_b;            end // OR
                 5'd5:  begin new_frac = frac_a ^ frac_b;             new_exp = exp_a ^ exp_b;            end // XOR
@@ -309,10 +334,7 @@ module chaos_amp_v2 (
                         new_exp  = exp_a ^ exp_b;
                     end
                 end
-                5'd22: begin                                                                              // GFMUL
-                    new_frac = {ufa[15:8], gf_mul(ufa[7:0], ufb[7:0])} ^ ufb;
-                    new_exp  = uea ^ ueb;
-                end
+                5'd22: begin new_frac = 16'd0;                       new_exp = 8'd0;                     end // GFMUL handled by S_GFMUL_RUN multi-cycle path
                 5'd23: begin                                                                              // PARITY
                     parity_bit = (popcount16(ufa) + {4'd0, popcount8(uea)}) & 5'd1;
                     paint16    = parity_bit ? 16'hFFFF : 16'h0000;
@@ -387,12 +409,40 @@ module chaos_amp_v2 (
     // FSM
     // =========================================================================
     integer k;
+    // Combinational signals used by S_MUL_RUN / S_GFMUL_RUN final-cycle dispatch
+    wire [15:0] mul_acc_frac_final = mul_acc_frac + (mul_b_frac[0] ? mul_a_frac : 16'd0);
+    wire [7:0]  mul_acc_exp_final  = mul_acc_exp  + (mul_b_exp[0]  ? mul_a_exp  : 8'd0);
+    wire [7:0]  gf_p_final         = gf_p ^ (gf_b[0] ? gf_a : 8'd0);
+    wire [23:0] mul_op_result      = {mul_acc_exp_final, mul_acc_frac_final};
+    wire [23:0] gf_op_result       = {gf_val_exp ^ gf_sec_exp,
+                                      gf_val_hi  ^ gf_sec_frac[15:8],
+                                      gf_p_final ^ gf_sec_frac[7:0]};
+    wire [23:0] mul_p1_result      = mul_op_result ^ rc24 ^ pos_const(bucket_idx, round_idx);
+    wire [23:0] gf_p1_result       = gf_op_result  ^ rc24 ^ pos_const(bucket_idx, round_idx);
+
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
-            fsm_state  <= S_IDLE;
-            done       <= 1'b0;
-            round_idx  <= 5'd0;
-            bucket_idx <= 5'd0;
+            fsm_state    <= S_IDLE;
+            done         <= 1'b0;
+            round_idx    <= 5'd0;
+            bucket_idx   <= 5'd0;
+            mul_a_frac   <= 16'd0;
+            mul_b_frac   <= 16'd0;
+            mul_acc_frac <= 16'd0;
+            mul_a_exp    <= 8'd0;
+            mul_b_exp    <= 8'd0;
+            mul_acc_exp  <= 8'd0;
+            mul_cnt      <= 4'd0;
+            mul_sec_frac <= 16'd0;
+            mul_sec_exp  <= 8'd0;
+            gf_a         <= 8'd0;
+            gf_b         <= 8'd0;
+            gf_p         <= 8'd0;
+            gfmul_cnt    <= 4'd0;
+            gf_val_hi    <= 8'd0;
+            gf_val_exp   <= 8'd0;
+            gf_sec_frac  <= 16'd0;
+            gf_sec_exp   <= 8'd0;
             for (k = 0; k < BUCKETS; k = k + 1) begin
                 state[k] <= 24'd0;
                 tmp[k]   <= 24'd0;
@@ -420,12 +470,79 @@ module chaos_amp_v2 (
                     fsm_state  <= S_PHASE1;
                 end
                 S_PHASE1: begin
-                    tmp[bucket_idx] <= p1_result;
-                    if (bucket_idx == 5'd15) begin
-                        bucket_idx <= 5'd0;
-                        fsm_state  <= S_PHASE2;
+                    if (op_idx == 5'd2) begin
+                        // MUL_LO — dispatch to multi-cycle shift-add
+                        mul_a_frac   <= val_p1[15:0];
+                        mul_b_frac   <= sec_p1[15:0];
+                        mul_acc_frac <= 16'd0;
+                        mul_a_exp    <= val_p1[23:16];
+                        mul_b_exp    <= sec_p1[23:16];
+                        mul_acc_exp  <= 8'd0;
+                        mul_cnt      <= 4'd0;
+                        fsm_state    <= S_MUL_RUN;
+                    end else if (op_idx == 5'd22) begin
+                        // GFMUL — dispatch to multi-cycle iterative GF mul
+                        gf_a        <= val_p1[7:0];
+                        gf_b        <= sec_p1[7:0];
+                        gf_p        <= 8'd0;
+                        gfmul_cnt   <= 4'd0;
+                        gf_val_hi   <= val_p1[15:8];
+                        gf_val_exp  <= val_p1[23:16];
+                        gf_sec_frac <= sec_p1[15:0];
+                        gf_sec_exp  <= sec_p1[23:16];
+                        fsm_state   <= S_GFMUL_RUN;
                     end else begin
-                        bucket_idx <= bucket_idx + 5'd1;
+                        // All other ops — combinational op_apply result, latch directly
+                        tmp[bucket_idx] <= p1_result;
+                        if (bucket_idx == 5'd15) begin
+                            bucket_idx <= 5'd0;
+                            fsm_state  <= S_PHASE2;
+                        end else begin
+                            bucket_idx <= bucket_idx + 5'd1;
+                        end
+                    end
+                end
+                S_MUL_RUN: begin
+                    // shift-add: acc += a * b[0]; a <<= 1; b >>= 1
+                    if (mul_b_frac[0]) mul_acc_frac <= mul_acc_frac + mul_a_frac;
+                    if (mul_b_exp[0])  mul_acc_exp  <= mul_acc_exp  + mul_a_exp;
+                    mul_a_frac <= mul_a_frac << 1;
+                    mul_b_frac <= mul_b_frac >> 1;
+                    mul_a_exp  <= mul_a_exp  << 1;
+                    mul_b_exp  <= mul_b_exp  >> 1;
+                    mul_cnt    <= mul_cnt + 4'd1;
+                    if (mul_cnt == 4'd15) begin
+                        // Last iteration: result is mul_acc + final partial; latch tmp and advance bucket
+                        tmp[bucket_idx] <= mul_p1_result;
+                        if (bucket_idx == 5'd15) begin
+                            bucket_idx <= 5'd0;
+                            fsm_state  <= S_PHASE2;
+                        end else begin
+                            bucket_idx <= bucket_idx + 5'd1;
+                            fsm_state  <= S_PHASE1;
+                        end
+                    end
+                end
+                S_GFMUL_RUN: begin
+                    // GF(2^8) mul with poly 0x11B: 8 iterations
+                    //   if b[0]: p ^= a
+                    //   if a[7]: a = (a<<1) ^ 0x1B  else: a = a<<1
+                    //   b >>= 1
+                    if (gf_b[0]) gf_p <= gf_p ^ gf_a;
+                    if (gf_a[7]) gf_a <= (gf_a << 1) ^ 8'h1B;
+                    else         gf_a <= (gf_a << 1);
+                    gf_b      <= gf_b >> 1;
+                    gfmul_cnt <= gfmul_cnt + 4'd1;
+                    if (gfmul_cnt == 4'd7) begin
+                        // Last iteration: result composed via gf_op_result wire; latch and advance
+                        tmp[bucket_idx] <= gf_p1_result;
+                        if (bucket_idx == 5'd15) begin
+                            bucket_idx <= 5'd0;
+                            fsm_state  <= S_PHASE2;
+                        end else begin
+                            bucket_idx <= bucket_idx + 5'd1;
+                            fsm_state  <= S_PHASE1;
+                        end
                     end
                 end
                 S_PHASE2: begin
