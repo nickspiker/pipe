@@ -34,7 +34,7 @@ echo "--- Synthesise ---"
 yosys -p "
     read_verilog $RTL/chaos_amp_v2.v
     read_verilog $RTL/measure/top_chaos_amp_v2_synth.v
-    synth_ecp5 -abc2 -top top_chaos_amp_v2_synth -json $BUILD/chaos_amp_v2_synth.json
+    synth_ecp5 -abc9 -top top_chaos_amp_v2_synth -json $BUILD/chaos_amp_v2_synth.json
     stat
 " > "$BUILD/chaos_amp_v2_synth_yosys.log" 2>&1
 
