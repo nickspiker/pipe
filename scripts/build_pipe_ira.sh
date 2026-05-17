@@ -43,6 +43,8 @@ echo "--- Synthesise ---"
 (cd "$BUILD" && yosys -p "
     read_verilog -I $RTL $RTL/blake3/blake3.v
     read_verilog -I $RTL $RTL/blake3_tree.v
+    read_verilog -I $RTL $RTL/ring_health.v
+    read_verilog -I $RTL $RTL/ring_scheduler.v
     read_verilog -I $RTL $RTL/trng.v
     read_verilog -I $RTL $RTL/otp.v
     read_verilog -I $RTL $RTL/inverted_pair_verify.v

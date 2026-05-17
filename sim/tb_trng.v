@@ -1,143 +1,199 @@
+// deps: ring_health.v ring_scheduler.v
 // =============================================================================
-// tb_trng.v — exercise the TRNG plumbing
+// tb_trng.v — integration test for trng + ring_scheduler + ring_health
 // =============================================================================
-// Tests:
-//   1. After reset: entropy=0, valid=0
-//   2. After ~256 clk_slow edges: full asserts, sync propagates, valid asserts
-//   3. entropy is non-zero (samples were captured)
-//   4. After more clk_slow edges past full: entropy unchanged (locked)
-//   5. POR clears: entropy=0, valid=0, counter reset
-//   6. Post-POR re-collection works (full re-asserts after another 256 edges)
 //
-// SIM ENTROPY CAVEAT: clk_fast and clk_slow are deterministic behavioral
-// clocks here, so the captured bit pattern is deterministic. We assert
-// "non-zero" only — entropy QUALITY validation is hardware-only.
+// Drives 16 ring inputs with mixed patterns through one KOHI gather. Uses a tiny SCHED_W=128 so total sim time is bounded.
+//
+// Patterns:
+//   0..11:  distinct LFSRs (healthy)
+//   12:     constant 0     (fail)
+//   13:     constant 1     (fail)
+//   14:     LFSR (healthy)
+//   15:     LFSR (healthy)
+//
+// Expected after gather:
+//   ring_health[i]   = 1 for i in {0..11, 14, 15}; 0 for {12, 13}
+//   ring_health_cnt  = 14
+//   health_fail      = 0 (>= 8 healthy → not FUCKED)
+//   gather_done      pulsed
+//   buffer holds bit-stream data (non-zero in many bytes)
+//
 // =============================================================================
 
 `timescale 1ns / 1ps
 
 module tb_trng;
 
-    reg          clk_fast    = 0;
-    reg          clk_slow    = 0;
-    reg          enclave_clk = 0;
-    reg          reset_n     = 0;
-    wire [255:0] entropy;
-    wire         entropy_valid;
+    localparam integer SCHED_W = 128;
 
-    trng dut (
-        .clk_fast      (clk_fast),
-        .clk_slow      (clk_slow),
-        .enclave_clk   (enclave_clk),
-        .reset_n       (reset_n),
-        .entropy       (entropy),
-        .entropy_valid (entropy_valid)
+    // Recompute scaled thresholds for the tiny W:
+    //   sigma = sqrt(W)/2 = ~5.66 → 6*sigma ≈ 34
+    //   LVL_LO = 64 - 34 = 30;  LVL_HI = 64 + 34 = 98
+    //   APT_W = 16 (W/APT_W = 8 windows per ring); APT_T = 14
+    //   RCT_C stays 32 (window-independent)
+    localparam integer LVL_LO = 30;
+    localparam integer LVL_HI = 98;
+    localparam integer APT_W  = 16;
+    localparam integer APT_T  = 14;
+    localparam integer RCT_C  = 32;
+
+    reg          clk     = 1'b0;
+    reg          reset_n = 1'b0;
+    reg          start   = 1'b0;
+    reg  [15:0]  ring_in = 16'b0;
+    reg  [12:0]  buf_raddr = 13'b0;
+    wire [7:0]   buf_rdata;
+    wire         busy;
+    wire         gather_done;
+    wire         health_fail;
+    wire [15:0]  ring_health;
+    wire [4:0]   ring_health_cnt;
+    wire [15:0]  ring_enable;
+
+    trng #(
+        .SCHED_W      (SCHED_W),
+        .SCHED_RCT_C  (RCT_C),
+        .SCHED_APT_W  (APT_W),
+        .SCHED_APT_T  (APT_T),
+        .SCHED_LVL_LO (LVL_LO),
+        .SCHED_LVL_HI (LVL_HI)
+    ) dut (
+        .clk             (clk),
+        .reset_n         (reset_n),
+        .start           (start),
+        .ring_in         (ring_in),
+        .buf_raddr       (buf_raddr),
+        .buf_rdata       (buf_rdata),
+        .busy            (busy),
+        .gather_done     (gather_done),
+        .health_fail     (health_fail),
+        .ring_health     (ring_health),
+        .ring_health_cnt (ring_health_cnt),
+        .ring_enable     (ring_enable)
     );
 
-    // Three behavioral clocks at different frequencies.
-    // clk_fast    period 4 ns (250 MHz)
-    // clk_slow    period 6 ns (167 MHz)
-    // enclave_clk period 10 ns (100 MHz)
-    always #2 clk_fast    = ~clk_fast;
-    always #3 clk_slow    = ~clk_slow;
-    always #5 enclave_clk = ~enclave_clk;
+    always #5 clk = ~clk;
 
+    // -------------------------------------------------------------------------
+    // 16 distinct LFSRs (rings 0..11, 14, 15) + 2 constant rings (12, 13)
+    // -------------------------------------------------------------------------
+    reg [15:0] lfsr [0:15];
+    integer li;
+
+    always @(posedge clk) begin
+        if (reset_n) begin
+            for (li = 0; li < 16; li = li + 1) begin
+                lfsr[li] <= {lfsr[li][14:0],
+                             lfsr[li][15] ^ lfsr[li][13] ^ lfsr[li][12] ^ lfsr[li][10]};
+            end
+        end
+    end
+
+    integer ri;
+    always @* begin
+        for (ri = 0; ri < 16; ri = ri + 1)
+            ring_in[ri] = lfsr[ri][0];
+        ring_in[12] = 1'b0;          // stuck low
+        ring_in[13] = 1'b1;          // stuck high
+    end
+
+    // -------------------------------------------------------------------------
     integer pass = 0;
     integer fail = 0;
-
-    task check;
-        input [255:0] tag;       // 32-byte label
-        input         actual;
-        input         expected;
-        begin
-            if (actual === expected) begin
-                pass = pass + 1;
-                $display("PASS  %s", tag);
-            end else begin
-                pass = pass + 0;
-                fail = fail + 1;
-                $display("FAIL  %s  got=%b expected=%b", tag, actual, expected);
-            end
-        end
-    endtask
-
-    task check_zero;
-        input [255:0] tag;
-        input [255:0] val;
-        begin
-            if (val === 256'b0) begin
-                pass = pass + 1;
-                $display("PASS  %s", tag);
-            end else begin
-                fail = fail + 1;
-                $display("FAIL  %s  val=%h", tag, val);
-            end
-        end
-    endtask
-
-    task check_nonzero;
-        input [255:0] tag;
-        input [255:0] val;
-        begin
-            if (val !== 256'b0) begin
-                pass = pass + 1;
-                $display("PASS  %s  (entropy = %h)", tag, val);
-            end else begin
-                fail = fail + 1;
-                $display("FAIL  %s  entropy stuck at zero", tag);
-            end
-        end
-    endtask
-
-    reg [255:0] frozen_entropy;
+    integer buf_nonzero;
+    integer cyc;
 
     initial begin
-        // ----- Phase 1: reset state -----
-        reset_n = 0;
-        #25;     // hold reset across several edges of every clock
-        check     ("reset: valid is 0",       entropy_valid, 1'b0);
-        check_zero("reset: entropy is 0",     entropy);
+        // Init LFSRs with distinct seeds
+        for (li = 0; li < 16; li = li + 1)
+            lfsr[li] = 16'hACE1 + li[15:0] * 16'h0BAD;
 
-        // ----- Phase 2: release reset, wait for full collection -----
-        reset_n = 1;
-        // Need >256 posedges of clk_slow (= 256 * 6 = 1536 ns), plus 2-FF sync
-        // into enclave_clk (~20 ns), plus margin. Wait 2000 ns.
-        #2000;
-        check        ("after 256 slow edges: valid is 1", entropy_valid, 1'b1);
-        check_nonzero("entropy is non-zero",              entropy);
-
-        // ----- Phase 3: lock — further slow edges do not change entropy -----
-        frozen_entropy = entropy;
-        #500;        // ~83 more clk_slow edges
-        if (entropy === frozen_entropy) begin
-            pass = pass + 1;
-            $display("PASS  entropy locked after full");
-        end else begin
-            fail = fail + 1;
-            $display("FAIL  entropy CHANGED after full: was %h now %h",
-                      frozen_entropy, entropy);
-        end
-        check("valid still 1 after lock", entropy_valid, 1'b1);
-
-        // ----- Phase 4: POR clears -----
-        reset_n = 0;
+        reset_n = 1'b0;
         #25;
-        check     ("after POR: valid is 0",   entropy_valid, 1'b0);
-        check_zero("after POR: entropy is 0", entropy);
+        reset_n = 1'b1;
+        #10;
 
-        // ----- Phase 5: post-POR re-collection -----
-        reset_n = 1;
-        #2000;
-        check        ("post-POR: valid re-asserts", entropy_valid, 1'b1);
-        check_nonzero("post-POR: entropy non-zero", entropy);
+        @(negedge clk);
+        start = 1'b1;
+        @(negedge clk);
+        start = 1'b0;
 
-        // ----- Summary -----
+        // Wait for gather to complete. Worst case: 16 rings * (W + a few FSM cycles)
+        // ~= 16 * 140 = 2240 cycles. Plus settling. Pad to 10k.
+        cyc = 0;
+        while (!gather_done && !health_fail && cyc < 10000) begin
+            @(negedge clk);
+            cyc = cyc + 1;
+        end
+
+        if (cyc >= 10000) begin
+            fail = fail + 1;
+            $display("FAIL  gather never completed (cyc=%0d)", cyc);
+        end else begin
+            // ring_health_mask check: bits 0..11, 14, 15 should be 1; 12, 13 should be 0
+            if (ring_health === 16'b1100_1111_1111_1111) begin
+                pass = pass + 1;
+                $display("PASS  ring_health = 0x%04h (rings 12, 13 failed as expected)", ring_health);
+            end else begin
+                fail = fail + 1;
+                $display("FAIL  ring_health = 0x%04h  expected 0xCFFF", ring_health);
+            end
+
+            if (ring_health_cnt === 5'd14) begin
+                pass = pass + 1;
+                $display("PASS  ring_health_cnt = 14");
+            end else begin
+                fail = fail + 1;
+                $display("FAIL  ring_health_cnt = %0d  expected 14", ring_health_cnt);
+            end
+
+            if (!health_fail) begin
+                pass = pass + 1;
+                $display("PASS  health_fail = 0 (14 healthy >= byzantine threshold of 8)");
+            end else begin
+                fail = fail + 1;
+                $display("FAIL  health_fail = 1 unexpectedly");
+            end
+
+            if (gather_done) begin
+                pass = pass + 1;
+                $display("PASS  gather_done pulsed");
+            end else begin
+                fail = fail + 1;
+                $display("FAIL  gather_done did not pulse");
+            end
+
+            // Check buffer has data (sample a few addresses)
+            buf_nonzero = 0;
+            for (cyc = 0; cyc < 64; cyc = cyc + 1) begin
+                buf_raddr = cyc[12:0] * 13'd16;     // every 16th byte
+                @(posedge clk);
+                @(negedge clk);
+                if (buf_rdata !== 8'h00) buf_nonzero = buf_nonzero + 1;
+            end
+            if (buf_nonzero >= 32) begin
+                pass = pass + 1;
+                $display("PASS  buffer non-empty: %0d/64 sampled bytes non-zero", buf_nonzero);
+            end else begin
+                fail = fail + 1;
+                $display("FAIL  buffer too sparse: only %0d/64 non-zero", buf_nonzero);
+            end
+        end
+
         $display("");
-        $display("================================");
+        $display("===========================================");
         $display(" tb_trng: %0d pass / %0d fail", pass, fail);
-        $display("================================");
+        $display("===========================================");
         if (fail == 0) $display("OVERALL PASS");
         else           $display("OVERALL FAIL");
+        $finish;
+    end
+
+    initial begin
+        #5_000_000;
+        $display("FAIL  testbench TIMEOUT");
+        $display("OVERALL FAIL");
         $finish;
     end
 
