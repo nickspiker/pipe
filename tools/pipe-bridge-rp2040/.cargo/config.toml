@@ -1,0 +1,22 @@
+# Auto-flash workflow: `cargo run --release`
+#   1. Builds the firmware for the RP2040 (thumbv6m-none-eabi)
+#   2. Converts the ELF to UF2
+#   3. Detects the RPI-RP2 USB mass-storage mount (board in BOOTSEL mode)
+#   4. Copies the UF2 onto it — the board reboots and runs immediately
+#
+# Requires: cargo install elf2uf2-rs
+# Hold BOOT on the RP2040-Zero, plug USB, then `cargo run --release`.
+
+[target.thumbv6m-none-eabi]
+runner    = "elf2uf2-rs -d"
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tdefmt.x",
+]
+
+[build]
+target = "thumbv6m-none-eabi"
+
+[env]
+DEFMT_LOG = "debug"
