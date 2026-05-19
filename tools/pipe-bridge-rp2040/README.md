@@ -21,17 +21,22 @@ cargo install elf2uf2-rs
 
 ## Flash workflow
 
-```bash
-# 1. Hold BOOT on the RP2040-Zero
-# 2. Plug USB-C into the host
-# 3. Release BOOT — board enumerates as RPI-RP2 mass-storage device
-# 4. From this directory:
-cargo run --release
+The RP2040-Zero board has both BOOT and RESET buttons, so flashing doesn't require unplugging USB:
+
+```
+1. Hold BOOT
+2. Tap RESET             (chip resets while BOOT is held → bootloader mode)
+3. Release BOOT          (board enumerates as RPI-RP2 mass-storage device)
+4. cargo run --release   (elf2uf2-rs auto-flashes; board reboots into new firmware)
 ```
 
 `elf2uf2-rs -d` auto-detects the `RPI-RP2` mount, converts the ELF to UF2, copies it across — the board reboots into the new firmware in ~2 seconds. After that, the board enumerates as `/dev/ttyACM0` (Linux) / `COMx` (Windows) / `/dev/cu.usbmodem*` (macOS).
 
-To re-flash: hold BOOT, replug USB (or tap the on-board reset trace if you've soldered one in), then `cargo run --release` again.
+**Button reference:**
+- **BOOT** held during reset → bootloader mode (UF2 flashing). Released after reset, normal boot.
+- **RESET** alone → restarts the firmware that's already flashed. Useful when code wedges and you don't need to re-flash.
+
+First-flash with a fresh board: same sequence (hold BOOT, tap RESET, release BOOT, then `cargo run --release`).
 
 ## Phase 1: USB-CDC echo + GPIO bit-bang (this scaffold)
 
