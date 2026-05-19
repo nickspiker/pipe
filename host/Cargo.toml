@@ -15,3 +15,5 @@ path = "src/lib.rs"
 pipe-enclave = { path = "../enclave" }
 blake3 = "1.5"
 ftdi-nusb = "0.1"
+vsf-mini = { path = "../../vsf-mini" }
+serialport = "4"

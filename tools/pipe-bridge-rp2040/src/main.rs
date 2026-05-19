@@ -22,18 +22,37 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use defmt::*;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Drive, Level, Output};
-use embassy_rp::multicore::{spawn_core1, Stack};
+use embassy_rp::multicore::{Stack, spawn_core1};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
+
+// Shared LED-state flag between core 0 (USB task) and core 1 (geiger task).
+//   STATE_IDLE → geiger runs normally (no USB activity right now)
+//   STATE_TX   → core 1 forces LED ON  (host → bridge → wire)
+//   STATE_RX   → core 1 forces LED OFF (wire → bridge → host)
+const STATE_IDLE: u8 = 0;
+const STATE_TX: u8 = 1;
+const STATE_RX: u8 = 2;
+static USB_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
+
+// Cross-core wake-up: core 0 signals on every USB_STATE change so core 1 can
+// drop out of `.await` immediately and re-read the atomic. Cheaper than a
+// timer-based poll and never starves on changes during LFSR bursts (the atomic
+// load inside the LFSR loop catches state changes too).
+static WAKE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -89,23 +108,41 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
         state = 0xACE1DEED;
     }
 
+    // Outer state-driven loop:
+    //   IDLE  → run LFSR flat-out, check atomic each iter (one cheap load)
+    //   TX/RX → set LED, then await Signal — core 1 sleeps, zero CPU
     loop {
-        // 1. Mix in fresh hardware entropy
-        let trng = pac::ROSC.randombit().read().randombit() as u32;
-        state ^= trng;
+        match USB_STATE.load(Ordering::Relaxed) {
+            STATE_TX => {
+                heartbeat.set_high();
+                WAKE_SIGNAL.wait().await;
+            }
+            STATE_RX => {
+                heartbeat.set_low();
+                WAKE_SIGNAL.wait().await;
+            }
+            _ => {
+                // IDLE: ripping Galois LFSR until state leaves IDLE
+                while USB_STATE.load(Ordering::Relaxed) == STATE_IDLE {
+                    // 1. Mix in fresh hardware entropy
+                    let trng = pac::ROSC.randombit().read().randombit() as u32;
+                    state ^= trng;
 
-        // 2. Galois LFSR step (Fibonacci-form-equivalent, single conditional XOR)
-        let lsb = state & 1;
-        state >>= 1;
-        if lsb != 0 {
-            state ^= GALOIS_TAPS;
-        }
+                    // 2. Galois LFSR step (single conditional XOR)
+                    let lsb = state & 1;
+                    state >>= 1;
+                    if lsb != 0 {
+                        state ^= GALOIS_TAPS;
+                    }
 
-        // 3. Threshold check on the full 32-bit state
-        if state < ON_THRESHOLD {
-            heartbeat.set_high();
-        } else if state < OFF_THRESHOLD {
-            heartbeat.set_low();
+                    // 3. Threshold check on the full 32-bit state
+                    if state < ON_THRESHOLD {
+                        heartbeat.set_high();
+                    } else if state < OFF_THRESHOLD {
+                        heartbeat.set_low();
+                    }
+                }
+            }
         }
     }
 }
@@ -176,7 +213,7 @@ async fn main(_spawner: Spawner) {
         loop {
             class.wait_connection().await;
             info!("host connected");
-            let _ = echo(&mut class, &mut wire).await;
+            let _ = handle_frames(&mut class, &mut wire).await;
             info!("host disconnected");
         }
     };
@@ -214,25 +251,146 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-/// Phase 1 loop: read a chunk from USB, toggle the wire GPIO for each byte (LSB-first), echo the bytes back. Replace with the PIO codec in Phase 2.
-async fn echo<'d, T: embassy_usb::driver::Driver<'d>>(
+/// Phase 2 loop: parse VSF commands from USB, dispatch, respond with VSF.
+///
+/// Wire format (each packet = one frame, fits in 64-byte CDC packet for now):
+///   request:   [d"cmd"(d"op":l"<name>")(d"id":u<n>)]
+///   response:  [d"resp"(d"id":u<n>)(d"op":l"<reply>")...optional extra fields...]
+///   error:     [d"resp"(d"id":u<n>)(d"err":l"<reason>")]
+///
+/// Supported ops:
+///   "ping" → "pong"
+///   "info" → returns name + version
+///   (others → "unknown_op" error)
+async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
     class: &mut CdcAcmClass<'d, T>,
-    wire: &mut Output<'_>,
+    _wire: &mut Output<'_>,
 ) -> Result<(), Disconnected> {
-    let mut buf = [0u8; 64];
+    let mut in_buf = [0u8; 64];
+    let mut out_buf = [0u8; 64];
     loop {
-        let n = class.read_packet(&mut buf).await?;
-        for byte in &buf[..n] {
-            for bit_idx in 0..8 {
-                let bit = (byte >> bit_idx) & 1;
-                if bit != 0 {
-                    wire.set_high();
-                } else {
-                    wire.set_low();
-                }
-                // No precise timing yet — Phase 2 PIO program handles that.
-            }
+        let n = class.read_packet(&mut in_buf).await?;
+        if n == 0 {
+            continue;
         }
-        class.write_packet(&buf[..n]).await?;
+
+        // USB activity → core 1 holds LED high during processing
+        USB_STATE.store(STATE_TX, Ordering::Relaxed);
+        WAKE_SIGNAL.signal(());
+
+        let resp_len = dispatch(&in_buf[..n], &mut out_buf);
+
+        if resp_len > 0 {
+            USB_STATE.store(STATE_RX, Ordering::Relaxed);
+            WAKE_SIGNAL.signal(());
+            class.write_packet(&out_buf[..resp_len]).await?;
+        }
+
+        USB_STATE.store(STATE_IDLE, Ordering::Relaxed);
+        WAKE_SIGNAL.signal(());
     }
+}
+
+/// Parse one VSF "cmd" section from `input`, dispatch, encode response into
+/// `output`. Returns response length in bytes, or 0 if input was malformed
+/// (silently drops malformed frames — host can retry).
+fn dispatch(input: &[u8], output: &mut [u8]) -> usize {
+    use vsf_mini::{VsfReader, VsfWriter};
+
+    let mut reader = VsfReader::new(input);
+
+    // Expect '[' section open
+    if reader.read_byte_raw() != Some(b'[') {
+        return 0;
+    }
+
+    // Section name must be "cmd"
+    let section_name = match reader.dict_key_str() {
+        Some(s) => s,
+        None => return 0,
+    };
+    if section_name != "cmd" {
+        return 0;
+    }
+
+    // Walk fields until ']'
+    let mut op_buf = [0u8; 16];
+    let mut op_len = 0usize;
+    let mut id: u64 = 0;
+    loop {
+        match reader.peek_tag() {
+            Some(b'(') => {
+                reader.read_byte_raw();
+                let field_name = match reader.dict_key_str() {
+                    Some(s) => s,
+                    None => return 0,
+                };
+                if reader.read_byte_raw() != Some(b':') {
+                    return 0;
+                }
+                match field_name {
+                    "op" => {
+                        let bytes = match reader.label() {
+                            Some(b) => b,
+                            None => return 0,
+                        };
+                        if bytes.len() > op_buf.len() {
+                            return 0;
+                        }
+                        op_buf[..bytes.len()].copy_from_slice(bytes);
+                        op_len = bytes.len();
+                    }
+                    "id" => {
+                        id = reader.uint().unwrap_or(0);
+                    }
+                    _ => {
+                        if !reader.skip_field() {
+                            return 0;
+                        }
+                    }
+                }
+                if reader.read_byte_raw() != Some(b')') {
+                    return 0;
+                }
+            }
+            Some(b']') => {
+                reader.read_byte_raw();
+                break;
+            }
+            _ => return 0,
+        }
+    }
+
+    // Build response
+    let mut writer = VsfWriter::new(output);
+    if !writer.section_open("resp") {
+        return 0;
+    }
+    if !(writer.field_open("id") && writer.uint(id) && writer.field_close()) {
+        return 0;
+    }
+
+    let op = &op_buf[..op_len];
+    let ok = match op {
+        b"ping" => {
+            writer.field_open("op") && writer.label("pong") && writer.field_close()
+        }
+        b"info" => {
+            writer.field_open("name")
+                && writer.label("pipe-bridge-rp2040")
+                && writer.field_close()
+                && writer.field_open("ver")
+                && writer.uint(1)
+                && writer.field_close()
+        }
+        _ => writer.field_open("err") && writer.label("unknown_op") && writer.field_close(),
+    };
+    if !ok {
+        return 0;
+    }
+
+    if !writer.section_close() {
+        return 0;
+    }
+    writer.pos()
 }
