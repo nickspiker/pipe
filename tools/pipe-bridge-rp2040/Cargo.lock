@@ -1066,6 +1066,7 @@ dependencies = [
  "panic-probe",
  "portable-atomic",
  "static_cell",
+ "vsf-mini",
 ]
 
 [[package]]
@@ -1541,6 +1542,10 @@ checksum = "de437e2a6208b014ab52972a27e59b33fa2920d3e00fe05026167a1c509d19cc"
 dependencies = [
  "vcell",
 ]
+
+[[package]]
+name = "vsf-mini"
+version = "0.1.0"
 
 [[package]]
 name = "wasi"
