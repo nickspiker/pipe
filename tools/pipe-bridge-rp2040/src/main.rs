@@ -249,7 +249,8 @@ async fn main(_spawner: Spawner) {
     // ---- USB stack -------------------------------------------------------
     let driver = Driver::new(p.USB, Irqs);
 
-    let mut config = Config::new(0x1209, 0x000C); // pid.codes test VID/PID — fine for development
+    // VID 0x1209 (pid.codes), PID 0x4665 (ferros, assigned via pid.codes PR #1208 2026-05-13).
+    let mut config = Config::new(0x1209, 0x4665);
     config.manufacturer = Some("ferros");
     config.product = Some("pipe-bridge-rp2040");
     config.serial_number = Some("dev-0001");
