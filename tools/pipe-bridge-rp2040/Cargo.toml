@@ -28,9 +28,6 @@ static_cell      = "2"
 
 blake3 = { version = "1.5", default-features = false }
 
-# no_std VSF encoder/decoder — same crate ferros uses for kernel-side framing
-vsf-mini = { path = "../../../vsf-mini" }
-
 [profile.release]
 debug         = true       # keep symbols for defmt RTT logs
 opt-level     = "s"
