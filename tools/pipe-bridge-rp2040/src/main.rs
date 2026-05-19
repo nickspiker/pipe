@@ -27,17 +27,37 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use defmt::*;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
+use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Drive, Level, Output};
 use embassy_rp::multicore::{Stack, spawn_core1};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::Instant;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
+
+/// RP2040-Zero flash size (Boya BY25Q16ES = 2 MiB).
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
+
+/// BLAKE3 domain string for the device public ID. Bumping the version invalidates
+/// all prior IDs, so treat it as part of the on-the-wire identity contract.
+const DEVICE_ID_DOMAIN: &str = "ferros bridge rp2040-zero device id v1";
+
+/// Firmware semantic version. Bump on every flash; `info` reports it.
+const FW_VERSION: u64 = 2;
+
+/// Action requested by `dispatch()` that must run *after* the response is on the wire.
+#[derive(Clone, Copy)]
+enum PostAction {
+    None,
+    BootSel,
+    Reset,
+}
 
 // Shared LED-state flag between core 0 (USB task) and core 1 (geiger task).
 //   STATE_IDLE → geiger runs normally (no USB activity right now)
@@ -152,6 +172,22 @@ async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     info!("pipe-bridge-rp2040 boot");
 
+    // ---- Device public ID -------------------------------------------------
+    // Read the flash chip's 8-byte unique ID via SPI cmd 0x4B, hash it together
+    // with a domain string. The resulting 32 bytes are the device public ID
+    // (a `hp` field on the wire). No private counterpart exists because the
+    // flash unique ID isn't isolated — anyone with the chip can read it.
+    let mut flash_uid = [0u8; 8];
+    {
+        let mut flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+        // Disable interrupts during flash access — XIP is paused while talking SPI.
+        let _ = cortex_m::interrupt::free(|_| flash.blocking_unique_id(&mut flash_uid));
+    }
+    static DEVICE_ID: StaticCell<[u8; 32]> = StaticCell::new();
+    let device_id: &'static [u8; 32] =
+        DEVICE_ID.init(blake3::derive_key(DEVICE_ID_DOMAIN, &flash_uid));
+    info!("device_id derived from flash uid={=[u8]:02x}", flash_uid);
+
     // ---- GPIO setup ------------------------------------------------------
     // GP0 = the wire output. Phase 2 will hand this to PIO; for now it's a
     // plain GPIO bit-banged by the USB task.
@@ -213,7 +249,7 @@ async fn main(_spawner: Spawner) {
         loop {
             class.wait_connection().await;
             info!("host connected");
-            let _ = handle_frames(&mut class, &mut wire).await;
+            let _ = handle_frames(&mut class, &mut wire, device_id).await;
             info!("host disconnected");
         }
     };
@@ -254,20 +290,34 @@ impl From<EndpointError> for Disconnected {
 /// Phase 2 loop: parse VSF commands from USB, dispatch, respond with VSF.
 ///
 /// Wire format (each packet = one frame, fits in 64-byte CDC packet for now):
-///   request:   [d"cmd"(d"op":l"<name>")(d"id":u<n>)]
-///   response:  [d"resp"(d"id":u<n>)(d"op":l"<reply>")...optional extra fields...]
+///   request:   [d"cmd"(d"op":l"<name>")(d"id":u<n>)...optional args...]
+///   response:  [d"resp"(d"id":u<n>)(d"op":l"<reply>")...optional fields...]
 ///   error:     [d"resp"(d"id":u<n>)(d"err":l"<reason>")]
 ///
-/// Supported ops:
-///   "ping" → "pong"
-///   "info" → returns name + version
-///   (others → "unknown_op" error)
+/// Supported ops (Tier 1):
+///   "ping"    → "pong"
+///   "info"    → name, ver, did (hp 32B), clk (u32 Hz), up (u64 ms)
+///   "uptime"  → ms (u64 since boot)
+///   "random"  → data (vb3 ≤32 bytes, BLAKE3-conditioned ROSC entropy); accepts optional (d"n":u<count>) arg
+///   "bootsel" → no response — drops into UF2 mass-storage bootloader (disconnect is the answer)
+///   "reset"   → no response — soft-resets (disconnect is the answer)
+///   (others)  → "unknown_op" error
+///
+/// Action commands deliberately send no ack. USB bulk transfers are guaranteed
+/// at the transport layer, so for data commands the response IS the ack. For
+/// actions the device disappears off the bus, so any ack races the disconnect
+/// — drop it and let the host infer success from the disconnect.
 async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
     class: &mut CdcAcmClass<'d, T>,
     _wire: &mut Output<'_>,
+    device_id: &'static [u8; 32],
 ) -> Result<(), Disconnected> {
+    // `in_buf` is one CDC packet (host commands are small — current largest is
+    // ~24 bytes). `out_buf` is sized for the biggest response (`info` ≈ 133 B
+    // with the 32-byte device hash) plus headroom for future fields.
     let mut in_buf = [0u8; 64];
-    let mut out_buf = [0u8; 64];
+    let mut out_buf = [0u8; 256];
+    const MAX_PACKET: usize = 64;
     loop {
         let n = class.read_packet(&mut in_buf).await?;
         if n == 0 {
@@ -278,64 +328,117 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
         USB_STATE.store(STATE_TX, Ordering::Relaxed);
         WAKE_SIGNAL.signal(());
 
-        let resp_len = dispatch(&in_buf[..n], &mut out_buf);
+        let (resp_len, action) = dispatch(&in_buf[..n], &mut out_buf, device_id);
 
         if resp_len > 0 {
             USB_STATE.store(STATE_RX, Ordering::Relaxed);
             WAKE_SIGNAL.signal(());
-            class.write_packet(&out_buf[..resp_len]).await?;
+            // Chunk into MAX_PACKET-sized writes. CDC-ACM bulk endpoints want
+            // one packet per write call.
+            let mut sent = 0;
+            while sent < resp_len {
+                let end = (sent + MAX_PACKET).min(resp_len);
+                class.write_packet(&out_buf[sent..end]).await?;
+                sent = end;
+            }
+            // If the response is an exact multiple of the packet size, append a
+            // zero-length packet so the host knows the transfer ended.
+            if resp_len.is_multiple_of(MAX_PACKET) {
+                class.write_packet(&[]).await?;
+            }
         }
 
         USB_STATE.store(STATE_IDLE, Ordering::Relaxed);
         WAKE_SIGNAL.signal(());
+
+        // Post-action runs only after the response is on the wire so the host
+        // actually sees the ack before the device drops off the bus.
+        match action {
+            PostAction::None => {}
+            PostAction::BootSel => {
+                embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+            }
+            PostAction::Reset => {
+                cortex_m::peripheral::SCB::sys_reset();
+            }
+        }
     }
 }
 
+/// Pull `n` bytes (≤32) of BLAKE3-conditioned hardware entropy.
+///
+/// Gathers 64 raw ROSC bits, runs them through one BLAKE3 invocation, returns
+/// the first `n` bytes of the digest. Not crypto-grade — the RP2040 ROSC is a
+/// single ring with no health checks (datasheet says so explicitly) — but it's
+/// fine for the bridge's `random` debug command. PIPE silicon has the actual
+/// entropy source.
+fn gather_random(out: &mut [u8]) {
+    use blake3::Hasher;
+    use embassy_rp::pac;
+
+    let mut raw = [0u8; 64];
+    for byte in &mut raw {
+        for _ in 0..8 {
+            let bit = pac::ROSC.randombit().read().randombit() as u8;
+            *byte = (*byte << 1) | bit;
+        }
+    }
+    let digest = Hasher::new().update(&raw).finalize();
+    let n = out.len().min(32);
+    out[..n].copy_from_slice(&digest.as_bytes()[..n]);
+}
+
 /// Parse one VSF "cmd" section from `input`, dispatch, encode response into
-/// `output`. Returns response length in bytes, or 0 if input was malformed
-/// (silently drops malformed frames — host can retry).
-fn dispatch(input: &[u8], output: &mut [u8]) -> usize {
+/// `output`. Returns `(response_length, post_action)`; a zero length means the
+/// frame was malformed and is silently dropped (host can retry).
+fn dispatch(
+    input: &[u8],
+    output: &mut [u8],
+    device_id: &[u8; 32],
+) -> (usize, PostAction) {
     use vsf_mini::{VsfReader, VsfWriter};
 
     let mut reader = VsfReader::new(input);
 
     // Expect '[' section open
     if reader.read_byte_raw() != Some(b'[') {
-        return 0;
+        return (0, PostAction::None);
     }
 
     // Section name must be "cmd"
     let section_name = match reader.dict_key_str() {
         Some(s) => s,
-        None => return 0,
+        None => return (0, PostAction::None),
     };
     if section_name != "cmd" {
-        return 0;
+        return (0, PostAction::None);
     }
 
     // Walk fields until ']'
     let mut op_buf = [0u8; 16];
     let mut op_len = 0usize;
     let mut id: u64 = 0;
+    // `n` is per-command arg (e.g. random byte count). 0 → use op's default.
+    let mut n_arg: u64 = 0;
     loop {
         match reader.peek_tag() {
             Some(b'(') => {
                 reader.read_byte_raw();
                 let field_name = match reader.dict_key_str() {
                     Some(s) => s,
-                    None => return 0,
+                    None => return (0, PostAction::None),
                 };
                 if reader.read_byte_raw() != Some(b':') {
-                    return 0;
+                    return (0, PostAction::None);
                 }
                 match field_name {
                     "op" => {
                         let bytes = match reader.label() {
                             Some(b) => b,
-                            None => return 0,
+                            None => return (0, PostAction::None),
                         };
                         if bytes.len() > op_buf.len() {
-                            return 0;
+                            return (0, PostAction::None);
                         }
                         op_buf[..bytes.len()].copy_from_slice(bytes);
                         op_len = bytes.len();
@@ -343,34 +446,46 @@ fn dispatch(input: &[u8], output: &mut [u8]) -> usize {
                     "id" => {
                         id = reader.uint().unwrap_or(0);
                     }
+                    "n" => {
+                        n_arg = reader.uint().unwrap_or(0);
+                    }
                     _ => {
                         if !reader.skip_field() {
-                            return 0;
+                            return (0, PostAction::None);
                         }
                     }
                 }
                 if reader.read_byte_raw() != Some(b')') {
-                    return 0;
+                    return (0, PostAction::None);
                 }
             }
             Some(b']') => {
                 reader.read_byte_raw();
                 break;
             }
-            _ => return 0,
+            _ => return (0, PostAction::None),
         }
     }
 
-    // Build response
-    let mut writer = VsfWriter::new(output);
-    if !writer.section_open("resp") {
-        return 0;
-    }
-    if !(writer.field_open("id") && writer.uint(id) && writer.field_close()) {
-        return 0;
+    let op = &op_buf[..op_len];
+
+    // Action commands send no response — the disconnect is the answer.
+    match op {
+        b"bootsel" => return (0, PostAction::BootSel),
+        b"reset" => return (0, PostAction::Reset),
+        _ => {}
     }
 
-    let op = &op_buf[..op_len];
+    // Data commands: build a "resp" section.
+    let mut writer = VsfWriter::new(output);
+    if !writer.section_open("resp") {
+        return (0, PostAction::None);
+    }
+    if !(writer.field_open("id") && writer.uint(id) && writer.field_close()) {
+        return (0, PostAction::None);
+    }
+
+    let up_ms = Instant::now().as_millis();
     let ok = match op {
         b"ping" => {
             writer.field_open("op") && writer.label("pong") && writer.field_close()
@@ -380,17 +495,37 @@ fn dispatch(input: &[u8], output: &mut [u8]) -> usize {
                 && writer.label("pipe-bridge-rp2040")
                 && writer.field_close()
                 && writer.field_open("ver")
-                && writer.uint(1)
+                && writer.uint(FW_VERSION)
                 && writer.field_close()
+                && writer.field_open("did")
+                && writer.hash_p(device_id)
+                && writer.field_close()
+                && writer.field_open("clk")
+                && writer.uint(embassy_rp::clocks::clk_sys_freq() as u64)
+                && writer.field_close()
+                && writer.field_open("up")
+                && writer.uint(up_ms)
+                && writer.field_close()
+        }
+        b"uptime" => {
+            writer.field_open("ms") && writer.uint(up_ms) && writer.field_close()
+        }
+        b"random" => {
+            // Default to 32 bytes if no `n` arg; cap at 32 to fit in 64-byte CDC packet
+            // alongside the surrounding section/field framing (~14 bytes overhead).
+            let count = if n_arg == 0 { 32 } else { n_arg.min(32) } as usize;
+            let mut buf = [0u8; 32];
+            gather_random(&mut buf[..count]);
+            writer.field_open("data") && writer.blob(&buf[..count]) && writer.field_close()
         }
         _ => writer.field_open("err") && writer.label("unknown_op") && writer.field_close(),
     };
     if !ok {
-        return 0;
+        return (0, PostAction::None);
     }
 
     if !writer.section_close() {
-        return 0;
+        return (0, PostAction::None);
     }
-    writer.pos()
+    (writer.pos(), PostAction::None)
 }
