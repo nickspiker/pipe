@@ -11,13 +11,13 @@ use pipe_host::ft232h::{Ft232h, PIPE_PIN_MASK};
 use std::time::Duration;
 
 const MPSSE_CLOCK_HZ: u32 = 6_000_000;
-const PAIR_SLOTS: usize = 32;      // 32 enclave+host pairs = 64 total slots
-const INJECT_AT: usize = 16;       // host injects a 1 at this slot index
+const PAIR_SLOTS: usize = 32; // 32 enclave+host pairs = 64 total slots
+const INJECT_AT: usize = 16; // host injects a 1 at this slot index
 
 const MPSSE_SET_BITS_LOW: u8 = 0x80;
 const MPSSE_GET_BITS_LOW: u8 = 0x81;
-const MPSSE_CLOCK_BYTES: u8 = 0x8F;  // length unit = 8 MPSSE clocks
-const MPSSE_CLOCK_BITS: u8 = 0x8E;   // length unit = 1 MPSSE clock (max 8/cmd)
+const MPSSE_CLOCK_BYTES: u8 = 0x8F; // length unit = 8 MPSSE clocks
+const MPSSE_CLOCK_BITS: u8 = 0x8E; // length unit = 1 MPSSE clock (max 8/cmd)
 const MPSSE_SEND_IMMEDIATE: u8 = 0x87;
 
 /// Emit MPSSE commands that consume exactly `target_clocks` MPSSE clock cycles of TCK time (used purely as a calibrated delay). Combines 0x8F (byte-granular, 8 clocks/unit) and 0x8E (bit-granular, 1 clock/unit, ≤ 8 clocks per cmd) so we can hit any target ≥ 2. The 0x8E fine-tune cmd can fill 2..9 clocks; if the byte-granular chunk leaves a 0- or 1-clock remainder, we back off one byte cycle so the remainder lands in [8, 9] (still reachable by 0x8E with N=6 or 7).
@@ -78,7 +78,10 @@ fn calibrate_half_slot_bytes(ft: &mut Ft232h) -> Result<u16, ftdi_nusb::Error> {
     }
     if edge_positions.len() < 4 {
         // The codec bitstream tristates during host slots; without the host driving, the wire shows no edges in pure sample-only mode. Fall back to the empirical value (56 ± a few clocks at SLOT_DIV=12, room temperature, this ring osc).
-        eprintln!("Calibration: only {} edges; falling back to 56 clocks/half-slot", edge_positions.len());
+        eprintln!(
+            "Calibration: only {} edges; falling back to 56 clocks/half-slot",
+            edge_positions.len()
+        );
         return Ok(56);
     }
     // Mean gap between edges = number of GET_BITS_LOW per half-slot.
@@ -178,10 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Decode -------------------------------------------------------
     // responses[2k] = early sample of enclave slot k (right after host released). responses[2k+1] = late sample (well into the enclave drive). Use the late sample for the codec's wire_in.
-    let enclave_samples: Vec<u8> = responses
-        .chunks_exact(2)
-        .map(|p| (p[1] >> 7) & 1)
-        .collect();
+    let enclave_samples: Vec<u8> = responses.chunks_exact(2).map(|p| (p[1] >> 7) & 1).collect();
 
     let mut decoded_from_enc: Vec<u8> = Vec::with_capacity(PAIR_SLOTS);
     for &w in &enclave_samples {
@@ -214,10 +214,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = INJECT_AT.saturating_sub(2);
     let end = (INJECT_AT + 8).min(enclave_samples.len());
     println!("\nAround injection (slot {}):", INJECT_AT);
-    println!("  slot:        {}", (start..end).map(|i| format!("{:2}", i)).collect::<Vec<_>>().join(" "));
-    println!("  host_drove:  {}", host_drives[start..end].iter().map(|b| format!(" {}", b)).collect::<Vec<_>>().join(" "));
-    println!("  wire_late:   {}", enclave_samples[start..end].iter().map(|b| format!(" {}", b)).collect::<Vec<_>>().join(" "));
-    println!("  decoded_rx:  {}", decoded_from_enc[start..end].iter().map(|b| format!(" {}", b)).collect::<Vec<_>>().join(" "));
+    println!(
+        "  slot:        {}",
+        (start..end)
+            .map(|i| format!("{:2}", i))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!(
+        "  host_drove:  {}",
+        host_drives[start..end]
+            .iter()
+            .map(|b| format!(" {}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!(
+        "  wire_late:   {}",
+        enclave_samples[start..end]
+            .iter()
+            .map(|b| format!(" {}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!(
+        "  decoded_rx:  {}",
+        decoded_from_enc[start..end]
+            .iter()
+            .map(|b| format!(" {}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     Ok(())
 }

@@ -9,9 +9,9 @@
 //!
 //! ```text cargo run --release --bin gen-test-vectors -- ../sim ```
 
-use pipe::{chaos_amp, ragu};
 use pipe::chaos_amp::state_to_bytes;
 use pipe::chaos_amp_v2::{chaos_amp_v2, state_to_bytes_v2};
+use pipe::{chaos_amp, ragu};
 
 fn main() {
     let mem_dir = std::env::args().nth(1);
@@ -31,9 +31,13 @@ fn main() {
     vectors.push(([0xFFu8; 64], [0xFF; 32]));
 
     let mut inp = [0u8; 64];
-    for i in 0..64 { inp[i] = i as u8; }
+    for i in 0..64 {
+        inp[i] = i as u8;
+    }
     let mut key = [0u8; 32];
-    for i in 0..32 { key[i] = (i * 7) as u8; }
+    for i in 0..32 {
+        key[i] = (i * 7) as u8;
+    }
     vectors.push((inp, key));
 
     let h = blake3::hash(b"PIPE-test-3");
@@ -74,8 +78,8 @@ fn main() {
     }
 
     if let Some(dir) = mem_dir {
-        let p_in    = format!("{}/vectors_input.mem", dir);
-        let p_st    = format!("{}/vectors_state.mem", dir);
+        let p_in = format!("{}/vectors_input.mem", dir);
+        let p_st = format!("{}/vectors_state.mem", dir);
         let p_st_v2 = format!("{}/vectors_state_v2.mem", dir);
         std::fs::write(&p_in, &input_mem).expect("write vectors_input.mem");
         std::fs::write(&p_st, &state_mem).expect("write vectors_state.mem");
@@ -88,11 +92,15 @@ fn main() {
         let mut v2_log = String::new();
         for (vi, (input, _)) in vectors.iter().enumerate() {
             v2_log.push_str(&format!("// v2 vector {}: input=", vi));
-            for b in input.iter() { v2_log.push_str(&format!("{:02x}", b)); }
+            for b in input.iter() {
+                v2_log.push_str(&format!("{:02x}", b));
+            }
             v2_log.push('\n');
             let st = chaos_amp_v2(input);
             v2_log.push_str("// chaos_amp_v2 state (16 × 24b LE):  ");
-            for w in &st { v2_log.push_str(&format!("{:06x} ", w & 0x00FF_FFFF)); }
+            for w in &st {
+                v2_log.push_str(&format!("{:06x} ", w & 0x00FF_FFFF));
+            }
             v2_log.push('\n');
         }
         let p_log_v2 = format!("{}/vectors_v2.txt", dir);
@@ -100,23 +108,26 @@ fn main() {
     }
 }
 
-fn print_vector_comment(
-    input: &[u8; 64],
-    state_bytes: &[u8; 64],
-    key: &[u8; 32],
-    r: &[u8; 32],
-) {
+fn print_vector_comment(input: &[u8; 64], state_bytes: &[u8; 64], key: &[u8; 32], r: &[u8; 32]) {
     print!("// input:        ");
-    for b in input.iter() { print!("{:02x}", b); }
+    for b in input.iter() {
+        print!("{:02x}", b);
+    }
     println!();
     print!("// chaos_state:  ");
-    for b in state_bytes.iter() { print!("{:02x}", b); }
+    for b in state_bytes.iter() {
+        print!("{:02x}", b);
+    }
     println!();
     print!("// key:          ");
-    for b in key.iter() { print!("{:02x}", b); }
+    for b in key.iter() {
+        print!("{:02x}", b);
+    }
     println!();
     print!("// ragu:         ");
-    for b in r.iter() { print!("{:02x}", b); }
+    for b in r.iter() {
+        print!("{:02x}", b);
+    }
     println!();
     println!();
 }

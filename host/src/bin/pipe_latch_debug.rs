@@ -54,11 +54,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = ft.sample_low(64)?; // drain FA AB
 
     let baseline = single_sample(&mut ft)?;
-    println!("baseline (no host drive): 0x{:02X} (bit7={})", baseline, (baseline >> 7) & 1);
+    println!(
+        "baseline (no host drive): 0x{:02X} (bit7={})",
+        baseline,
+        (baseline >> 7) & 1
+    );
 
     drive_and_sample(&mut ft, PIPE_PIN_MASK, PIPE_PIN_MASK, 50, "drive HIGH 50ms")?;
     drive_and_sample(&mut ft, 0x00, PIPE_PIN_MASK, 50, "drive  LOW 50ms")?;
-    drive_and_sample(&mut ft, PIPE_PIN_MASK, PIPE_PIN_MASK, 200, "drive HIGH 200ms")?;
+    drive_and_sample(
+        &mut ft,
+        PIPE_PIN_MASK,
+        PIPE_PIN_MASK,
+        200,
+        "drive HIGH 200ms",
+    )?;
     drive_and_sample(&mut ft, 0x00, PIPE_PIN_MASK, 200, "drive  LOW 200ms")?;
 
     Ok(())

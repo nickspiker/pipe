@@ -34,7 +34,10 @@ fn drive(ft: &mut Ft232h, level: u8) -> Result<(), ftdi_nusb::Error> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ft = Ft232h::open(MPSSE_CLOCK_HZ)?;
-    eprintln!("FT232H opened, MPSSE clock = {} MHz", ft.mpsse_clock_hz() / 1_000_000);
+    eprintln!(
+        "FT232H opened, MPSSE clock = {} MHz",
+        ft.mpsse_clock_hz() / 1_000_000
+    );
 
     // Drain the FA AB bad-cmd echo from sync_mpsse.
     let _ = ft.sample_low(64)?;
@@ -61,7 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if pass {
-        println!("PASS: host ↔ enclave bidirectional on ADBUS{}", PIPE_ADBUS_BIT);
+        println!(
+            "PASS: host ↔ enclave bidirectional on ADBUS{}",
+            PIPE_ADBUS_BIT
+        );
         Ok(())
     } else {
         println!("FAIL: latch did not echo host drive — wiring or bitstream issue");

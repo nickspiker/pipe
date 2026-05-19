@@ -173,7 +173,9 @@ mod tests {
 
     #[test]
     fn every_byte_toggle_counts_as_edges() {
-        let samples: Vec<u8> = (0..100).map(|i| if i & 1 == 0 { 0x00 } else { 0x01 }).collect();
+        let samples: Vec<u8> = (0..100)
+            .map(|i| if i & 1 == 0 { 0x00 } else { 0x01 })
+            .collect();
         assert_eq!(count_edges(&samples, 0), 99);
         assert_eq!(count_edges(&samples, 1), 0);
     }
@@ -187,7 +189,11 @@ mod tests {
         let samples: Vec<u8> = (0..total).map(|i| ((i / slot) & 1) as u8).collect();
         let cdr = Cdr::lock_from_idle(&samples, 0, 0).expect("should lock");
         assert!(cdr.locked);
-        assert!((cdr.period_mclks - 120.0).abs() < 1.0, "got {}", cdr.period_mclks);
+        assert!(
+            (cdr.period_mclks - 120.0).abs() < 1.0,
+            "got {}",
+            cdr.period_mclks
+        );
     }
 
     #[test]
@@ -202,7 +208,11 @@ mod tests {
             cdr.observe_edge(t, true);
         }
         // PLL settles to within one step of the dead-zone boundary (so 1 MCLK + 0.25 step worst-case from truth).
-        assert!((cdr.period_mclks - 120.0).abs() <= 1.5, "drifted to {}", cdr.period_mclks);
+        assert!(
+            (cdr.period_mclks - 120.0).abs() <= 1.5,
+            "drifted to {}",
+            cdr.period_mclks
+        );
     }
 
     #[test]
@@ -216,7 +226,11 @@ mod tests {
             let jitter = if i % 2 == 0 { 0 } else { 0 };
             cdr.observe_edge(nominal + jitter, true);
         }
-        assert!((cdr.period_mclks - 120.0).abs() < 0.5, "period drifted to {}", cdr.period_mclks);
+        assert!(
+            (cdr.period_mclks - 120.0).abs() < 0.5,
+            "period drifted to {}",
+            cdr.period_mclks
+        );
     }
 
     #[test]
@@ -241,17 +255,19 @@ mod tests {
             let t = k * 480;
             cdr.observe_edge(t, true);
         }
-        assert!((cdr.period_mclks - 120.0).abs() < 1.0, "got {}", cdr.period_mclks);
+        assert!(
+            (cdr.period_mclks - 120.0).abs() < 1.0,
+            "got {}",
+            cdr.period_mclks
+        );
     }
 
     #[test]
     fn frequency_25khz_at_6mhz_sample() {
         // 25 kHz wave at 6 Msps = 240 samples/period = 120 samples/half. Run a long enough capture (60 ms) so boundary-truncation error is < 1%.
         let half = 6_000_000 / 25_000 / 2; // 120
-        let total = 60 * 6_000;            // 360_000 samples = 60 ms
-        let samples: Vec<u8> = (0..total)
-            .map(|i| ((i / half) & 1) as u8)
-            .collect();
+        let total = 60 * 6_000; // 360_000 samples = 60 ms
+        let samples: Vec<u8> = (0..total).map(|i| ((i / half) & 1) as u8).collect();
         let edges = count_edges(&samples, 0);
         let f = frequency_hz(edges, samples.len(), 6_000_000);
         assert!((f - 25_000.0).abs() < 100.0, "got {f} Hz");

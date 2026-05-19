@@ -23,9 +23,10 @@
 #![no_main]
 
 use defmt::*;
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::gpio::{Drive, Level, Output};
+use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
@@ -38,6 +39,77 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
 
+// Core 1 stack + executor for the Geiger LED task.
+// 16 KB stack to hold the 8 KB BLAKE3 buffer + the ~1.7 KB BLAKE3 hasher state
+// + executor overhead with comfortable headroom.
+static mut CORE1_STACK: Stack<16384> = Stack::new();
+static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
+
+/// Core 1's dedicated task: Galois LFSR + ROSC TRNG mixing, Geiger LED on GP25.
+///
+/// Architecture:
+///   - Boot: gather 32 raw ROSC bits → BLAKE3 hash → first 4 bytes seed the LFSR
+///     (BLAKE3 still validates on the chip; it just doesn't run in the hot loop)
+///   - Hot loop: read 1 fresh ROSC bit, XOR into LFSR state, Galois step,
+///     threshold-check, GPIO write
+///   - No BLAKE3 in the hot path → no bursts, runs at constant ~8 MHz iters
+///
+/// LFSR polynomial: 0x80200003 = x^32 + x^22 + x^2 + x + 1 (maximal length over
+/// GF(2), period 2^32 - 1 = 4,294,967,295). The continuous ROSC XOR-in means
+/// the LFSR is reseeded with one fresh hardware-entropy bit per iteration, so
+/// the output is strictly better than pure LFSR.
+///
+/// Iteration cost (cycles, M0+):
+///   - ROSC PAC read:        ~4 (AHB bus)
+///   - XOR + shift + cond XOR: 3-4
+///   - Two 32-bit compares:  2
+///   - Conditional GPIO:     1-2
+///   Total: ~12-15 cycles → ~8-10 MHz at 125 MHz sys_clk
+#[embassy_executor::task]
+async fn geiger_task(mut heartbeat: Output<'static>) {
+    use blake3::Hasher;
+    use embassy_rp::pac;
+
+    const ON_THRESHOLD: u32 = 11 << 17;
+    const OFF_THRESHOLD: u32 = 7 << 22;
+    const GALOIS_TAPS: u32 = 0x80200003; // x^32 + x^22 + x^2 + x + 1
+
+    // Boot-time seed: 32 raw ROSC bits → BLAKE3 → first 4 bytes
+    let mut seed = [0u8; 32];
+    for byte in &mut seed {
+        for _ in 0..8 {
+            let bit = pac::ROSC.randombit().read().randombit() as u8;
+            *byte = (*byte << 1) | bit;
+        }
+    }
+    let hash = Hasher::new().update(&seed).finalize();
+    let mut state: u32 = u32::from_le_bytes(hash.as_bytes()[0..4].try_into().unwrap());
+    if state == 0 {
+        // LFSR must start non-zero or it stays at 0 forever
+        state = 0xACE1DEED;
+    }
+
+    loop {
+        // 1. Mix in fresh hardware entropy
+        let trng = pac::ROSC.randombit().read().randombit() as u32;
+        state ^= trng;
+
+        // 2. Galois LFSR step (Fibonacci-form-equivalent, single conditional XOR)
+        let lsb = state & 1;
+        state >>= 1;
+        if lsb != 0 {
+            state ^= GALOIS_TAPS;
+        }
+
+        // 3. Threshold check on the full 32-bit state
+        if state < ON_THRESHOLD {
+            heartbeat.set_high();
+        } else if state < OFF_THRESHOLD {
+            heartbeat.set_low();
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -47,6 +119,25 @@ async fn main(_spawner: Spawner) {
     // GP0 = the wire output. Phase 2 will hand this to PIO; for now it's a
     // plain GPIO bit-banged by the USB task.
     let mut wire = Output::new(p.PIN_0, Level::Low);
+
+    // GP25 = external heartbeat LED. Direct-soldered (no series resistor)
+    // at 2 mA drive strength — pin's own current limit replaces the resistor.
+    // Ownership of `heartbeat` is moved to core 1 below.
+    let mut heartbeat = Output::new(p.PIN_25, Level::Low);
+    heartbeat.set_drive_strength(Drive::_2mA);
+
+    // Launch core 1 with its own executor running the Geiger task.
+    // Core 0 stays focused on USB + the echo/bit-bang loop.
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = EXECUTOR1.init(Executor::new());
+            executor1.run(|spawner| {
+                spawner.spawn(geiger_task(heartbeat)).unwrap();
+            });
+        },
+    );
 
     // Onboard WS2812 RGB LED is on GP16 — not driven by this scaffold.
 
@@ -79,7 +170,7 @@ async fn main(_spawner: Spawner) {
     let mut class = CdcAcmClass::new(&mut builder, state, 64);
     let mut usb = builder.build();
 
-    // ---- Run USB device task + echo+bit-bang loop concurrently ----------
+    // ---- Run USB + echo on core 0 (Geiger lives on core 1) --------------
     let usb_fut = usb.run();
     let echo_fut = async {
         loop {
@@ -88,6 +179,25 @@ async fn main(_spawner: Spawner) {
             let _ = echo(&mut class, &mut wire).await;
             info!("host disconnected");
         }
+    };
+
+    // (heartbeat_fut moved to core 1 as `geiger_task` above)
+    #[allow(unused)]
+    let _placeholder = async {
+        // Geiger LED, BLAKE3-XOF conditioned version.
+        //
+        // Raw ROSC RANDOMBIT is biased and looks visibly periodic (single ring,
+        // no health checks, no conditioner — RP2040 datasheet explicitly says
+        // it's not crypto-grade). Fix: gather 32 bytes of raw ROSC entropy at
+        // boot, BLAKE3-hash to seed an XOF (extendable output function), then
+        // pull a fresh uniform-random 32-byte block per tick.
+        //
+        // Threshold logic on the full 256-bit XOF block (big-endian):
+        //   value < 2^250  (top 6 bits zero ⇔ buf[0] < 4)  → turn OFF  ~1.56%
+        //   value < 2^248  (top 8 bits zero ⇔ buf[0] == 0) → turn ON   ~0.39%
+        // When both fire (buf[0]==0), turn-on runs second and wins.
+        //
+        // unused — kept so the type-checker has a valid future to drop later
     };
 
     embassy_futures::join::join(usb_fut, echo_fut).await;

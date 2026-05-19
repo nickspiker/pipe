@@ -72,8 +72,7 @@ const ROUND_CONSTS: [u32; ROUNDS] = [
 #[inline]
 fn pos_const(i: usize, round_idx: usize) -> u32 {
     // Fixed prime multiplier 0x9E37_79B9 (golden-ratio constant) keeps neighbouring (i, round) pairs distinct.
-    ((i as u32).wrapping_mul(0x9E37_79B9)
-        ^ (round_idx as u32).wrapping_mul(0x517C_C1B7))
+    ((i as u32).wrapping_mul(0x9E37_79B9) ^ (round_idx as u32).wrapping_mul(0x517C_C1B7))
         & BUCKET_MASK
 }
 
@@ -113,29 +112,29 @@ fn op_apply(op_idx: u8, val: u32, secondary: u32) -> u32 {
 
     let (new_frac, new_exp): (i16, i8) = match op_idx & 0x1F {
         // ============== Spirix-shaped (0..15) ==============
-        0  => (frac_a.wrapping_add(frac_b), exp_a.wrapping_add(exp_b)),                       // ADD
-        1  => (frac_a.wrapping_sub(frac_b), exp_a.wrapping_sub(exp_b)),                       // SUB
-        2  => (frac_a.wrapping_mul(frac_b), exp_a.wrapping_mul(exp_b)),                       // MUL_LO
-        3  => (frac_a & frac_b, exp_a & exp_b),                                                // AND (lossy)
-        4  => (frac_a | frac_b, exp_a | exp_b),                                                // OR  (lossy)
-        5  => (frac_a ^ frac_b, exp_a ^ exp_b),                                                // XOR
-        6  => ((ufa & !ufb) as i16, (uea & !ueb) as i8),                                       // ANDN (lossy)
-        7  => ((!ufa) as i16 ^ frac_b, (!uea) as i8 ^ exp_b),                                  // NOT
-        8  => (ufa.wrapping_shl(sh) as i16 ^ frac_b, exp_a ^ exp_b),                           // SHL (lossy)
-        9  => (ufa.wrapping_shr(sh) as i16 ^ frac_b, exp_a ^ exp_b),                           // SHR (lossy)
-        10 => (ufa.rotate_left(sh) as i16 ^ frac_b, exp_a ^ exp_b),                            // ROL_B (by secondary)
-        11 => (ufa.rotate_right(sh) as i16 ^ frac_b, exp_a ^ exp_b),                           // ROR_B
-        12 => (ufa.rotate_left(sh_self) as i16 ^ frac_b, exp_a ^ exp_b),                       // ROL_S (by self)
-        13 => (frac_a.wrapping_neg() ^ frac_b, exp_a.wrapping_neg() ^ exp_b),                  // NEG
+        0 => (frac_a.wrapping_add(frac_b), exp_a.wrapping_add(exp_b)), // ADD
+        1 => (frac_a.wrapping_sub(frac_b), exp_a.wrapping_sub(exp_b)), // SUB
+        2 => (frac_a.wrapping_mul(frac_b), exp_a.wrapping_mul(exp_b)), // MUL_LO
+        3 => (frac_a & frac_b, exp_a & exp_b),                         // AND (lossy)
+        4 => (frac_a | frac_b, exp_a | exp_b),                         // OR  (lossy)
+        5 => (frac_a ^ frac_b, exp_a ^ exp_b),                         // XOR
+        6 => ((ufa & !ufb) as i16, (uea & !ueb) as i8),                // ANDN (lossy)
+        7 => ((!ufa) as i16 ^ frac_b, (!uea) as i8 ^ exp_b),           // NOT
+        8 => (ufa.wrapping_shl(sh) as i16 ^ frac_b, exp_a ^ exp_b),    // SHL (lossy)
+        9 => (ufa.wrapping_shr(sh) as i16 ^ frac_b, exp_a ^ exp_b),    // SHR (lossy)
+        10 => (ufa.rotate_left(sh) as i16 ^ frac_b, exp_a ^ exp_b),    // ROL_B (by secondary)
+        11 => (ufa.rotate_right(sh) as i16 ^ frac_b, exp_a ^ exp_b),   // ROR_B
+        12 => (ufa.rotate_left(sh_self) as i16 ^ frac_b, exp_a ^ exp_b), // ROL_S (by self)
+        13 => (frac_a.wrapping_neg() ^ frac_b, exp_a.wrapping_neg() ^ exp_b), // NEG
         14 => (
             frac_a.wrapping_abs().wrapping_add(frac_b),
             exp_a.wrapping_abs().wrapping_add(exp_b),
-        ),                                                                                      // ABS
-        15 => ((ufa.swap_bytes() as i16) ^ frac_b, exp_a ^ exp_b),                             // BSWAP
+        ), // ABS
+        15 => ((ufa.swap_bytes() as i16) ^ frac_b, exp_a ^ exp_b),     // BSWAP
 
         // ============== Chaos-specific Rube Goldberg (16..31) ==============
-        16 => (frac_a.min(frac_b), exp_a.min(exp_b)),                                           // MIN (lossy)
-        17 => (frac_a.max(frac_b), exp_a.max(exp_b)),                                           // MAX (lossy)
+        16 => (frac_a.min(frac_b), exp_a.min(exp_b)), // MIN (lossy)
+        17 => (frac_a.max(frac_b), exp_a.max(exp_b)), // MAX (lossy)
         18 => {
             // POPCNT(val ^ secondary): replace low 8 bits with popcount; preserve top byte XOR'd. Lossy.
             let xor = ufa ^ ufb;
@@ -145,15 +144,9 @@ fn op_apply(op_idx: u8, val: u32, secondary: u32) -> u32 {
                 (((preserved as u16) << 8) | (pc as u16)) as i16,
                 (uea ^ ueb) as i8,
             )
-        }                                                                                       // POPCNT
-        19 => (
-            frac_a.saturating_add(frac_b),
-            exp_a.saturating_add(exp_b),
-        ),                                                                                      // SAT_ADD (lossy)
-        20 => (
-            frac_a.saturating_sub(frac_b),
-            exp_a.saturating_sub(exp_b),
-        ),                                                                                      // SAT_SUB (lossy)
+        } // POPCNT
+        19 => (frac_a.saturating_add(frac_b), exp_a.saturating_add(exp_b)), // SAT_ADD (lossy)
+        20 => (frac_a.saturating_sub(frac_b), exp_a.saturating_sub(exp_b)), // SAT_SUB (lossy)
         21 => {
             // CSWAP: branch on (val < secondary). Either swap-rotate path or XOR path.
             if frac_a < frac_b {
@@ -161,7 +154,7 @@ fn op_apply(op_idx: u8, val: u32, secondary: u32) -> u32 {
             } else {
                 (frac_a ^ frac_b, exp_a ^ exp_b)
             }
-        }                                                                                       // CSWAP (branch-entropy)
+        } // CSWAP (branch-entropy)
         22 => {
             // GFMUL: GF(2^8) multiply on the two low bytes — algebraic mixing without an S-box.
             let lo = gf_mul(ufa as u8, ufb as u8);
@@ -169,51 +162,45 @@ fn op_apply(op_idx: u8, val: u32, secondary: u32) -> u32 {
                 (((ufa & 0xFF00) | lo as u16) as i16) ^ frac_b,
                 (uea ^ ueb) as i8,
             )
-        }                                                                                       // GFMUL
+        } // GFMUL
         23 => {
             // PARITY: XOR-fold val to 1 bit, paint across all 24 bits. Extreme lossy: 24→1.
             let p = (ufa.count_ones() as u32 + uea.count_ones()) & 1;
             let p_paint16: u16 = if p == 1 { 0xFFFF } else { 0x0000 };
             let p_paint8: u8 = if p == 1 { 0xFF } else { 0x00 };
-            (
-                (p_paint16 ^ ufb) as i16,
-                (p_paint8 ^ ueb) as i8,
-            )
-        }                                                                                       // PARITY (extreme lossy)
-        24 => (ufa.reverse_bits() as i16 ^ frac_b, exp_a ^ exp_b),                              // BREV
+            ((p_paint16 ^ ufb) as i16, (p_paint8 ^ ueb) as i8)
+        } // PARITY (extreme lossy)
+        24 => (ufa.reverse_bits() as i16 ^ frac_b, exp_a ^ exp_b), // BREV
         25 => {
             // NREV: reverse nibble order within each byte.
             let lo = ((ufa & 0x000F) << 4) | ((ufa & 0x00F0) >> 4);
             let hi = ((ufa & 0x0F00) << 4) | ((ufa & 0xF000) >> 4);
             (((lo | hi) as i16) ^ frac_b, exp_a ^ exp_b)
-        }                                                                                       // NREV
+        } // NREV
         26 => {
             // AVG: rounded average of (a, b). Lossy: a+b sums collide.
             let avg_frac = (((frac_a as i32) + (frac_b as i32) + 1) >> 1) as i16;
             let avg_exp = (((exp_a as i16) + (exp_b as i16) + 1) >> 1) as i8;
             (avg_frac, avg_exp)
-        }                                                                                       // AVG (lossy)
+        } // AVG (lossy)
         27 => {
             // LFSR_TICK: one Galois-LFSR step on 16-bit frac with primitive polynomial taps 0xB400.
             let lsb = ufa & 1;
             let stepped = (ufa >> 1) ^ (if lsb == 1 { 0xB400u16 } else { 0u16 });
             (stepped as i16 ^ frac_b, exp_a ^ exp_b)
-        }                                                                                       // LFSR_TICK
+        } // LFSR_TICK
         28 => {
             // EXPAND_LO: replicate low byte of val across the frac word.
             let lo = (ufa & 0xFF) as u8;
             let exp = (((lo as u16) << 8) | (lo as u16)) as i16;
             (exp ^ frac_b, exp_a ^ exp_b)
-        }                                                                                       // EXPAND_LO (lossy)
+        } // EXPAND_LO (lossy)
         29 => {
             // SQUEEZE: XOR all bytes of (val ^ secondary) → 1 byte, paint across.
             let x = ufa ^ ufb;
             let s = ((x & 0xFF) as u8) ^ ((x >> 8) as u8) ^ uea ^ ueb;
-            (
-                (((s as u16) << 8) | (s as u16)) as i16,
-                s as i8,
-            )
-        }                                                                                       // SQUEEZE (extreme lossy)
+            ((((s as u16) << 8) | (s as u16)) as i16, s as i8)
+        } // SQUEEZE (extreme lossy)
         30 => {
             // ZIP: interleave low bytes of val and secondary at bit granularity.
             let alo = (ufa & 0xFF) as u8;
@@ -224,17 +211,14 @@ fn op_apply(op_idx: u8, val: u32, secondary: u32) -> u32 {
                 z |= (((blo >> i) & 1) as u16) << (2 * i + 1);
             }
             (z as i16, exp_a ^ exp_b)
-        }                                                                                       // ZIP
+        } // ZIP
         31 => {
             // PCNT_REPLACE: low byte = popcount(val), high byte = popcount(secondary), exp = popcount(uea + ueb). Maximally lossy.
             let pa = ufa.count_ones() as u8;
             let pb = ufb.count_ones() as u8;
             let pe = ((uea as u16) + (ueb as u16)).count_ones() as u8;
-            (
-                (((pb as u16) << 8) | pa as u16) as i16,
-                pe as i8,
-            )
-        }                                                                                       // PCNT_REPLACE (extreme lossy)
+            ((((pb as u16) << 8) | pa as u16) as i16, pe as i8)
+        } // PCNT_REPLACE (extreme lossy)
         _ => unreachable!(),
     };
 
@@ -378,8 +362,7 @@ mod tests {
         let mut expected = [0u32; ROUNDS];
         // 16 × u32 = 64 bytes; BLAKE3 default output is 32 bytes (8 u32), so two hashes give us 16.
         for i in 0..8 {
-            expected[i] =
-                u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+            expected[i] = u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
         }
         let h2 = blake3::hash(b"PIPE chaos amp v2 - Dragonfly - more");
         let b2 = h2.as_bytes();

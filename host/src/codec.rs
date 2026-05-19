@@ -62,10 +62,7 @@ mod tests {
     use super::*;
 
     /// Run a bidirectional exchange. Each round = one enclave slot + one host slot. Returns the wire trace and decoded streams from both sides.
-    fn paired_exchange(
-        enc_tx: &[u8],
-        host_tx: &[u8],
-    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn paired_exchange(enc_tx: &[u8], host_tx: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         assert_eq!(enc_tx.len(), host_tx.len());
         let mut enc = Codec::enclave();
         let mut host = Codec::host();
@@ -96,7 +93,10 @@ mod tests {
         let zeros = vec![0u8; 16];
         let (wire, _, _) = paired_exchange(&zeros, &zeros);
         let expected: Vec<u8> = (0..32).map(|i| if i % 2 == 0 { 1 } else { 0 }).collect();
-        assert_eq!(wire, expected, "idle wire should be 1010… by slot ownership");
+        assert_eq!(
+            wire, expected,
+            "idle wire should be 1010… by slot ownership"
+        );
     }
 
     #[test]
@@ -104,7 +104,10 @@ mod tests {
         let zeros = vec![0u8; 16];
         let (_, enc_dec, host_dec) = paired_exchange(&zeros, &zeros);
         assert_eq!(enc_dec, zeros, "enc should decode host's idle as all zeros");
-        assert_eq!(host_dec, zeros, "host should decode enc's idle as all zeros");
+        assert_eq!(
+            host_dec, zeros,
+            "host should decode enc's idle as all zeros"
+        );
     }
 
     #[test]

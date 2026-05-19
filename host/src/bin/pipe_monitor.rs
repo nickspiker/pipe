@@ -1,11 +1,14 @@
 //! Live PIPE wire monitor. Continuously samples the wire and redraws a status panel showing frequency, edge count, current pin state, and capture rate. Refreshes a few times per second; quit with Ctrl-C.
 
-use pipe_host::{cdr, ft232h::{Ft232h, PIPE_ADBUS_BIT}};
+use pipe_host::{
+    cdr,
+    ft232h::{Ft232h, PIPE_ADBUS_BIT},
+};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 const MPSSE_CLOCK_HZ: u32 = 6_000_000;
-const SAMPLES_PER_PASS: usize = 4096;     // ~2.7 ms of capture at within-batch rate
+const SAMPLES_PER_PASS: usize = 4096; // ~2.7 ms of capture at within-batch rate
 const REFRESH_DELAY: Duration = Duration::from_millis(200);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut samples = Vec::with_capacity(SAMPLES_PER_PASS);
         for _ in 0..(SAMPLES_PER_PASS / 256) {
             let chunk = ft.sample_low(256)?;
-            if chunk.is_empty() { break; }
+            if chunk.is_empty() {
+                break;
+            }
             samples.extend_from_slice(&chunk);
         }
         let capture_dt = t0.elapsed();
@@ -32,7 +37,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let n = samples.len();
         let rate_hz = if capture_dt.as_secs_f64() > 0.0 {
             (n as f64 / capture_dt.as_secs_f64()) as u32
-        } else { 0 };
+        } else {
+            0
+        };
 
         let (active_bit, active_edges) = cdr::detect_active_pin(&samples);
         let wire_edges = cdr::count_edges(&samples, PIPE_ADBUS_BIT);
@@ -43,14 +50,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Repaint: home cursor, clear from cursor down, draw panel.
         print!("\x1b[H\x1b[J");
         println!("┌─ PIPE wire monitor ──────────────────────────────────────┐");
-        println!("│ uptime        {:>8.1} s                                  │", started.elapsed().as_secs_f64());
-        println!("│ frame         {:>8}                                      │", frame);
-        println!("│ samples       {:>8} in {:>5.1} ms  ({:.2} Msps)            │", n, capture_dt.as_secs_f64()*1000.0, rate_hz as f64 / 1.0e6);
+        println!(
+            "│ uptime        {:>8.1} s                                  │",
+            started.elapsed().as_secs_f64()
+        );
+        println!(
+            "│ frame         {:>8}                                      │",
+            frame
+        );
+        println!(
+            "│ samples       {:>8} in {:>5.1} ms  ({:.2} Msps)            │",
+            n,
+            capture_dt.as_secs_f64() * 1000.0,
+            rate_hz as f64 / 1.0e6
+        );
         println!("├──────────────────────────────────────────────────────────┤");
-        println!("│ wire ADBUS{}   freq {:>8.0} Hz   edges {:>5}             │", PIPE_ADBUS_BIT, wire_freq, wire_edges);
-        println!("│ pin level     {}                                          │", if bit_now == 1 { "HIGH" } else { "low " });
+        println!(
+            "│ wire ADBUS{}   freq {:>8.0} Hz   edges {:>5}             │",
+            PIPE_ADBUS_BIT, wire_freq, wire_edges
+        );
+        println!(
+            "│ pin level     {}                                          │",
+            if bit_now == 1 { "HIGH" } else { "low " }
+        );
         println!("├──────────────────────────────────────────────────────────┤");
-        println!("│ noisiest pin  ADBUS{}  ({} edges)                         │", active_bit, active_edges);
+        println!(
+            "│ noisiest pin  ADBUS{}  ({} edges)                         │",
+            active_bit, active_edges
+        );
         println!("└──────────────────────────────────────────────────────────┘");
         println!("Ctrl-C to exit.");
         std::io::stdout().flush().ok();

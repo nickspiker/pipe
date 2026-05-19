@@ -63,8 +63,12 @@ hash in blake3_tree_expected.hex. Both must match for PASS.\n\
         writeln!(g, "{:02x}", b)?;
     }
 
-    println!("Generated {} bytes of test input ({} header + {} fill).",
-             buf.len(), n, buf.len() - n);
+    println!(
+        "Generated {} bytes of test input ({} header + {} fill).",
+        buf.len(),
+        n,
+        buf.len() - n
+    );
     println!("Output dir: {}", out_dir.display());
     println!("Expected BLAKE3 hash: {}", hash.to_hex());
 

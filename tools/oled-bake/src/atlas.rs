@@ -33,7 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::create_dir_all(out_dir)?;
     let font_data = fs::read(font_path)?;
-    let font = Font::from_bytes(font_data, FontSettings::default()).map_err(|e| format!("font load: {e}"))?;
+    let font = Font::from_bytes(font_data, FontSettings::default())
+        .map_err(|e| format!("font load: {e}"))?;
 
     // First pass: rasterize every glyph, learn extents.
     let mut rasters = Vec::with_capacity(NUM_CHARS);
@@ -57,7 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tight_h = max_ascent + max_descent;
     let (cell_w, cell_h) = if pow2 {
-        (next_pow2(tight_w as u32) as i32, next_pow2(tight_h as u32) as i32)
+        (
+            next_pow2(tight_w as u32) as i32,
+            next_pow2(tight_h as u32) as i32,
+        )
     } else {
         (tight_w, tight_h)
     };
@@ -119,7 +123,11 @@ fn next_pow2(mut n: u32) -> u32 {
         return 1;
     }
     n -= 1;
-    n |= n >> 1; n |= n >> 2; n |= n >> 4; n |= n >> 8; n |= n >> 16;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
     n + 1
 }
 
@@ -128,7 +136,9 @@ fn write_memh(buf: &[u8], path: &Path) -> std::io::Result<()> {
     for chunk in buf.chunks(16) {
         let mut line = String::new();
         for (i, b) in chunk.iter().enumerate() {
-            if i > 0 { line.push(' '); }
+            if i > 0 {
+                line.push(' ');
+            }
             line.push_str(&format!("{:02x}", b));
         }
         writeln!(f, "{}", line)?;

@@ -132,7 +132,10 @@ mod tests {
             }
         }
 
-        eprintln!("ragu collisions on 1-bit flips: {} / {}", ragu_collisions, TRIALS);
+        eprintln!(
+            "ragu collisions on 1-bit flips: {} / {}",
+            ragu_collisions, TRIALS
+        );
         assert_eq!(
             ragu_collisions, 0,
             "ragu must produce different output for any 1-bit input flip — defense-in-depth pattern broken"

@@ -131,7 +131,10 @@ mod tests {
         let nonce = make_nonce(0xAA);
         let silicon = Silicon::boot(&efuse, &nonce);
         let challenge = [0xC3u8; 64];
-        assert_ne!(silicon.anchor_ragu(&challenge), silicon.session_ragu(&challenge));
+        assert_ne!(
+            silicon.anchor_ragu(&challenge),
+            silicon.session_ragu(&challenge)
+        );
     }
 
     /// Anchor ragu is stable across simulated reboots (same eFuse, any nonce).
