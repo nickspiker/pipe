@@ -28,6 +28,15 @@ static_cell      = "2"
 
 blake3 = { version = "1.5", default-features = false }
 
+# Unified VSF crate (no_std + alloc mode). Bridge cmd/resp packets are complete
+# VSF documents now — encode via vsf::vsf_builder::VsfBuilder, decode via
+# vsf::file_format::VsfHeader::decode + vsf::verification::is_original.
+vsf = { path = "../../../vsf", default-features = false }
+
+# Linked-list-first-fit heap. 32 KB static .bss buffer is plenty for bridge
+# packets (each <1 KB; we never queue more than one in-flight at a time).
+embedded-alloc = "0.5"
+
 [profile.release]
 debug         = true       # keep symbols for defmt RTT logs
 opt-level     = "s"

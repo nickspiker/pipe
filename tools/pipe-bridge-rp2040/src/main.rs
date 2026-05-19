@@ -22,6 +22,12 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::string::ToString;
+use alloc::vec;
+use core::cell::OnceCell;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use defmt::*;
@@ -38,8 +44,30 @@ use embassy_time::Instant;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
+use embedded_alloc::Heap;
+use portable_atomic::{AtomicU64, Ordering as PaOrdering};
 use static_cell::StaticCell;
+use vsf::file_format::VsfHeader;
+use vsf::schema::{bridge_cmd_schema, SectionBuilder};
+use vsf::types::{EtType, VsfType};
+use vsf::verification::is_original;
+use vsf::vsf_builder::VsfBuilder;
 use {defmt_rtt as _, panic_probe as _};
+
+// ---------------------------------------------------------------------------
+// Global heap — 32 KB linked-list-first-fit, initialised at boot.
+//
+// vsf::vsf_builder::VsfBuilder.build() returns Vec<u8>, and VsfHeader::decode
+// allocates Vec<HeaderField>; the unified vsf crate runs no_std + alloc. Bridge
+// packets are <1 KB each and at most one is in flight at a time, so 32 KB leaves
+// ~30× headroom. Static .bss — no runtime growth, no fragmentation risk.
+// ---------------------------------------------------------------------------
+
+const HEAP_SIZE: usize = 32 * 1024;
+static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
 
 /// RP2040-Zero flash size (Boya BY25Q16ES = 2 MiB).
 const FLASH_SIZE: usize = 2 * 1024 * 1024;
@@ -49,7 +77,8 @@ const FLASH_SIZE: usize = 2 * 1024 * 1024;
 const DEVICE_ID_DOMAIN: &str = "ferros bridge rp2040-zero device id v1";
 
 /// Firmware semantic version. Bump on every flash; `info` reports it.
-const FW_VERSION: u64 = 2;
+/// v5: protocol break — every wire packet is now a complete VSF document (magic + header + hp) parseable by `vsfinfo`.
+const FW_VERSION: u64 = 5;
 
 /// Action requested by `dispatch()` that must run *after* the response is on the wire.
 #[derive(Clone, Copy)]
@@ -169,6 +198,9 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    // Heap must come up before anything that allocates (VsfBuilder, etc).
+    unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
+
     let p = embassy_rp::init(Default::default());
     info!("pipe-bridge-rp2040 boot");
 
@@ -312,23 +344,39 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
     _wire: &mut Output<'_>,
     device_id: &'static [u8; 32],
 ) -> Result<(), Disconnected> {
-    // `in_buf` is one CDC packet (host commands are small — current largest is
-    // ~24 bytes). `out_buf` is sized for the biggest response (`info` ≈ 133 B
-    // with the 32-byte device hash) plus headroom for future fields.
-    let mut in_buf = [0u8; 64];
+    // `in_buf` accumulates incoming bytes across multiple CDC packets until we
+    // see `]` (end of cmd section). Host writes hp-validated cmds that are
+    // typically 78-100 bytes — well over the 64-byte CDC packet limit — so a
+    // single-packet read is never enough. `out_buf` is sized for the biggest
+    // response (`info` ≈ 180 B with hp + did) plus headroom.
+    let mut in_buf = [0u8; 256];
     let mut out_buf = [0u8; 256];
     const MAX_PACKET: usize = 64;
+    let mut acc_len = 0usize;
     loop {
-        let n = class.read_packet(&mut in_buf).await?;
+        let n = class.read_packet(&mut in_buf[acc_len..]).await?;
         if n == 0 {
             continue;
         }
+        acc_len += n;
+
+        // Wait until we see the closing `]` of a cmd section — otherwise the
+        // frame is incomplete and parsing would fail. If the buffer fills up
+        // without one, drop everything (malformed frame).
+        if in_buf[acc_len - 1] != b']' {
+            if acc_len == in_buf.len() {
+                acc_len = 0;
+            }
+            continue;
+        }
+        let frame_len = acc_len;
+        acc_len = 0;
 
         // USB activity → core 1 holds LED high during processing
         USB_STATE.store(STATE_TX, Ordering::Relaxed);
         WAKE_SIGNAL.signal(());
 
-        let (resp_len, action) = dispatch(&in_buf[..n], &mut out_buf, device_id);
+        let (resp_len, action) = dispatch(&in_buf[..frame_len], &mut out_buf, device_id);
 
         if resp_len > 0 {
             USB_STATE.store(STATE_RX, Ordering::Relaxed);
@@ -365,6 +413,75 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Eagle Time epoch anchor — synced from the host on first cmd received.
+//
+// Host CLI uses `nunc-time` to source absolute Eagle Time and writes it into
+// every cmd's `creation_time` header field. On the first cmd received the
+// firmware records `(host_et, my_uptime_at_receive)` as the anchor. Subsequent
+// `next_eagle_time()` calls return `host_et + (now - anchor_uptime)` — an
+// absolute Eagle Time value monotonically increasing across responses.
+//
+// `LAST_ET` enforces strict monotonicity: every emitted Eagle Time value is
+// strictly greater than the previous one. Two responses in the same tick get
+// distinct (consecutive) Eagle Time values, satisfying Nick's "add one
+// oscillation" rule for ordering.
+//
+// EPOCH lives in a `static mut OnceCell` (read-mostly, written exactly once on
+// the first cmd) accessed via `&raw const` to avoid the static_mut_refs
+// lint; the bridge handle_frames task is single-threaded on core 0.
+// ---------------------------------------------------------------------------
+
+static mut EPOCH: OnceCell<(u64, u64)> = OnceCell::new();
+static LAST_ET: AtomicU64 = AtomicU64::new(0);
+
+/// Record (host_eagle_time, my_uptime_us_at_receive) from the first cmd
+/// received. Subsequent calls are no-ops.
+fn anchor_epoch_from_cmd(input: &[u8]) {
+    // SAFETY: the bridge runs handle_frames on a single embassy task pinned to core 0; anchor_epoch_from_cmd is only called from there, so we have exclusive access to EPOCH.
+    let epoch_ref = unsafe { &mut *(&raw mut EPOCH) };
+    if epoch_ref.get().is_some() {
+        return;
+    }
+    let (header, _) = match VsfHeader::decode(input) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let host_et = match &header.creation_time {
+        VsfType::e(EtType::e5(v)) => *v as u64,
+        VsfType::e(EtType::e6(v)) => *v as u64,
+        VsfType::e(EtType::e7(v)) => *v as u64,
+        _ => return,
+    };
+    let _ = epoch_ref.set((host_et, Instant::now().as_micros()));
+}
+
+/// Return a strictly-monotonic Eagle Time value for the next outgoing packet.
+/// Returns `0` until the first cmd anchors the epoch.
+fn next_eagle_time() -> u64 {
+    // SAFETY: see `anchor_epoch_from_cmd` — only called from the single bridge task.
+    let epoch_ref = unsafe { &*(&raw const EPOCH) };
+    let candidate = match epoch_ref.get() {
+        Some((host_et, anchor_us)) => {
+            let delta = Instant::now().as_micros().saturating_sub(*anchor_us);
+            host_et.saturating_add(delta)
+        }
+        None => 0,
+    };
+    // Monotonic bump: never emit a value equal to or less than the previous one.
+    // portable_atomic provides AtomicU64 CAS on Cortex-M0+ via critical_section polyfill.
+    loop {
+        let prev = LAST_ET.load(PaOrdering::Relaxed);
+        let next = candidate.max(prev.saturating_add(1));
+        if LAST_ET
+            .compare_exchange_weak(prev, next, PaOrdering::Relaxed, PaOrdering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
 /// Pull `n` bytes (≤32) of BLAKE3-conditioned hardware entropy.
 ///
 /// Gathers 64 raw ROSC bits, runs them through one BLAKE3 invocation, returns
@@ -388,144 +505,126 @@ fn gather_random(out: &mut [u8]) {
     out[..n].copy_from_slice(&digest.as_bytes()[..n]);
 }
 
-/// Parse one VSF "cmd" section from `input`, dispatch, encode response into
-/// `output`. Returns `(response_length, post_action)`; a zero length means the
-/// frame was malformed and is silently dropped (host can retry).
-fn dispatch(
-    input: &[u8],
-    output: &mut [u8],
-    device_id: &[u8; 32],
-) -> (usize, PostAction) {
-    use vsf_mini::{VsfReader, VsfWriter};
+/// Parse one VSF cmd packet from `input` (complete VSF document), dispatch,
+/// encode the response into `output` (also a complete VSF document).
+/// Returns `(response_length, post_action)`; a zero length means the frame
+/// was malformed / hp-invalid / unknown section, in which case the host can
+/// retry.
+fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, PostAction) {
+    // Anchor the host Eagle Time on the first cmd we ever see, regardless of
+    // whether hp later verifies. The header is parsed independently and the
+    // anchor is a one-shot; even a malicious caller can't bump it twice.
+    anchor_epoch_from_cmd(input);
 
-    let mut reader = VsfReader::new(input);
-
-    // Expect '[' section open
-    if reader.read_byte_raw() != Some(b'[') {
+    // hp verification covers the entire VSF document. Standard `is_original`
+    // re-hashes with the hp slot zeroed and compares against the stored hp.
+    if is_original(input).is_err() {
         return (0, PostAction::None);
     }
 
-    // Section name must be "cmd"
-    let section_name = match reader.dict_key_str() {
-        Some(s) => s,
-        None => return (0, PostAction::None),
+    // Locate the "cmd" section in the header TOC, then schema-parse its body.
+    let (header, _) = match VsfHeader::decode(input) {
+        Ok(h) => h,
+        Err(_) => return (0, PostAction::None),
     };
-    if section_name != "cmd" {
+    let field = match header.fields.iter().find(|f| f.name == "cmd") {
+        Some(f) => f,
+        _ => return (0, PostAction::None),
+    };
+    let off = field.offset_bytes;
+    let size = field.size_bytes;
+    if off.checked_add(size).map_or(true, |end| end > input.len()) {
         return (0, PostAction::None);
     }
+    let section_bytes = &input[off..off + size];
+    let cmd = match SectionBuilder::parse(bridge_cmd_schema(), section_bytes) {
+        Ok(c) => c,
+        Err(_) => return (0, PostAction::None),
+    };
 
-    // Walk fields until ']'
-    let mut op_buf = [0u8; 16];
-    let mut op_len = 0usize;
-    let mut id: u64 = 0;
-    // `n` is per-command arg (e.g. random byte count). 0 → use op's default.
-    let mut n_arg: u64 = 0;
-    loop {
-        match reader.peek_tag() {
-            Some(b'(') => {
-                reader.read_byte_raw();
-                let field_name = match reader.dict_key_str() {
-                    Some(s) => s,
-                    None => return (0, PostAction::None),
-                };
-                if reader.read_byte_raw() != Some(b':') {
-                    return (0, PostAction::None);
-                }
-                match field_name {
-                    "op" => {
-                        let bytes = match reader.label() {
-                            Some(b) => b,
-                            None => return (0, PostAction::None),
-                        };
-                        if bytes.len() > op_buf.len() {
-                            return (0, PostAction::None);
-                        }
-                        op_buf[..bytes.len()].copy_from_slice(bytes);
-                        op_len = bytes.len();
-                    }
-                    "id" => {
-                        id = reader.uint().unwrap_or(0);
-                    }
-                    "n" => {
-                        n_arg = reader.uint().unwrap_or(0);
-                    }
-                    _ => {
-                        if !reader.skip_field() {
-                            return (0, PostAction::None);
-                        }
-                    }
-                }
-                if reader.read_byte_raw() != Some(b')') {
-                    return (0, PostAction::None);
-                }
-            }
-            Some(b']') => {
-                reader.read_byte_raw();
-                break;
-            }
-            _ => return (0, PostAction::None),
-        }
-    }
-
-    let op = &op_buf[..op_len];
+    // Schema-validated field reads. Missing field → default (`""` / `0`).
+    let op_str = cmd
+        .get("op")
+        .ok()
+        .and_then(|vs| vs.first())
+        .and_then(|v| match v {
+            VsfType::a(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .unwrap_or("");
+    let id = cmd
+        .get("id")
+        .ok()
+        .and_then(|vs| vs.first())
+        .and_then(|v| match v {
+            VsfType::u(n, _) => Some(*n as u64),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let n_arg = cmd
+        .get("n")
+        .ok()
+        .and_then(|vs| vs.first())
+        .and_then(|v| match v {
+            VsfType::u(n, _) => Some(*n as u64),
+            _ => None,
+        })
+        .unwrap_or(0);
 
     // Action commands send no response — the disconnect is the answer.
-    match op {
-        b"bootsel" => return (0, PostAction::BootSel),
-        b"reset" => return (0, PostAction::Reset),
+    match op_str {
+        "bootsel" => return (0, PostAction::BootSel),
+        "reset" => return (0, PostAction::Reset),
         _ => {}
     }
 
-    // Data commands: build a "resp" section.
-    let mut writer = VsfWriter::new(output);
-    if !writer.section_open("resp") {
-        return (0, PostAction::None);
-    }
-    if !(writer.field_open("id") && writer.uint(id) && writer.field_close()) {
-        return (0, PostAction::None);
-    }
-
+    // Build the resp section: always carries `id`, plus the op-specific fields.
     let up_ms = Instant::now().as_millis();
-    let ok = match op {
-        b"ping" => {
-            writer.field_open("op") && writer.label("pong") && writer.field_close()
+    let mut fields: alloc::vec::Vec<(alloc::string::String, VsfType)> = vec![
+        ("id".to_string(), VsfType::u(id as usize, false)),
+    ];
+    match op_str {
+        "ping" => {
+            fields.push(("op".to_string(), VsfType::a("pong".to_string())));
         }
-        b"info" => {
-            writer.field_open("name")
-                && writer.label("pipe-bridge-rp2040")
-                && writer.field_close()
-                && writer.field_open("ver")
-                && writer.uint(FW_VERSION)
-                && writer.field_close()
-                && writer.field_open("did")
-                && writer.hash_p(device_id)
-                && writer.field_close()
-                && writer.field_open("clk")
-                && writer.uint(embassy_rp::clocks::clk_sys_freq() as u64)
-                && writer.field_close()
-                && writer.field_open("up")
-                && writer.uint(up_ms)
-                && writer.field_close()
+        "info" => {
+            fields.push(("name".to_string(), VsfType::a("pipe-bridge-rp2040".to_string())));
+            fields.push(("ver".to_string(), VsfType::u(FW_VERSION as usize, false)));
+            fields.push(("did".to_string(), VsfType::hp(device_id.to_vec())));
+            fields.push((
+                "clk".to_string(),
+                VsfType::u(embassy_rp::clocks::clk_sys_freq() as usize, false),
+            ));
+            fields.push(("up".to_string(), VsfType::u(up_ms as usize, false)));
         }
-        b"uptime" => {
-            writer.field_open("ms") && writer.uint(up_ms) && writer.field_close()
+        "uptime" => {
+            fields.push(("ms".to_string(), VsfType::u(up_ms as usize, false)));
         }
-        b"random" => {
-            // Default to 32 bytes if no `n` arg; cap at 32 to fit in 64-byte CDC packet
-            // alongside the surrounding section/field framing (~14 bytes overhead).
+        "random" => {
+            // Default to 32 bytes if no `n` arg; cap at 32 (BLAKE3 digest size).
             let count = if n_arg == 0 { 32 } else { n_arg.min(32) } as usize;
             let mut buf = [0u8; 32];
             gather_random(&mut buf[..count]);
-            writer.field_open("data") && writer.blob(&buf[..count]) && writer.field_close()
+            fields.push(("data".to_string(), VsfType::v(b'b', buf[..count].to_vec())));
         }
-        _ => writer.field_open("err") && writer.label("unknown_op") && writer.field_close(),
-    };
-    if !ok {
-        return (0, PostAction::None);
+        _ => {
+            fields.push(("err".to_string(), VsfType::a("unknown_op".to_string())));
+        }
     }
 
-    if !writer.section_close() {
+    let doc = VsfBuilder::new()
+        .version(7, 7)
+        .creation_time_oscillations(next_eagle_time() as i64)
+        .provenance_only()
+        .add_section("resp", fields)
+        .build();
+    let bytes = match doc {
+        Ok(b) => b,
+        Err(_) => return (0, PostAction::None),
+    };
+    if bytes.len() > output.len() {
         return (0, PostAction::None);
     }
-    (writer.pos(), PostAction::None)
+    output[..bytes.len()].copy_from_slice(&bytes);
+    (bytes.len(), PostAction::None)
 }
