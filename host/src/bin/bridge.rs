@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use vsf::file_format::VsfHeader;
-use vsf::schema::{bridge_cmd_schema, bridge_resp_schema, SectionBuilder};
+use vsf::schema::{pipe_message_schema, SectionBuilder};
 use vsf::types::VsfType;
 use vsf::verification::is_original;
 use vsf::vsf_builder::VsfBuilder;
@@ -137,7 +137,7 @@ fn build_cmd_doc(
         .version(7, 7)
         .creation_time_oscillations(now_eagle_oscillations())
         .provenance_only()
-        .add_section("cmd", fields)
+        .add_section("PIPE message", fields)
         .build()
 }
 
@@ -218,13 +218,13 @@ fn parse_resp(bytes: &[u8]) -> Result<SectionBuilder, String> {
     let field = header
         .fields
         .iter()
-        .find(|f| f.name == "resp")
-        .ok_or_else(|| "response missing 'resp' section".to_string())?;
+        .find(|f| f.name == "PIPE message")
+        .ok_or_else(|| "response missing 'PIPE message' section".to_string())?;
     let end = field.offset_bytes + field.size_bytes;
     if end > bytes.len() {
         return Err("section bounds out of range".into());
     }
-    SectionBuilder::parse(bridge_resp_schema(), &bytes[field.offset_bytes..end])
+    SectionBuilder::parse(pipe_message_schema(), &bytes[field.offset_bytes..end])
         .map_err(|e| format!("resp schema validation: {e}"))
 }
 

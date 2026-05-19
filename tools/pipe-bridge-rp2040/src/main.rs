@@ -48,7 +48,7 @@ use embedded_alloc::Heap;
 use portable_atomic::{AtomicU64, Ordering as PaOrdering};
 use static_cell::StaticCell;
 use vsf::file_format::VsfHeader;
-use vsf::schema::{bridge_cmd_schema, SectionBuilder};
+use vsf::schema::{pipe_message_schema, SectionBuilder};
 use vsf::types::{EtType, VsfType, OSCILLATIONS_PER_SECOND};
 use vsf::verification::is_original;
 use vsf::vsf_builder::VsfBuilder;
@@ -323,9 +323,10 @@ impl From<EndpointError> for Disconnected {
 /// Phase 2 loop: parse VSF commands from USB, dispatch, respond with VSF.
 ///
 /// Wire format (each packet = one frame, fits in 64-byte CDC packet for now):
-///   request:   [d"cmd"(d"op":l"<name>")(d"id":u<n>)...optional args...]
-///   response:  [d"resp"(d"id":u<n>)(d"op":l"<reply>")...optional fields...]
-///   error:     [d"resp"(d"id":u<n>)(d"err":l"<reason>")]
+///   Every packet is a complete VSF document with one section named "PIPE message".
+///   Body shape: [(d"op":a"<name>")(d"id":u<n>)(...optional fields...)]
+///   The section name lives in the header TOC entry only; body is just fields.
+///   Direction (cmd vs resp) is implicit from USB transfer direction.
 ///
 /// Supported ops (Tier 1):
 ///   "ping"    → "pong"
@@ -530,12 +531,12 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         return (0, PostAction::None);
     }
 
-    // Locate the "cmd" section in the header TOC, then schema-parse its body.
+    // Locate the "PIPE message" section in the header TOC, then schema-parse its body.
     let (header, _) = match VsfHeader::decode(input) {
         Ok(h) => h,
         Err(_) => return (0, PostAction::None),
     };
-    let field = match header.fields.iter().find(|f| f.name == "cmd") {
+    let field = match header.fields.iter().find(|f| f.name == "PIPE message") {
         Some(f) => f,
         _ => return (0, PostAction::None),
     };
@@ -545,7 +546,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         return (0, PostAction::None);
     }
     let section_bytes = &input[off..off + size];
-    let cmd = match SectionBuilder::parse(bridge_cmd_schema(), section_bytes) {
+    let cmd = match SectionBuilder::parse(pipe_message_schema(), section_bytes) {
         Ok(c) => c,
         Err(_) => return (0, PostAction::None),
     };
@@ -618,7 +619,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         .version(7, 7)
         .creation_time_oscillations(next_eagle_time() as i64)
         .provenance_only()
-        .add_section("resp", fields)
+        .add_section("PIPE message", fields)
         .build();
     let bytes = match doc {
         Ok(b) => b,
