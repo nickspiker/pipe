@@ -49,7 +49,7 @@ use portable_atomic::{AtomicU64, Ordering as PaOrdering};
 use static_cell::StaticCell;
 use vsf::file_format::VsfHeader;
 use vsf::schema::{bridge_cmd_schema, SectionBuilder};
-use vsf::types::{EtType, VsfType};
+use vsf::types::{EtType, VsfType, OSCILLATIONS_PER_SECOND};
 use vsf::verification::is_original;
 use vsf::vsf_builder::VsfBuilder;
 use {defmt_rtt as _, panic_probe as _};
@@ -463,8 +463,15 @@ fn next_eagle_time() -> u64 {
     let epoch_ref = unsafe { &*(&raw const EPOCH) };
     let candidate = match epoch_ref.get() {
         Some((host_et, anchor_us)) => {
-            let delta = Instant::now().as_micros().saturating_sub(*anchor_us);
-            host_et.saturating_add(delta)
+            // host_et is in 21cm oscillations (~1.42 GHz); `Instant::as_micros()` is in microseconds.
+            // Split-multiply by OSCILLATIONS_PER_SECOND so `secs * OPS` only overflows past ~400 years of uptime.
+            let delta_us = Instant::now().as_micros().saturating_sub(*anchor_us);
+            let delta_secs = delta_us / 1_000_000;
+            let delta_sub_us = delta_us % 1_000_000;
+            let delta_oscillations = delta_secs
+                .saturating_mul(OSCILLATIONS_PER_SECOND)
+                .saturating_add(delta_sub_us * OSCILLATIONS_PER_SECOND / 1_000_000);
+            host_et.saturating_add(delta_oscillations)
         }
         None => 0,
     };
@@ -556,19 +563,13 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         .get("id")
         .ok()
         .and_then(|vs| vs.first())
-        .and_then(|v| match v {
-            VsfType::u(n, _) => Some(*n as u64),
-            _ => None,
-        })
+        .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let n_arg = cmd
         .get("n")
         .ok()
         .and_then(|vs| vs.first())
-        .and_then(|v| match v {
-            VsfType::u(n, _) => Some(*n as u64),
-            _ => None,
-        })
+        .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
     // Action commands send no response — the disconnect is the answer.

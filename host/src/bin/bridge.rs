@@ -35,6 +35,10 @@ const DEFAULT_PORT: &str = "/dev/ttyACM0";
 /// Global `--inspect` flag — set once during arg parsing, read by send_cmd to optionally pretty-print every request and response.
 static INSPECT: AtomicBool = AtomicBool::new(false);
 
+/// Global `--save <prefix>` — set once during arg parsing; if non-empty, send_cmd writes raw request to `{prefix}_req.vsf` and raw response to `{prefix}_resp.vsf`.
+/// Useful for running `vsfinfo <path> verify` against the captured wire bytes.
+static SAVE_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut port_path = DEFAULT_PORT.to_string();
@@ -52,6 +56,16 @@ fn main() -> ExitCode {
         if args[i] == "--inspect" {
             INSPECT.store(true, Ordering::Relaxed);
             args.remove(i);
+            continue;
+        }
+        if args[i] == "--save" {
+            if i + 1 >= args.len() {
+                eprintln!("error: --save requires a prefix argument");
+                return ExitCode::from(2);
+            }
+            let prefix = args.remove(i + 1);
+            args.remove(i);
+            let _ = SAVE_PREFIX.set(prefix);
             continue;
         }
         i += 1;
@@ -146,6 +160,12 @@ fn send_cmd(
         }
     }
 
+    if let Some(prefix) = SAVE_PREFIX.get() {
+        let p = format!("{prefix}_req.vsf");
+        std::fs::write(&p, &req).map_err(|e| format!("save {p}: {e}"))?;
+        println!("(saved request → {p})");
+    }
+
     let t0 = Instant::now();
     port.write_all(&req).map_err(|e| format!("write: {e}"))?;
 
@@ -180,6 +200,14 @@ fn send_cmd(
         }
     }
 
+    if !resp.is_empty() {
+        if let Some(prefix) = SAVE_PREFIX.get() {
+            let p = format!("{prefix}_resp.vsf");
+            std::fs::write(&p, &resp).map_err(|e| format!("save {p}: {e}"))?;
+            println!("(saved response → {p})");
+        }
+    }
+
     Ok((resp, elapsed))
 }
 
@@ -201,11 +229,9 @@ fn parse_resp(bytes: &[u8]) -> Result<SectionBuilder, String> {
 }
 
 /// Pull a `u64` from a resp field, returning `None` if absent or wrong type.
+/// Uses VsfType::as_u64 so it accepts the full set of unsigned variants (u/u0/u3/u4/u5/u6).
 fn resp_u64(resp: &SectionBuilder, name: &str) -> Option<u64> {
-    resp.get(name).ok()?.first().and_then(|v| match v {
-        VsfType::u(n, _) => Some(*n as u64),
-        _ => None,
-    })
+    resp.get(name).ok()?.first().and_then(|v| v.as_u64())
 }
 
 /// Pull an `&str` from a resp ASCII field, returning `None` if absent or wrong type.
