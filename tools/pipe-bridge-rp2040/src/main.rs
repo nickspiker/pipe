@@ -222,11 +222,20 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
         core::cmp::max(s.leading_ones(), s.leading_zeros()) as u64
     }
 
+    /// AND `ands` LFSR readings into a single u32. Early-exits as soon as the
+    /// accumulator collapses to 0 — at AND_n=12 the chunk reaches 0 around
+    /// iteration 6-7 on average (P(zero by step k) = (1 - 1/2^k)^32), so the
+    /// 99% "chunk is zero" path now does ~6 LFSR steps instead of 12. The
+    /// answer is already determined the moment chunk hits 0; the remaining
+    /// steps were busy-work.
     fn and_chunk(state: &mut u32, ands: u32) -> u32 {
         let mut chunk: u32 = u32::MAX;
         for _ in 0..ands {
             lfsr_step(state);
             chunk &= *state;
+            if chunk == 0 {
+                return 0;
+            }
         }
         chunk
     }
@@ -238,7 +247,7 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
             if chunk != 0 {
                 return total_zeros + chunk.leading_zeros() as u64;
             }
-            // All zero this chunk — contributes 32 leading zeros, take another.
+            // Zero chunk — contributes 32 leading zeros, load another batch.
             total_zeros += 32;
         }
     }
