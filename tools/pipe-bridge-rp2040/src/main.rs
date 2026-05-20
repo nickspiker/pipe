@@ -229,8 +229,10 @@ const STATS_MAX_SAMPLES: u32 = 1 << 22;
 const SYNC_ACQ_EDGES: u32 = 256;
 /// Fractional bits below the integer slot_cycles value. Each ±1 step on `interval` slews slot_cycles by 1/2^FRAC of a slot. Tune to trade P-gain for noise immunity: 11 = slot/2048 per edge (default), bigger = quieter/slower, smaller = faster/jitterier.
 const SYNC_FRAC_BITS: u32 = 11;
-/// Hard cap on inner-loop iterations to bound wall time even if the wire is dead. At ~24 MS/s ≈ 42 ns/iter, 2^22 ≈ 175 ms.
-const SYNC_MAX_ITERATIONS: u32 = 1 << 22;
+/// Hard cap on inner-loop iterations to bound wall time even if the wire is dead. At ~290 ns/iter, 2^26 ≈ 19 s — long enough for warmup + measurement at typical edge rates.
+const SYNC_MAX_ITERATIONS: u32 = 1 << 26;
+/// Default warmup budget — lets the bang-bang integrator slew from acquisition seed to steady state before we start binning. Convergence cost at FRAC_BITS = 11: each integer-iter slot shift needs 2048 same-sign slews; with ~4 k edges/sec on the current wire, ~5 s settles a 10-iter offset. Caller can override the split via the wire_sync param.
+const SYNC_WARMUP_DEFAULT: u32 = 1 << 24;
 /// Per-polarity histogram bin count for signed phase_err. Centered on zero, covers ±SYNC_HIST_HALF_RANGE iter at 1-iter resolution. Edges beyond go to per-polarity overflow counters.
 const SYNC_HIST_BINS: usize = 256;
 const SYNC_HIST_HALF_RANGE: i32 = (SYNC_HIST_BINS as i32) / 2; // = 128, range is [-128, +127]
@@ -244,8 +246,16 @@ struct SyncResult {
     status: u32,
     /// Initial mean inter-edge interval after acquisition (raw iter, not fixed-point).
     acquisition_slot_cycles: u32,
+    /// `interval` value (fp) at the warmup → measurement boundary.
+    interval_fp_after_warmup: u32,
     /// Final `interval` value (fixed-point, SYNC_FRAC_BITS frac bits). Integer slot_cycles = final_interval_fp >> SYNC_FRAC_BITS.
     final_interval_fp: u32,
+    /// Iterations spent in warmup vs measurement (acquisition is part of warmup).
+    warmup_iter_count: u32,
+    measurement_iter_count: u32,
+    /// Edge counts during warmup phase (not binned).
+    warmup_rising: u32,
+    warmup_falling: u32,
     /// Per-polarity tracking edge counts (no rejection — every edge counts).
     rising_total: u32,
     falling_total: u32,
@@ -269,7 +279,12 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     total_iterations: 0,
     status: 0,
     acquisition_slot_cycles: 0,
+    interval_fp_after_warmup: 0,
     final_interval_fp: 0,
+    warmup_iter_count: 0,
+    measurement_iter_count: 0,
+    warmup_rising: 0,
+    warmup_falling: 0,
     rising_total: 0,
     falling_total: 0,
     rising_neg_overflow: 0,
@@ -283,7 +298,10 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     falling_hist: [0; SYNC_HIST_BINS],
 };
 
+/// Warmup-iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
 static SYNC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Measurement-iter budget for the same run (set before SYNC_REQUEST goes non-zero).
+static SYNC_MEASURE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 /// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs. Inlined here to keep the firmware crate self-contained for now; once the codec is stable we'll lift it into a shared `pipe_codec` crate that both host and firmware import. Not currently used in the runtime — the slot loop was nuked along with the hardcoded SLOT_US, and the next iteration will plug Codec back in driven by wire_sync's locked slot_cycles.
@@ -570,8 +588,10 @@ fn fast_stats(samples: u32) -> WireStats {
 }
 
 /// CDR sync loop. Caller MUST run inside `cortex_m::interrupt::free` — the per-iteration↔wall-time mapping requires no IRQ preemption. `max_iter` caps wall time even if the wire is silent.
-fn fast_sync(max_iter: u32) -> SyncResult {
-    let max_iter = max_iter.min(SYNC_MAX_ITERATIONS);
+fn fast_sync(warmup_iter: u32, measurement_iter: u32) -> SyncResult {
+    let warmup_iter = warmup_iter.min(SYNC_MAX_ITERATIONS);
+    let measurement_iter = measurement_iter.min(SYNC_MAX_ITERATIONS - warmup_iter);
+    let max_iter = warmup_iter + measurement_iter;
     let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
     let start = embassy_time::Instant::now();
 
@@ -579,6 +599,9 @@ fn fast_sync(max_iter: u32) -> SyncResult {
     let mut iter: u32 = 1;
     let mut edge_count: u32 = 0;
     let mut any_anchored: bool = false;
+    let mut interval_fp_after_warmup: u32 = 0;
+    let mut warmup_rising: u32 = 0;
+    let mut warmup_falling: u32 = 0;
 
     // Acquisition (mixed-polarity sum of inter-edge intervals, mean = 1 slot in idle).
     let mut iter_since_any_edge: u32 = 0;
@@ -676,42 +699,60 @@ fn fast_sync(max_iter: u32) -> SyncResult {
                 } else if phase_err < 0 {
                     interval_fp = interval_fp.wrapping_sub(1);
                 }
-                phase_sum += phase_err as i64;
 
-                // Bin phase_err into per-polarity histogram (±HALF_RANGE iter, 1-iter resolution).
-                let bin_signed = phase_err + SYNC_HIST_HALF_RANGE;
-                if bin_signed >= 0 && bin_signed < SYNC_HIST_BINS as i32 {
+                let in_warmup = iter <= warmup_iter;
+                if in_warmup {
+                    // Spin up the lock — slew interval_fp but don't pollute the histogram or the offset/phase sums with transient pre-convergence data.
                     if rising {
-                        rising_hist[bin_signed as usize] = rising_hist[bin_signed as usize].saturating_add(1);
+                        warmup_rising += 1;
+                        iter_since_rise = 0;
                     } else {
-                        falling_hist[bin_signed as usize] = falling_hist[bin_signed as usize].saturating_add(1);
+                        warmup_falling += 1;
+                        iter_since_fall = 0;
                     }
-                } else if phase_err < 0 {
-                    if rising { rising_neg_overflow += 1 } else { falling_neg_overflow += 1 };
                 } else {
-                    if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
+                    phase_sum += phase_err as i64;
+
+                    // Bin phase_err into per-polarity histogram (±HALF_RANGE iter, 1-iter resolution).
+                    let bin_signed = phase_err + SYNC_HIST_HALF_RANGE;
+                    if bin_signed >= 0 && bin_signed < SYNC_HIST_BINS as i32 {
+                        if rising {
+                            rising_hist[bin_signed as usize] = rising_hist[bin_signed as usize].saturating_add(1);
+                        } else {
+                            falling_hist[bin_signed as usize] = falling_hist[bin_signed as usize].saturating_add(1);
+                        }
+                    } else if phase_err < 0 {
+                        if rising { rising_neg_overflow += 1 } else { falling_neg_overflow += 1 };
+                    } else {
+                        if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
+                    }
+
+                    // RC offset using the OTHER polarity's counter (folded against slot).
+                    let other_iter = if rising { iter_since_fall as i32 } else { iter_since_rise as i32 };
+                    let other_anchored = if rising { fall_anchored } else { rise_anchored };
+                    if other_anchored {
+                        let mut o_n = (other_iter + half_slot) / slot;
+                        if o_n == 0 { o_n = 1; }
+                        let o_residual = other_iter - o_n * slot;
+                        if rising {
+                            fall_to_rise_offset_sum += o_residual as i64;
+                        } else {
+                            rise_to_fall_offset_sum += o_residual as i64;
+                        }
+                    }
+
+                    if rising {
+                        rising_total += 1;
+                        iter_since_rise = 0;
+                    } else {
+                        falling_total += 1;
+                        iter_since_fall = 0;
+                    }
                 }
 
-                // RC offset using the OTHER polarity's counter (folded against slot).
-                let other_iter = if rising { iter_since_fall as i32 } else { iter_since_rise as i32 };
-                let other_anchored = if rising { fall_anchored } else { rise_anchored };
-                if other_anchored {
-                    let mut o_n = (other_iter + half_slot) / slot;
-                    if o_n == 0 { o_n = 1; }
-                    let o_residual = other_iter - o_n * slot;
-                    if rising {
-                        fall_to_rise_offset_sum += o_residual as i64;
-                    } else {
-                        rise_to_fall_offset_sum += o_residual as i64;
-                    }
-                }
-
-                if rising {
-                    rising_total += 1;
-                    iter_since_rise = 0;
-                } else {
-                    falling_total += 1;
-                    iter_since_fall = 0;
+                // Snapshot interval_fp at the warmup → measurement transition (catches it on the next edge after iter crosses warmup_iter, which is close enough — we're not looking for cycle-perfect timing of the snapshot).
+                if interval_fp_after_warmup == 0 && !in_warmup {
+                    interval_fp_after_warmup = interval_fp;
                 }
             }
         }
@@ -730,12 +771,23 @@ fn fast_sync(max_iter: u32) -> SyncResult {
         interval_fp = acquisition_slot_cycles << SYNC_FRAC_BITS;
     }
 
+    if interval_fp_after_warmup == 0 {
+        interval_fp_after_warmup = interval_fp;
+    }
+    let warmup_actual = iter.min(warmup_iter);
+    let measurement_actual = iter.saturating_sub(warmup_iter);
+
     SyncResult {
         elapsed_us: start.elapsed().as_micros() as u32,
         total_iterations: iter,
         status,
         acquisition_slot_cycles,
+        interval_fp_after_warmup,
         final_interval_fp: interval_fp,
+        warmup_iter_count: warmup_actual,
+        measurement_iter_count: measurement_actual,
+        warmup_rising,
+        warmup_falling,
         rising_total,
         falling_total,
         rising_neg_overflow,
@@ -796,7 +848,8 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
 
         let sync_req = SYNC_REQUEST.load(PaOrdering::Acquire);
         if sync_req != 0 {
-            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req));
+            let measure_req = SYNC_MEASURE_REQUEST.load(PaOrdering::Relaxed);
+            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, measure_req));
             let iters = result.total_iterations.max(1);
             unsafe {
                 SYNC_RESULT = result;
@@ -1488,7 +1541,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
         }
         "wire_sync" => {
-            // Input: bytes 0..4 = max_iter (u32 LE). Default = SYNC_MAX_ITERATIONS.
+            // Input: bytes 0..4 = warmup_iter (u32 LE), bytes 4..8 = measurement_iter (u32 LE). Either missing → default split (warmup = SYNC_WARMUP_DEFAULT, measurement = SYNC_WARMUP_DEFAULT/4).
             let data_in = cmd
                 .get("data")
                 .ok()
@@ -1498,17 +1551,25 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                     _ => None,
                 })
                 .unwrap_or_default();
-            let max_iter = if data_in.len() >= 4 {
-                u32::from_le_bytes([data_in[0], data_in[1], data_in[2], data_in[3]])
+            let (warmup_iter, measurement_iter) = if data_in.len() >= 8 {
+                (
+                    u32::from_le_bytes([data_in[0], data_in[1], data_in[2], data_in[3]]),
+                    u32::from_le_bytes([data_in[4], data_in[5], data_in[6], data_in[7]]),
+                )
             } else {
-                SYNC_MAX_ITERATIONS
+                (SYNC_WARMUP_DEFAULT, SYNC_WARMUP_DEFAULT / 4)
             };
-            let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_EDGES * 8);
+            let warmup_iter = warmup_iter.min(SYNC_MAX_ITERATIONS - SYNC_ACQ_EDGES * 8);
+            let measurement_iter = measurement_iter
+                .min(SYNC_MAX_ITERATIONS - warmup_iter)
+                .max(SYNC_ACQ_EDGES * 8);
 
             SYNC_RESPONSE.store(0, PaOrdering::Relaxed);
-            SYNC_REQUEST.store(max_iter, PaOrdering::Release);
+            SYNC_MEASURE_REQUEST.store(measurement_iter, PaOrdering::Relaxed);
+            SYNC_REQUEST.store(warmup_iter, PaOrdering::Release);
 
-            let deadline = Instant::now() + embassy_time::Duration::from_secs(2);
+            // Worst case at SYNC_MAX_ITERATIONS = 2^26 × 290 ns ≈ 19 s; 25 s deadline gives margin. USB CDC stays up on core 0 during this because interrupt::free on core 1 doesn't gate core 0's IRQs.
+            let deadline = Instant::now() + embassy_time::Duration::from_secs(25);
             while SYNC_RESPONSE.load(PaOrdering::Acquire) == 0 {
                 if Instant::now() > deadline {
                     break;
@@ -1520,22 +1581,24 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 fields.push(("err".to_string(), VsfType::a("sync_timeout".to_string())));
             } else {
                 let s = unsafe { SYNC_RESULT };
-                // Layout (all LE), 1092 bytes (11 × u32 + 3 × i64 + 2 × 256 × u16 hists + bin-count header u32):
-                //   u32 elapsed_us, total_iterations, status, frac_bits, acquisition_slot_cycles, final_interval_fp,
-                //   u32 rising_total, falling_total,
-                //   u32 rising_neg_overflow, rising_pos_overflow, falling_neg_overflow, falling_pos_overflow,
-                //   u32 hist_bins, hist_half_range,
-                //   i64 phase_sum, fall_to_rise_offset_sum, rise_to_fall_offset_sum,
-                //   u16[hist_bins] rising_hist, u16[hist_bins] falling_hist
+                // Layout (all LE): 19 × u32 + 3 × i64 + 2 × SYNC_HIST_BINS × u16.
+                //   u32: elapsed_us, total_iterations, status, frac_bits, acquisition_slot_cycles, interval_fp_after_warmup, final_interval_fp, warmup_iter_count, measurement_iter_count, warmup_rising, warmup_falling, rising_total, falling_total, rising_neg_overflow, rising_pos_overflow, falling_neg_overflow, falling_pos_overflow, hist_bins, hist_half_range
+                //   i64: phase_sum, fall_to_rise_offset_sum, rise_to_fall_offset_sum
+                //   u16[]: rising_hist[hist_bins], falling_hist[hist_bins]
                 let hist_bytes = SYNC_HIST_BINS * 2;
-                let cap = 14 * 4 + 3 * 8 + 2 * hist_bytes;
+                let cap = 19 * 4 + 3 * 8 + 2 * hist_bytes;
                 let mut payload = alloc::vec::Vec::with_capacity(cap);
                 payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
                 payload.extend_from_slice(&s.total_iterations.to_le_bytes());
                 payload.extend_from_slice(&s.status.to_le_bytes());
                 payload.extend_from_slice(&SYNC_FRAC_BITS.to_le_bytes());
                 payload.extend_from_slice(&s.acquisition_slot_cycles.to_le_bytes());
+                payload.extend_from_slice(&s.interval_fp_after_warmup.to_le_bytes());
                 payload.extend_from_slice(&s.final_interval_fp.to_le_bytes());
+                payload.extend_from_slice(&s.warmup_iter_count.to_le_bytes());
+                payload.extend_from_slice(&s.measurement_iter_count.to_le_bytes());
+                payload.extend_from_slice(&s.warmup_rising.to_le_bytes());
+                payload.extend_from_slice(&s.warmup_falling.to_le_bytes());
                 payload.extend_from_slice(&s.rising_total.to_le_bytes());
                 payload.extend_from_slice(&s.falling_total.to_le_bytes());
                 payload.extend_from_slice(&s.rising_neg_overflow.to_le_bytes());

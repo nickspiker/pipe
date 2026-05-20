@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [WARMUP_ITER [MEASURE_ITER]]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -122,8 +122,9 @@ fn main() -> ExitCode {
 type Port = Box<dyn serialport::SerialPort>;
 
 fn open_port(path: &str) -> Result<Port, String> {
+    // 30s read timeout — wire_sync can spin for >20s during the warmup+measurement budget while core 1 holds interrupt::free; other commands respond quickly and won't notice.
     serialport::new(path, 115_200)
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(30))
         .open()
         .map_err(|e| format!("opening {path}: {e}"))
 }
@@ -669,18 +670,27 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `wire_sync [MAX_ITER]` — runs the bang-bang CDR loop on the bridge: 256-edge mixed-polarity acquisition seeds a fixed-point `interval`, then per-edge mod-fold + ±1 slew tracks the slot rate. Reports the locked period plus per-polarity (rising / falling) phase offsets so the RC asymmetry is visible.
+/// `wire_sync [WARMUP_ITER [MEASURE_ITER]]` — runs the bang-bang CDR loop on the bridge: 256-edge acquisition seeds a fixed-point `interval`, a warmup phase slews the lock to steady state (no binning), then a measurement phase records the per-polarity phase_err histogram on the converged lock.
 fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
-    const SYNC_MAX_ITER: u32 = 1 << 22;
-    let max_iter: u32 = args
+    const SYNC_MAX_ITER: u32 = 1 << 26;
+    const SYNC_WARMUP_DEFAULT: u32 = 1 << 24;
+    const SYNC_MEASURE_DEFAULT: u32 = 1 << 22;
+    let warmup_iter: u32 = args
         .first()
-        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad WARMUP_ITER: {e}")))
         .transpose()?
-        .unwrap_or(SYNC_MAX_ITER)
+        .unwrap_or(SYNC_WARMUP_DEFAULT)
         .clamp(2048, SYNC_MAX_ITER);
+    let measure_iter: u32 = args
+        .get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MEASURE_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(SYNC_MEASURE_DEFAULT)
+        .clamp(2048, SYNC_MAX_ITER - warmup_iter);
 
-    let mut params = Vec::with_capacity(4);
-    params.extend_from_slice(&max_iter.to_le_bytes());
+    let mut params = Vec::with_capacity(8);
+    params.extend_from_slice(&warmup_iter.to_le_bytes());
+    params.extend_from_slice(&measure_iter.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -701,9 +711,9 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
             _ => None,
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
-    // Scalar header is 14 × u32 + 3 × i64 = 80 bytes; then 2 × hist_bins × u16.
-    if data.len() < 80 {
-        return Err(format!("sync response too short: {} bytes (want >= 80 scalar header)", data.len()));
+    // Scalar header is 19 × u32 + 3 × i64 = 100 bytes; then 2 × hist_bins × u16.
+    if data.len() < 100 {
+        return Err(format!("sync response too short: {} bytes (want >= 100 scalar header)", data.len()));
     }
     let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
     let gi64 = |off: usize| i64::from_le_bytes([
@@ -717,20 +727,25 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     let status = g32(8);
     let frac_bits = g32(12);
     let acq_slot = g32(16);
-    let final_interval_fp = g32(20);
-    let rising_total = g32(24);
-    let falling_total = g32(28);
-    let rising_neg_overflow = g32(32);
-    let rising_pos_overflow = g32(36);
-    let falling_neg_overflow = g32(40);
-    let falling_pos_overflow = g32(44);
-    let hist_bins = g32(48) as usize;
-    let hist_half_range = g32(52) as i32;
-    let phase_sum = gi64(56);
-    let fall_to_rise_offset_sum = gi64(64);
-    let rise_to_fall_offset_sum = gi64(72);
+    let interval_fp_after_warmup = g32(20);
+    let final_interval_fp = g32(24);
+    let warmup_iter_count = g32(28);
+    let measurement_iter_count = g32(32);
+    let warmup_rising = g32(36);
+    let warmup_falling = g32(40);
+    let rising_total = g32(44);
+    let falling_total = g32(48);
+    let rising_neg_overflow = g32(52);
+    let rising_pos_overflow = g32(56);
+    let falling_neg_overflow = g32(60);
+    let falling_pos_overflow = g32(64);
+    let hist_bins = g32(68) as usize;
+    let hist_half_range = g32(72) as i32;
+    let phase_sum = gi64(76);
+    let fall_to_rise_offset_sum = gi64(84);
+    let rise_to_fall_offset_sum = gi64(92);
 
-    let hist_off = 80;
+    let hist_off = 100;
     let hist_bytes = hist_bins * 2;
     if data.len() < hist_off + 2 * hist_bytes {
         return Err(format!(
@@ -772,36 +787,40 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
 
     let slot_ns_acq = acq_slot as f64 * ns_per_iter;
     let slot_hz_acq = if slot_ns_acq > 0.0 { 1e9 / slot_ns_acq } else { 0.0 };
+    let warmup_slot_iter = fp_to_iter(interval_fp_after_warmup);
     let final_slot_iter = fp_to_iter(final_interval_fp);
     let final_slot_ns = final_slot_iter * ns_per_iter;
-    let slot_drift_iter = final_slot_iter - acq_slot as f64;
-    let slot_drift_ppm = if acq_slot > 0 {
-        slot_drift_iter * 1_000_000.0 / acq_slot as f64
-    } else {
-        0.0
-    };
+    let slot_drift_warmup = warmup_slot_iter - acq_slot as f64;
+    let slot_drift_measure = final_slot_iter - warmup_slot_iter;
 
     println!();
-    println!("  acquisition (256 mixed-polarity edges):");
-    println!("    slot_cycles: {} iter = {:.3} µs/slot ({:.1} Hz)", acq_slot, slot_ns_acq / 1000.0, slot_hz_acq);
+    println!("  acquisition: slot_cycles {} iter = {:.3} µs/slot ({:.1} Hz)",
+        acq_slot, slot_ns_acq / 1000.0, slot_hz_acq);
+    println!("  warmup:      {} iter ({:.3} ms), {} edges ({} rising + {} falling) — slewed to {:.4} iter (Δ {:+.4} from acquisition)",
+        warmup_iter_count,
+        warmup_iter_count as f64 * ns_per_iter / 1_000_000.0,
+        warmup_rising + warmup_falling, warmup_rising, warmup_falling,
+        warmup_slot_iter, slot_drift_warmup,
+    );
 
     let total_edges = rising_total + falling_total;
     let total_ov = rising_neg_overflow + rising_pos_overflow + falling_neg_overflow + falling_pos_overflow;
 
-    println!();
-    println!("  tracking edges: {} total ({} rising + {} falling); {} hist overflow",
+    println!("  measurement: {} iter ({:.3} ms), {} edges ({} rising + {} falling); {} hist overflow",
+        measurement_iter_count,
+        measurement_iter_count as f64 * ns_per_iter / 1_000_000.0,
         total_edges, rising_total, falling_total, total_ov,
     );
 
     if total_edges == 0 {
-        println!("  no tracking edges — increase MAX_ITER or check wire");
+        println!("  no measurement edges — increase MEASURE_ITER or check wire");
         return Ok(());
     }
 
     println!();
-    println!("  final interval (fp): {} = {:.4} iter = {:.3} µs/slot   drift {:+.4} iter ({:+.1} ppm)",
+    println!("  final interval (fp): {} = {:.4} iter = {:.3} µs/slot   measure-phase Δ {:+.4} iter",
         final_interval_fp, final_slot_iter, final_slot_ns / 1000.0,
-        slot_drift_iter, slot_drift_ppm,
+        slot_drift_measure,
     );
 
     let phase_mean = phase_sum as f64 / total_edges as f64;
