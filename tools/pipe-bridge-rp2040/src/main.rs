@@ -163,8 +163,6 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
     use blake3::Hasher;
     use embassy_rp::pac;
 
-    const ON_THRESHOLD: u32 = 11 << 17;
-    const OFF_THRESHOLD: u32 = 7 << 22;
     const GALOIS_TAPS: u32 = 0x80200003; // x^32 + x^22 + x^2 + x + 1
 
     // Boot-time seed: 32 raw ROSC bits → BLAKE3 → first 4 bytes
@@ -182,31 +180,28 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
         state = 0xACE1DEED;
     }
 
-    // Geiger blink, fully event-driven:
-    //   IDLE → set HIGH, sleep ON_us (one LFSR step picked it), set LOW, sleep OFF_us, repeat.
-    //   TX/RX → set LED, await WAKE_SIGNAL until USB goes idle again.
+    // Geiger blink, fully event-driven, geometric distribution (linear in µs).
     //
-    // The sleep on each phase is `select(Timer, WAKE_SIGNAL)` — if USB state
-    // changes mid-pulse we abort the sleep immediately and re-evaluate at
-    // the top of the loop, so TX/RX hold takes effect with USB-IRQ latency,
-    // not blink-cycle latency.
+    // ON duration: one LFSR step → max(leading_ones, leading_zeros) of the
+    //   32-bit state. Always 1..=32. Distribution P(k) = 2^(-k): 50% are
+    //   1 µs, 25% are 2 µs, 12.5% are 3 µs, …, max 32 µs.
     //
-    // One ROSC-mixed LFSR step picks each duration (ON, then OFF). At avg
-    // OFF ~600 ms + avg ON ~25 ms ≈ 1.5 blinks/sec on average — geiger-counter
-    // feel, occasional clusters and long quiet gaps. CPU wakes ~3×/sec when
-    // idle.
+    // OFF duration: AND four LFSR steps together (biases bits toward 0 —
+    //   each bit is now 1 with probability 1/16). max(clo, clz) of the
+    //   ANDed result. ~88% of the time we land here with leading_zeros
+    //   dominating (mean ~15 µs). If the AND is all zero (~12% of the
+    //   time), extend the curve: take four more readings, AND again,
+    //   treat the previous all-zero chunk as 32 leading zeros and add the
+    //   new chunk's leading_zeros on top. Repeat as long as each new
+    //   chunk is also zero — the tail extends to whatever bit-width we
+    //   need. No multiplier, every leading-zero counts as a literal µs.
+    //
+    // Both sleeps are select(Timer, WAKE_SIGNAL) so a USB state change
+    // mid-pulse aborts the sleep and re-evaluates at the loop head, giving
+    // TX/RX hold USB-IRQ latency rather than blink-cycle latency.
     use embassy_futures::select::{select, Either};
 
-    // Min/max in microseconds. Tune to taste.
-    // Target ~2 kHz blink rate (matches the original busy-loop's visual feel
-    // of fast geiger shimmer). Avg cycle ≈ 150 µs ON + 350 µs OFF = 500 µs.
-    const ON_MIN_US: u32 = 50;       //  50 µs minimum bright pulse
-    const ON_RANGE_US: u32 = 200;    //  +0..200  → 50–250 µs total
-    const OFF_MIN_US: u32 = 100;     // 100 µs minimum gap
-    const OFF_RANGE_US: u32 = 500;   //  +0..500  → 100–600 µs total
-
     fn lfsr_step(state: &mut u32) {
-        // SAFETY: PAC access — independent of any other core's reads. Fine to read concurrently with anything.
         let trng = embassy_rp::pac::ROSC.randombit().read().randombit() as u32;
         *state ^= trng;
         let lsb = *state & 1;
@@ -216,8 +211,39 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
         }
     }
 
-    let _ = ON_THRESHOLD;
-    let _ = OFF_THRESHOLD;
+    fn on_pulse_us(state: &mut u32) -> u64 {
+        lfsr_step(state);
+        let s = *state;
+        core::cmp::max(s.leading_ones(), s.leading_zeros()) as u64
+    }
+
+    fn off_pulse_us(state: &mut u32) -> u64 {
+        // First chunk: 4 LFSR steps ANDed together.
+        let mut chunk: u32 = u32::MAX;
+        for _ in 0..4 {
+            lfsr_step(state);
+            chunk &= *state;
+        }
+        if chunk != 0 {
+            return core::cmp::max(chunk.leading_ones(), chunk.leading_zeros()) as u64;
+        }
+        // All zero — extend the leading-zero run by another 32 bits per round.
+        // Probability of needing another round = (15/16)^32 ≈ 12%, so this
+        // loop terminates fast in practice. No cap; the natural decay is the
+        // bound.
+        let mut total_zeros: u64 = 32;
+        loop {
+            let mut chunk: u32 = u32::MAX;
+            for _ in 0..4 {
+                lfsr_step(state);
+                chunk &= *state;
+            }
+            if chunk != 0 {
+                return total_zeros + chunk.leading_zeros() as u64;
+            }
+            total_zeros += 32;
+        }
+    }
 
     loop {
         match USB_STATE.load(Ordering::Relaxed) {
@@ -231,11 +257,10 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
             }
             _ => {
                 // --- ON phase ---
-                lfsr_step(&mut state);
-                let on_us = ON_MIN_US + (state % ON_RANGE_US);
+                let on_us = on_pulse_us(&mut state);
                 heartbeat.set_high();
                 if let Either::Second(_) = select(
-                    embassy_time::Timer::after_micros(on_us as u64),
+                    embassy_time::Timer::after_micros(on_us),
                     WAKE_SIGNAL.wait(),
                 )
                 .await
@@ -244,11 +269,10 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
                 }
 
                 // --- OFF phase ---
-                lfsr_step(&mut state);
-                let off_us = OFF_MIN_US + (state % OFF_RANGE_US);
+                let off_us = off_pulse_us(&mut state);
                 heartbeat.set_low();
                 if let Either::Second(_) = select(
-                    embassy_time::Timer::after_micros(off_us as u64),
+                    embassy_time::Timer::after_micros(off_us),
                     WAKE_SIGNAL.wait(),
                 )
                 .await
