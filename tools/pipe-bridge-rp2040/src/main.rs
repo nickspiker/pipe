@@ -106,30 +106,6 @@ static USB_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 // load inside the LFSR loop catches state changes too).
 static WAKE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-// ---------------------------------------------------------------------------
-// PIPE wire stats. Written by core 1's pipe_wire_task, read by core 0's
-// dispatch handler when a `wire_status` cmd arrives. Single-writer / many-
-// reader pattern → portable_atomic with Relaxed ordering is fine.
-//
-// Idle math for the host-side codec talking to an enclave-side FPGA:
-//   - FPGA drives HIGH on its slots (idle wire = 1)
-//   - host releases on its slots (5kΩ pull-down → wire = 0)
-//   - wire trace alternates 1 0 1 0 …
-//   - host's codec.rx(1) at correct phase decodes 0; locked = all-zeros stream
-// ---------------------------------------------------------------------------
-static WIRE_SAMPLES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-static WIRE_HIGH: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-static WIRE_LOW: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-static RX_ZEROS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-static RX_ONES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-static WIRE_TOGGLES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-
-/// Slot/sample period in µs. Build script estimates 600 kHz / 12 = 50 kHz → 20 µs/slot,
-/// but the ROSC is process-dependent and we currently run the FPGA at SLOT_DIV=192 as
-/// a dev-rig workaround for breadboard capacitance. Measured slot period via wire_trace:
-/// ~312 µs (3.2 kHz slot rate, enclave_clk ~615 kHz × 1/192). Re-measure with wire_trace
-/// after any FPGA re-program before trusting codec decode.
-const SLOT_US: u64 = 312;
 
 // ---------------------------------------------------------------------------
 // Fast wire-trace buffer — tight bit-banged GPIO read at native CPU rate
@@ -285,10 +261,8 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
 static SYNC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
-/// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs.
-/// Inlined here to keep the firmware crate self-contained for now; once the
-/// codec is stable we'll lift it into a shared `pipe_codec` crate that both
-/// host and firmware import.
+/// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs. Inlined here to keep the firmware crate self-contained for now; once the codec is stable we'll lift it into a shared `pipe_codec` crate that both host and firmware import. Not currently used in the runtime — the slot loop was nuked along with the hardcoded SLOT_US, and the next iteration will plug Codec back in driven by wire_sync's locked slot_cycles.
+#[allow(dead_code)]
 struct Codec {
     own_idle: u8,
     other_idle: u8,
@@ -296,6 +270,7 @@ struct Codec {
     other_last: u8,
 }
 
+#[allow(dead_code)]
 impl Codec {
     const fn host() -> Self {
         Self {
@@ -695,42 +670,21 @@ fn fast_sync(max_iter: u32) -> SyncResult {
 /// perturbed by) USB latency, so all USB work lives on core 0.
 #[embassy_executor::task]
 async fn pipe_wire_task(mut wire: Flex<'static>) {
-    // Configure GP0 as input with no pull — the FPGA-side 5kΩ external
-    // pull-down dominates the line when nobody's driving.
+    // Configure GP0 as input with no pull — the FPGA-side 5kΩ external pull-down dominates the line when nobody's driving.
     wire.set_as_input();
     wire.set_pull(Pull::None);
 
-    let mut codec = Codec::host();
-
-    // my_slot alternates. We don't know the initial phase relative to the
-    // FPGA, so we start with `false` (assume first sample lands in the
-    // enclave's slot). If decoded data comes back as all-ones instead of
-    // all-zeros, we're off by one phase — host CLI can show this via
-    // wire_status and we flip my_slot manually for now.
-    let mut my_slot: bool = false;
-    let mut last_sample: u8 = 0;
-    let mut next_tick =
-        embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
-
+    // Idle service loop: poll for diagnostic-tool arm requests (trace, stats, sync). No slot-rate sampling and no codec decode yet — that wiring waits until the FPGA emits protocol-spec idle and we feed wire_sync's locked slot_cycles back in here. The 1 ms poll is a yield point for the embassy executor (without it core 1 busy-spins) and is below human perception for tool-arm latency.
     loop {
-        // Trace arm-check runs *before* awaiting the next slot tick so a capture
-        // request never waits up to a full SLOT_US to start. fast_capture runs
-        // inside interrupt::free so timer/USB IRQs can't perturb the cadence;
-        // duration is bounded (≤ TRACE_MAX_SAMPLES × period_ns + native overhead,
-        // ≤ ~1 ms at native rate, ≤ ~80 ms at 10 µs period). After it returns we
-        // re-anchor next_tick to "now" so the slot loop doesn't fire a burst of
-        // catch-up samples for the time we spent off-slot.
         let req = TRACE_REQUEST.load(PaOrdering::Acquire);
         if req != 0 {
             let samples = (req as usize).min(TRACE_MAX_SAMPLES);
             let period_ns = TRACE_PERIOD_NS.load(PaOrdering::Relaxed);
             let elapsed_us = cortex_m::interrupt::free(|_| fast_capture(samples, period_ns));
             TRACE_ELAPSED_US.store(elapsed_us, PaOrdering::Relaxed);
-            // Release: pairs with core 0's Acquire on TRACE_RESPONSE, publishing
-            // both TRACE_FAST_BUF writes and TRACE_ELAPSED_US.
+            // Release: pairs with core 0's Acquire on TRACE_RESPONSE, publishing both TRACE_FAST_BUF writes and TRACE_ELAPSED_US.
             TRACE_RESPONSE.store(samples as u32, PaOrdering::Release);
             TRACE_REQUEST.store(0, PaOrdering::Relaxed);
-            next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
         }
 
         let stats_req = STATS_REQUEST.load(PaOrdering::Acquire);
@@ -743,7 +697,6 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             // Release: pairs with core 0's Acquire on STATS_RESPONSE, publishing STATS_RESULT writes.
             STATS_RESPONSE.store(taken, PaOrdering::Release);
             STATS_REQUEST.store(0, PaOrdering::Relaxed);
-            next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
         }
 
         let sync_req = SYNC_REQUEST.load(PaOrdering::Acquire);
@@ -756,39 +709,9 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             // Release: pairs with core 0's Acquire on SYNC_RESPONSE.
             SYNC_RESPONSE.store(iters, PaOrdering::Release);
             SYNC_REQUEST.store(0, PaOrdering::Relaxed);
-            next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
         }
 
-        embassy_time::Timer::at(next_tick).await;
-        next_tick += embassy_time::Duration::from_micros(SLOT_US);
-
-        let sample: u8 = if wire.is_high() { 1 } else { 0 };
-
-        WIRE_SAMPLES.fetch_add(1, PaOrdering::Relaxed);
-        if sample == 1 {
-            WIRE_HIGH.fetch_add(1, PaOrdering::Relaxed);
-        } else {
-            WIRE_LOW.fetch_add(1, PaOrdering::Relaxed);
-        }
-        if sample != last_sample {
-            WIRE_TOGGLES.fetch_add(1, PaOrdering::Relaxed);
-        }
-        last_sample = sample;
-
-        if !my_slot {
-            // Enclave's slot: decode their bit.
-            let rx = codec.rx(sample);
-            if rx == 1 {
-                RX_ONES.fetch_add(1, PaOrdering::Relaxed);
-            } else {
-                RX_ZEROS.fetch_add(1, PaOrdering::Relaxed);
-            }
-        } else {
-            // Our slot: in v0 we never actually drive (TX added in next step).
-            // Still tick the codec so own_last stays consistent.
-            let _ = codec.tx(0);
-        }
-        my_slot = !my_slot;
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
     }
 }
 
@@ -1340,25 +1263,6 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             let mut buf = [0u8; 32];
             gather_random(&mut buf[..count]);
             fields.push(("data".to_string(), VsfType::v(b'b', buf[..count].to_vec())));
-        }
-        "wire_status" => {
-            // Pack 6 × u32 LE into the `data` blob:
-            //   samples, high, low, decoded_zeros, decoded_ones, toggles.
-            // Host CLI decodes and pretty-prints.
-            let s = WIRE_SAMPLES.load(PaOrdering::Relaxed);
-            let h = WIRE_HIGH.load(PaOrdering::Relaxed);
-            let l = WIRE_LOW.load(PaOrdering::Relaxed);
-            let z = RX_ZEROS.load(PaOrdering::Relaxed);
-            let o = RX_ONES.load(PaOrdering::Relaxed);
-            let t = WIRE_TOGGLES.load(PaOrdering::Relaxed);
-            let mut buf = [0u8; 24];
-            buf[0..4].copy_from_slice(&s.to_le_bytes());
-            buf[4..8].copy_from_slice(&h.to_le_bytes());
-            buf[8..12].copy_from_slice(&l.to_le_bytes());
-            buf[12..16].copy_from_slice(&z.to_le_bytes());
-            buf[16..20].copy_from_slice(&o.to_le_bytes());
-            buf[20..24].copy_from_slice(&t.to_le_bytes());
-            fields.push(("data".to_string(), VsfType::v(b'b', buf.to_vec())));
         }
         "wire_trace" => {
             // Input params packed into the request `data` blob:
