@@ -204,7 +204,7 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
     // TX/RX hold USB-IRQ latency rather than blink-cycle latency.
     use embassy_futures::select::{select, Either};
 
-    const OFF_ANDS: u32 = 12;
+    const OFF_ANDS: u32 = 7;
 
     fn lfsr_step(state: &mut u32) {
         let trng = embassy_rp::pac::ROSC.randombit().read().randombit() as u32;
@@ -218,8 +218,11 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
 
     fn on_pulse_us(state: &mut u32) -> u64 {
         lfsr_step(state);
-        let s = *state;
-        core::cmp::max(s.leading_ones(), s.leading_zeros()) as u64
+        // 1 + leading_zeros has the same geometric distribution as max(clo, clz)
+        // out to k=31 (P(k) = 1/2^k for k in 1..=32), with only a vanishing
+        // 1/2^32 difference at the very tail. Uses one __clzsi2 call instead
+        // of two, and the +1 floors at 1 µs so we never schedule a 0 µs sleep.
+        1 + state.leading_zeros() as u64
     }
 
     /// AND `ands` LFSR readings into a single u32. Early-exits as soon as the
@@ -245,7 +248,10 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
         loop {
             let chunk = and_chunk(state, OFF_ANDS);
             if chunk != 0 {
-                return total_zeros + chunk.leading_zeros() as u64;
+                // +1 floors at 1 µs so the rare case where the first chunk's
+                // MSB is already 1 (P ≈ 1/4096 at AND-12) doesn't schedule a
+                // 0 µs sleep.
+                return total_zeros + chunk.leading_zeros() as u64 + 1;
             }
             // Zero chunk — contributes 32 leading zeros, load another batch.
             total_zeros += 32;
