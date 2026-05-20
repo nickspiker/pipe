@@ -683,7 +683,7 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         .get(1)
         .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
         .transpose()?
-        .unwrap_or(11)
+        .unwrap_or(13)
         .clamp(4, 19);
 
     let mut params = Vec::with_capacity(8);

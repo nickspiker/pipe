@@ -219,7 +219,9 @@ const STATS_MAX_SAMPLES: u32 = 1 << 22;
 const SYNC_ACQ_PER_POLARITY: u32 = 128;
 const SYNC_ACQ_SHIFT: u32 = 9;
 /// Default fractional bits in interval_fp if the host doesn't override. ±1 slew per edge = slot/2^FRAC adjustment.
-const SYNC_FRAC_BITS_DEFAULT: u32 = 11;
+///
+/// Picked 13 (slew = slot/8192) from the empirical sweep on the current FPGA wire. Aggressive values (FRAC ≤ 9) converged interval_fp to the centroid of the wire's multimodal edge clusters — which drove mean phase_err to zero but smeared the per-polarity histogram, making the wire's actual cluster structure unreadable. Slow values (FRAC ≥ 13) kept the lock anchored near the acquisition seed, the histogram resolved the wire's discrete clusters cleanly, and slow drift (~hundreds of ppm/sec from chip self-heating) still got tracked correctly over multi-second runs. 13 balances drift-tracking responsiveness against histogram clarity; bumping to 14-15 makes the lock even quieter but slower to follow real drift.
+const SYNC_FRAC_BITS_DEFAULT: u32 = 13;
 /// Bounds on runtime frac_bits. Upper bound keeps interval_fp from overflowing u32 for typical slot values (~1500 iter × 2^19 ≈ 8×10^8, safe). Lower bound keeps the slew meaningful.
 const SYNC_FRAC_BITS_MIN: u32 = 4;
 const SYNC_FRAC_BITS_MAX: u32 = 19;
