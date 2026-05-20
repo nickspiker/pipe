@@ -198,10 +198,12 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
     use embassy_futures::select::{select, Either};
 
     // Min/max in microseconds. Tune to taste.
-    const ON_MIN_US: u32 = 5_000;       //   5 ms (visible flash, quick)
-    const ON_RANGE_US: u32 = 45_000;    //  +0..45 → 5–50 ms total
-    const OFF_MIN_US: u32 = 50_000;     //  50 ms (minimum gap between pulses)
-    const OFF_RANGE_US: u32 = 1_150_000;//  +0..1150 → 50–1200 ms total
+    // Target ~2 kHz blink rate (matches the original busy-loop's visual feel
+    // of fast geiger shimmer). Avg cycle ≈ 150 µs ON + 350 µs OFF = 500 µs.
+    const ON_MIN_US: u32 = 50;       //  50 µs minimum bright pulse
+    const ON_RANGE_US: u32 = 200;    //  +0..200  → 50–250 µs total
+    const OFF_MIN_US: u32 = 100;     // 100 µs minimum gap
+    const OFF_RANGE_US: u32 = 500;   //  +0..500  → 100–600 µs total
 
     fn lfsr_step(state: &mut u32) {
         // SAFETY: PAC access — independent of any other core's reads. Fine to read concurrently with anything.
