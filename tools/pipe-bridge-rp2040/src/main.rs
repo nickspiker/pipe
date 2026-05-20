@@ -164,27 +164,18 @@ static TRACE_ELAPSED_US: portable_atomic::AtomicU32 = portable_atomic::AtomicU32
 static TRACE_PERIOD_NS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
-// Wire stats — streaming statistics at native sample rate, no buffer.
-// fast_capture maxes out at TRACE_MAX_SAMPLES bits because of BRAM; stats
-// doesn't store samples, so it can run for as long as we want and compute
-// duty cycle / freq / pulse-width distribution over a much larger window.
+// Wire stats — streaming statistics at native sample rate, no buffer. fast_capture maxes out at TRACE_MAX_SAMPLES bits because of BRAM; stats doesn't store samples, so it can run for as long as we want and compute duty cycle / freq / pulse-width distribution over a much larger window.
 //
 // Per-state accounting:
 //   - count of completed runs (toggle ended a HIGH or LOW span)
 //   - min, max run length (in samples)
 //   - sum, sumsq of completed run lengths → host derives mean + stddev
-// Plus final_state + final_run for the unclosed trailing run at the end of
-// the window; host folds it into total-sample-count duty math but excludes
-// it from run-length stats (partial-run bias).
 //
-// Inner loop on M0+ (non-toggle path): LDR + AND + CMP + BEQ + ADD ≈ 5-6
-// cycles. The toggle path is heavier (one u32×u32 → u64 mul, min/max, two
-// u64 adds with carry) but only runs on actual edges, not on every sample.
+// Plus final_state + final_run for the unclosed trailing run at the end of the window; host folds it into total-sample-count duty math but excludes it from run-length stats (partial-run bias).
+//
+// Inner loop on M0+ (non-toggle path): LDR + AND + CMP + BEQ + ADD ≈ 5-6 cycles. The toggle path is heavier (one u32×u32 → u64 mul, min/max, two u64 adds with carry) but only runs on actual edges, not on every sample.
 // ---------------------------------------------------------------------------
-/// log2 histogram bin count per state. Bin i covers run lengths in
-/// [2^i, 2^(i+1)). 16 bins covers [1, 65536) samples, which at the ~9 MS/s
-/// stats sample rate spans [110 ns, 7 ms] — every realistic pulse width
-/// from a single-sample glitch to a multi-slot stretch.
+/// log2 histogram bin count per state. Bin i covers run lengths in [2^i, 2^(i+1)). 16 bins covers [1, 65536) samples, which at the ~9 MS/s stats sample rate spans [110 ns, 7 ms] — every realistic pulse width from a single-sample glitch to a multi-slot stretch.
 const STATS_HIST_BINS: usize = 16;
 
 #[repr(C)]
@@ -229,15 +220,70 @@ static mut STATS_RESULT: WireStats = WireStats {
 
 /// Number of samples to collect. 0 = idle, >0 = arm fast_stats.
 static STATS_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-/// Set by core 1 to samples_taken after fast_stats completes (Release
-/// publishes STATS_RESULT writes to core 0's Acquire load).
+/// Set by core 1 to samples_taken after fast_stats completes (Release publishes STATS_RESULT writes to core 0's Acquire load).
 static STATS_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
-/// Cap stats sample budget to keep wall time bounded. At ~24 MS/s native
-/// rate, 2^22 ≈ 175 ms — covers ~350 full periods of a 2 kHz signal so
-/// stats are well-converged, and stays under typical USB host timeouts
-/// (we're inside interrupt::free for the duration, so USB IRQs starve).
+/// Cap stats sample budget to keep wall time bounded. At ~24 MS/s native rate, 2^22 ≈ 175 ms — covers ~350 full periods of a 2 kHz signal so stats are well-converged, and stays under typical USB host timeouts (we're inside interrupt::free for the duration, so USB IRQs starve).
 const STATS_MAX_SAMPLES: u32 = 1 << 22;
+
+// ---------------------------------------------------------------------------
+// Wire sync — phase-locked loop on the enclave's slot clock.
+//
+// Per PROTOCOL.md Layer 2: idle wire is the 1010 pattern with 100% edge density (one edge per slot), the enclave drives the 1s actively, the pull-down handles the 0s. Each inter-edge interval IS one slot period.
+//
+// Algorithm:
+//   ACQUISITION — wait for first edge to anchor; then sum the next 256 inter-edge intervals (= 256 slots) in loop-iteration units. Initial slot_cycles = sum / 256. Strong noise rejection because loop is constant-time so iteration count ∝ wall time.
+//   TRACKING — on each subsequent edge: error = actual_interval - slot_cycles; slot_cycles += error / 256. Bounded slew: a single bad edge can only move the lock by 1/256 of itself, so glitches and noise can't slam it but real PVT drift (orders of magnitude slower) tracks smoothly.
+//
+// Loop body must stay constant-time for the iteration↔wall-time mapping to hold; lives inside interrupt::free same as the other fast_* paths.
+// ---------------------------------------------------------------------------
+const SYNC_ACQ_EDGES: u32 = 256;
+const SYNC_SLEW_DIVISOR: i32 = 256;
+/// Hard cap on inner-loop iterations to bound wall time even if the wire is dead. At ~24 MS/s ≈ 42 ns/iter, 2^22 ≈ 175 ms.
+const SYNC_MAX_ITERATIONS: u32 = 1 << 22;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyncResult {
+    elapsed_us: u32,
+    total_iterations: u32,
+    /// 0 = locked OK, 1 = ran out of iterations during acquisition, 2 = no edge ever seen.
+    status: u32,
+    edges_total: u32,
+    /// slot_cycles immediately after acquisition (mean of first 256 intervals).
+    acquisition_slot_cycles: u32,
+    /// slot_cycles at end of tracking (after all slew corrections).
+    final_slot_cycles: u32,
+    /// Extremes of slot_cycles observed during tracking.
+    slot_cycles_min: u32,
+    slot_cycles_max: u32,
+    /// Edge count during tracking phase only.
+    track_edges: u32,
+    /// Per-edge phase error stats during tracking, in iteration units. error = observed_interval - slot_cycles (before applying slew). Host derives mean + stddev from sum / sumsq.
+    err_sum: i64,
+    err_sumsq: u64,
+    err_min: i32,
+    err_max: i32,
+}
+
+static mut SYNC_RESULT: SyncResult = SyncResult {
+    elapsed_us: 0,
+    total_iterations: 0,
+    status: 0,
+    edges_total: 0,
+    acquisition_slot_cycles: 0,
+    final_slot_cycles: 0,
+    slot_cycles_min: 0,
+    slot_cycles_max: 0,
+    track_edges: 0,
+    err_sum: 0,
+    err_sumsq: 0,
+    err_min: 0,
+    err_max: 0,
+};
+
+static SYNC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 /// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs.
 /// Inlined here to keep the firmware crate self-contained for now; once the
@@ -402,23 +448,13 @@ fn fast_capture(samples: usize, period_ns: u32) -> u32 {
     start.elapsed().as_micros() as u32
 }
 
-/// Tight bit-banged stats collector. Reads GP0 at native loop rate, tracks
-/// per-state run length stats (count, min, max, sum, sumsq) so the host can
-/// derive duty cycle, average frequency, and pulse-width stddev from one
-/// pass. No buffer — sample budget is the only bound.
+/// Tight bit-banged stats collector. Reads GP0 at native loop rate, tracks per-state run length stats (count, min, max, sum, sumsq) so the host can derive duty cycle, average frequency, and pulse-width stddev from one pass. No buffer — sample budget is the only bound.
 ///
-/// Same disable-IRQs invariant as fast_capture: caller MUST wrap this in
-/// `cortex_m::interrupt::free` so the inner loop runs without USB/timer
-/// preemption. Returns measured wall time in microseconds; host divides by
-/// samples_taken for true sample rate (timer is ground truth).
+/// Same disable-IRQs invariant as fast_capture: caller MUST wrap this in `cortex_m::interrupt::free` so the inner loop runs without USB/timer preemption. Returns measured wall time in microseconds; host divides by samples_taken for true sample rate (timer is ground truth).
 ///
-/// Inner loop on M0+, non-toggle path:
-///   LDR gpio → AND #1 → CMP prev → BEQ same → ADD cur_run, #1 → branch
-/// ≈ 5-6 cycles → matches fast_capture's ~24 MS/s floor.
+/// Inner loop on M0+, non-toggle path: LDR gpio → AND #1 → CMP prev → BEQ same → ADD cur_run, #1 → branch ≈ 5-6 cycles → matches fast_capture's ~24 MS/s floor.
 ///
-/// Toggle path closes the current run into hi_* or lo_* accumulators:
-/// one u32×u32→u32 MULS (M0+ single-cycle), two min/max compares, u64 sum
-/// with carry. Only runs on edges, so rare relative to sample count.
+/// Toggle path closes the current run into hi_* or lo_* accumulators: one u32×u32→u32 MULS (M0+ single-cycle), two min/max compares, u64 sum with carry. Only runs on edges, so rare relative to sample count.
 fn fast_stats(samples: u32) -> WireStats {
     let samples = samples.min(STATS_MAX_SAMPLES);
     let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
@@ -472,9 +508,7 @@ fn fast_stats(samples: u32) -> WireStats {
             let run = cur_run;
             let run64 = run as u64;
             let sq = run64 * run64;
-            // log2 bin: floor(log2(run)) clamped to [0, STATS_HIST_BINS-1].
-            // M0+ has no CLZ; leading_zeros lowers to __clzsi2 (~20 cyc), only
-            // hit per toggle (rare relative to sample count) so negligible.
+            // log2 bin: floor(log2(run)) clamped to [0, STATS_HIST_BINS-1]. M0+ has no CLZ; leading_zeros lowers to __clzsi2 (~20 cyc), only hit per toggle (rare relative to sample count) so negligible.
             let bin = (31 - run.leading_zeros()) as usize;
             let bin = if bin >= STATS_HIST_BINS { STATS_HIST_BINS - 1 } else { bin };
             if prev == 1 {
@@ -532,6 +566,117 @@ fn fast_stats(samples: u32) -> WireStats {
         lo_sumsq,
         hi_hist,
         lo_hist,
+    }
+}
+
+/// CDR sync loop. Caller MUST run inside `cortex_m::interrupt::free` — the per-iteration↔wall-time mapping requires no IRQ preemption. `max_iter` caps wall time even if the wire is silent.
+fn fast_sync(max_iter: u32) -> SyncResult {
+    let max_iter = max_iter.min(SYNC_MAX_ITERATIONS);
+    let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
+    let start = embassy_time::Instant::now();
+
+    let mut prev: u32 = unsafe { gpio_in.read_volatile() & 1 };
+    let mut cycles_since_edge: u32 = 0;
+    let mut iter: u32 = 1;
+    let mut edge_count: u32 = 0;
+
+    // Unified acquisition+tracking loop. ONE inner loop body so the compiler can't emit different per-iteration code for the two phases — that's critical because we use iteration count as the timebase, and the iter↔wall-time mapping has to be constant across the entire run. The edge handler branches on edge_count to switch behavior, but the 99.9% common path (non-edge) is identical throughout.
+    let mut acq_sum: u64 = 0;
+    let mut acquisition_slot_cycles: u32 = 0;
+    let mut slot_cycles: i32 = 0;
+    let mut slot_min: i32 = i32::MAX;
+    let mut slot_max: i32 = i32::MIN;
+    let mut track_edges: u32 = 0;
+    let mut err_sum: i64 = 0;
+    let mut err_sumsq: u64 = 0;
+    let mut err_min: i32 = i32::MAX;
+    let mut err_max: i32 = i32::MIN;
+    let mut anchored: bool = false;
+
+    while iter < max_iter {
+        let cur = unsafe { gpio_in.read_volatile() & 1 };
+        iter += 1;
+        cycles_since_edge += 1;
+        if cur != prev {
+            prev = cur;
+            if !anchored {
+                // First edge: discard the partial pre-edge interval; from here on every interval is a real slot-to-slot measurement.
+                anchored = true;
+                cycles_since_edge = 0;
+                continue;
+            }
+            edge_count += 1;
+            if edge_count <= SYNC_ACQ_EDGES {
+                acq_sum += cycles_since_edge as u64;
+                if edge_count == SYNC_ACQ_EDGES {
+                    acquisition_slot_cycles = (acq_sum / SYNC_ACQ_EDGES as u64) as u32;
+                    slot_cycles = acquisition_slot_cycles as i32;
+                    slot_min = slot_cycles;
+                    slot_max = slot_cycles;
+                }
+            } else {
+                let error: i32 = cycles_since_edge as i32 - slot_cycles;
+                err_sum += error as i64;
+                err_sumsq += (error as i64 * error as i64) as u64;
+                if error < err_min {
+                    err_min = error;
+                }
+                if error > err_max {
+                    err_max = error;
+                }
+                track_edges += 1;
+                slot_cycles += error / SYNC_SLEW_DIVISOR;
+                if slot_cycles < slot_min {
+                    slot_min = slot_cycles;
+                }
+                if slot_cycles > slot_max {
+                    slot_max = slot_cycles;
+                }
+            }
+            cycles_since_edge = 0;
+        }
+    }
+
+    // Status from how far we got.
+    let status: u32 = if !anchored {
+        2 // never saw an edge
+    } else if edge_count < SYNC_ACQ_EDGES {
+        1 // acquisition incomplete
+    } else {
+        0 // locked
+    };
+
+    if status == 1 && edge_count > 0 {
+        // Partial acquisition: report the partial mean as the "lock".
+        acquisition_slot_cycles = (acq_sum / edge_count as u64) as u32;
+        slot_cycles = acquisition_slot_cycles as i32;
+        slot_min = slot_cycles;
+        slot_max = slot_cycles;
+    }
+
+    if track_edges == 0 {
+        err_min = 0;
+        err_max = 0;
+    }
+    if slot_min == i32::MAX {
+        slot_min = slot_cycles;
+        slot_max = slot_cycles;
+    }
+
+    SyncResult {
+        elapsed_us: start.elapsed().as_micros() as u32,
+        total_iterations: iter,
+        status,
+        edges_total: edge_count,
+        acquisition_slot_cycles,
+        final_slot_cycles: slot_cycles as u32,
+        slot_cycles_min: slot_min as u32,
+        slot_cycles_max: slot_max as u32,
+        track_edges,
+        err_sum,
+        err_sumsq,
+        err_min,
+        err_max,
     }
 }
 
@@ -595,10 +740,22 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             unsafe {
                 STATS_RESULT = result;
             }
-            // Release: pairs with core 0's Acquire on STATS_RESPONSE, publishing
-            // STATS_RESULT writes.
+            // Release: pairs with core 0's Acquire on STATS_RESPONSE, publishing STATS_RESULT writes.
             STATS_RESPONSE.store(taken, PaOrdering::Release);
             STATS_REQUEST.store(0, PaOrdering::Relaxed);
+            next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
+        }
+
+        let sync_req = SYNC_REQUEST.load(PaOrdering::Acquire);
+        if sync_req != 0 {
+            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req));
+            let iters = result.total_iterations.max(1);
+            unsafe {
+                SYNC_RESULT = result;
+            }
+            // Release: pairs with core 0's Acquire on SYNC_RESPONSE.
+            SYNC_RESPONSE.store(iters, PaOrdering::Release);
+            SYNC_REQUEST.store(0, PaOrdering::Relaxed);
             next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
         }
 
@@ -1267,8 +1424,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
         }
         "wire_stats" => {
-            // Input: bytes 0..4 = samples (u32 LE), clamped to STATS_MAX_SAMPLES.
-            // Missing/short → default 2^20 samples (~44 ms at 24 MS/s).
+            // Input: bytes 0..4 = samples (u32 LE), clamped to STATS_MAX_SAMPLES. Missing/short → default 2^20 samples (~44 ms at 24 MS/s).
             let data_in = cmd
                 .get("data")
                 .ok()
@@ -1291,8 +1447,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 STATS_RESPONSE.store(0, PaOrdering::Relaxed);
                 STATS_REQUEST.store(samples_req, PaOrdering::Release);
 
-                // Worst case at STATS_MAX_SAMPLES (~4M) / ~24 MS/s ≈ 175 ms;
-                // 2 s deadline covers slower silicon variants comfortably.
+                // Worst case at STATS_MAX_SAMPLES (~4M) / ~24 MS/s ≈ 175 ms; 2 s deadline covers slower silicon variants comfortably.
                 let deadline = Instant::now() + embassy_time::Duration::from_secs(2);
                 while STATS_RESPONSE.load(PaOrdering::Acquire) == 0 {
                     if Instant::now() > deadline {
@@ -1307,10 +1462,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 } else {
                     // Acquire above already published STATS_RESULT.
                     let s = unsafe { STATS_RESULT };
-                    // Layout (all LE), 200 bytes total:
-                    //   72 bytes scalars (see WireStats), then:
-                    //   16 × u32 hi_hist (log2 run-length bins, 1..65k samples)
-                    //   16 × u32 lo_hist
+                    // Layout (all LE), 200 bytes total: 72 bytes scalars (see WireStats), then 16 × u32 hi_hist (log2 run-length bins, 1..65k samples), then 16 × u32 lo_hist.
                     let mut payload = alloc::vec::Vec::with_capacity(200);
                     payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
                     payload.extend_from_slice(&s.samples_taken.to_le_bytes());
@@ -1334,6 +1486,57 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                     }
                     fields.push(("data".to_string(), VsfType::v(b'b', payload)));
                 }
+            }
+        }
+        "wire_sync" => {
+            // Input: bytes 0..4 = max_iter (u32 LE). Default = SYNC_MAX_ITERATIONS.
+            let data_in = cmd
+                .get("data")
+                .ok()
+                .and_then(|vs| vs.first().cloned())
+                .and_then(|v| match v {
+                    VsfType::v(b'b', bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let max_iter = if data_in.len() >= 4 {
+                u32::from_le_bytes([data_in[0], data_in[1], data_in[2], data_in[3]])
+            } else {
+                SYNC_MAX_ITERATIONS
+            };
+            let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_EDGES * 8);
+
+            SYNC_RESPONSE.store(0, PaOrdering::Relaxed);
+            SYNC_REQUEST.store(max_iter, PaOrdering::Release);
+
+            let deadline = Instant::now() + embassy_time::Duration::from_secs(2);
+            while SYNC_RESPONSE.load(PaOrdering::Acquire) == 0 {
+                if Instant::now() > deadline {
+                    break;
+                }
+                cortex_m::asm::nop();
+            }
+            let iters = SYNC_RESPONSE.load(PaOrdering::Relaxed);
+            if iters == 0 {
+                fields.push(("err".to_string(), VsfType::a("sync_timeout".to_string())));
+            } else {
+                let s = unsafe { SYNC_RESULT };
+                // Layout (all LE), 60 bytes: u32 elapsed_us, u32 total_iterations, u32 status, u32 edges_total, u32 acquisition_slot_cycles, u32 final_slot_cycles, u32 slot_cycles_min, u32 slot_cycles_max, u32 track_edges, i64 err_sum, u64 err_sumsq, i32 err_min, i32 err_max.
+                let mut payload = alloc::vec::Vec::with_capacity(60);
+                payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
+                payload.extend_from_slice(&s.total_iterations.to_le_bytes());
+                payload.extend_from_slice(&s.status.to_le_bytes());
+                payload.extend_from_slice(&s.edges_total.to_le_bytes());
+                payload.extend_from_slice(&s.acquisition_slot_cycles.to_le_bytes());
+                payload.extend_from_slice(&s.final_slot_cycles.to_le_bytes());
+                payload.extend_from_slice(&s.slot_cycles_min.to_le_bytes());
+                payload.extend_from_slice(&s.slot_cycles_max.to_le_bytes());
+                payload.extend_from_slice(&s.track_edges.to_le_bytes());
+                payload.extend_from_slice(&s.err_sum.to_le_bytes());
+                payload.extend_from_slice(&s.err_sumsq.to_le_bytes());
+                payload.extend_from_slice(&s.err_min.to_le_bytes());
+                payload.extend_from_slice(&s.err_max.to_le_bytes());
+                fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
         _ => {

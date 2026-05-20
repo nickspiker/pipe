@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_status|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_status|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -99,6 +99,7 @@ fn main() -> ExitCode {
         "wire_status" => cmd_wire_status(&port_path),
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
+        "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
         "reset" => cmd_action(&port_path, "reset"),
         "flash" => cmd_flash(&port_path, cmd_args),
@@ -534,10 +535,7 @@ fn cmd_wire_trace(port_path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `wire_stats [SAMPLES]` — runs a tight bit-bang at the bridge's native loop
-/// rate over the requested sample budget, then reports duty cycle, average
-/// frequency, and per-state pulse-width stats (mean ± stddev, min, max).
-/// No buffer is held on the device — sample count caps wall-clock time only.
+/// `wire_stats [SAMPLES]` — runs a tight bit-bang at the bridge's native loop rate over the requested sample budget, then reports duty cycle, average frequency, and per-state pulse-width stats (mean ± stddev, min, max). No buffer is held on the device — sample count caps wall-clock time only.
 fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
     const STATS_MAX_SAMPLES: u32 = 1 << 22;
     let samples: u32 = args
@@ -569,11 +567,7 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
             _ => None,
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
-    // Firmware layout (LE), 200 bytes total:
-    //   u32 elapsed_us, u32 samples_taken, u32 final_state, u32 final_run,
-    //   u32 hi_count, u32 hi_min, u32 hi_max, u64 hi_sum, u64 hi_sumsq,
-    //   u32 lo_count, u32 lo_min, u32 lo_max, u64 lo_sum, u64 lo_sumsq,
-    //   16 × u32 hi_hist, 16 × u32 lo_hist
+    // Firmware layout (LE), 200 bytes total: u32 elapsed_us, u32 samples_taken, u32 final_state, u32 final_run, u32 hi_count, u32 hi_min, u32 hi_max, u64 hi_sum, u64 hi_sumsq, u32 lo_count, u32 lo_min, u32 lo_max, u64 lo_sum, u64 lo_sumsq, 16 × u32 hi_hist, 16 × u32 lo_hist.
     const HIST_BINS: usize = 16;
     const SCALAR_BYTES: usize = 72;
     const HIST_BYTES: usize = HIST_BINS * 4;
@@ -621,18 +615,14 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
         0.0
     };
 
-    // Duty cycle includes the final (unclosed) run so the total sample count
-    // matches samples_taken exactly. Run-length stats below exclude it
-    // (partial-run bias toward shorter values).
+    // Duty cycle includes the final (unclosed) run so the total sample count matches samples_taken exactly. Run-length stats below exclude it (partial-run bias toward shorter values).
     let total_hi_samples = hi_sum + if final_state == 1 { final_run } else { 0 };
     let total_lo_samples = lo_sum + if final_state == 0 { final_run } else { 0 };
     let total = (total_hi_samples + total_lo_samples).max(1);
     let duty_hi = 100.0 * total_hi_samples as f64 / total as f64;
     let duty_lo = 100.0 * total_lo_samples as f64 / total as f64;
 
-    // Average signal frequency: each full cycle has one closed HIGH run AND
-    // one closed LOW run, so we take the min — that's the count of complete
-    // cycles inside our window. Divide by elapsed seconds.
+    // Average signal frequency: each full cycle has one closed HIGH run AND one closed LOW run, so we take the min — that's the count of complete cycles inside our window. Divide by elapsed seconds.
     let full_cycles = hi_count.min(lo_count);
     let elapsed_s = elapsed_us as f64 / 1_000_000.0;
     let avg_freq_hz = if elapsed_s > 0.0 {
@@ -647,8 +637,7 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
         }
         let n = count as f64;
         let mean = sum as f64 / n;
-        // Population variance: E[X²] − (E[X])². Clamp tiny negatives from
-        // float roundoff before sqrt.
+        // Population variance: E[X²] − (E[X])². Clamp tiny negatives from float roundoff before sqrt.
         let var = (sumsq as f64 / n - mean * mean).max(0.0);
         let stddev = var.sqrt();
         (mean * ns_per_sample, stddev * ns_per_sample,
@@ -703,9 +692,7 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
         fmt_ns(final_run as f64 * ns_per_sample),
     );
 
-    // Run-length distribution. Bin i = runs of length [2^i, 2^(i+1)) samples.
-    // Bar width scales to the larger of the two histograms so HIGH and LOW
-    // are visually comparable.
+    // Run-length distribution. Bin i = runs of length [2^i, 2^(i+1)) samples. Bar width scales to the larger of the two histograms so HIGH and LOW are visually comparable.
     let max_bin_count = hi_hist.iter().chain(lo_hist.iter()).copied().max().unwrap_or(0);
     if max_bin_count > 0 {
         let bar_max = 40usize;
@@ -740,6 +727,164 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
                 bar_max = bar_max,
             );
         }
+    }
+
+    Ok(())
+}
+
+/// `wire_sync [MAX_ITER]` — runs the CDR sync loop on the bridge: locks to the enclave's idle 1010 pattern via 256-edge acquisition + bounded-slew tracking. Reports the locked slot period, lock quality (phase error stddev), and how much slot_cycles drifted during tracking.
+fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
+    const SYNC_MAX_ITER: u32 = 1 << 22;
+    let max_iter: u32 = args
+        .first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(SYNC_MAX_ITER)
+        .clamp(2048, SYNC_MAX_ITER);
+
+    let mut params = Vec::with_capacity(4);
+    params.extend_from_slice(&max_iter.to_le_bytes());
+
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_sync",
+        9,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+    if data.len() < 60 {
+        return Err(format!("sync response too short: {} bytes (want 60)", data.len()));
+    }
+
+    let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+    let gi32 = |off: usize| i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+    let g64 = |off: usize| u64::from_le_bytes([
+        data[off], data[off+1], data[off+2], data[off+3],
+        data[off+4], data[off+5], data[off+6], data[off+7],
+    ]);
+    let gi64 = |off: usize| i64::from_le_bytes([
+        data[off], data[off+1], data[off+2], data[off+3],
+        data[off+4], data[off+5], data[off+6], data[off+7],
+    ]);
+
+    let elapsed_us = g32(0) as u64;
+    let total_iter = g32(4) as u64;
+    let status = g32(8);
+    let edges_total = g32(12);
+    let acq_slot = g32(16);
+    let final_slot = g32(20);
+    let slot_min = g32(24);
+    let slot_max = g32(28);
+    let track_edges = g32(32);
+    let err_sum = gi64(36);
+    let err_sumsq = g64(44);
+    let err_min = gi32(52);
+    let err_max = gi32(56);
+
+    // Iteration → ns: total wall time / total iterations.
+    let ns_per_iter = if total_iter > 0 {
+        (elapsed_us as f64 * 1000.0) / total_iter as f64
+    } else {
+        0.0
+    };
+    let iter_mhz = if elapsed_us > 0 {
+        total_iter as f64 / elapsed_us as f64
+    } else {
+        0.0
+    };
+
+    let status_str = match status {
+        0 => "LOCKED",
+        1 => "acquisition timeout (not enough edges in budget)",
+        2 => "no edges seen — wire dead?",
+        _ => "unknown",
+    };
+    println!(
+        "PIPE wire sync ({} iterations, {:.3} ms wall time, {:.3} Miter/s, {:.1} ns/iter):",
+        total_iter, elapsed_us as f64 / 1000.0, iter_mhz, ns_per_iter,
+    );
+    println!("  status: {}", status_str);
+    println!("  edges seen: {} ({} acquisition + {} tracking)",
+        edges_total, edges_total.saturating_sub(track_edges), track_edges);
+
+    if status != 0 && status != 1 {
+        return Ok(());
+    }
+
+    let slot_ns = acq_slot as f64 * ns_per_iter;
+    let slot_hz = if slot_ns > 0.0 { 1e9 / slot_ns } else { 0.0 };
+    let final_slot_ns = final_slot as f64 * ns_per_iter;
+    let slot_drift = final_slot as i64 - acq_slot as i64;
+    let slot_drift_ppm = if acq_slot > 0 {
+        slot_drift as f64 * 1_000_000.0 / acq_slot as f64
+    } else {
+        0.0
+    };
+
+    println!();
+    println!("  initial lock (after 256-edge acquisition):");
+    println!("    slot_cycles: {} iterations = {:.3} µs/slot", acq_slot, slot_ns / 1000.0);
+    println!("    slot rate:   {:.1} Hz", slot_hz);
+
+    if track_edges > 0 {
+        let n = track_edges as f64;
+        let err_mean = err_sum as f64 / n;
+        let err_var = (err_sumsq as f64 / n - err_mean * err_mean).max(0.0);
+        let err_std = err_var.sqrt();
+        let err_mean_ns = err_mean * ns_per_iter;
+        let err_std_ns = err_std * ns_per_iter;
+        let slot_excursion_min_ns = (slot_min as i64 - acq_slot as i64) as f64 * ns_per_iter;
+        let slot_excursion_max_ns = (slot_max as i64 - acq_slot as i64) as f64 * ns_per_iter;
+
+        println!();
+        println!("  tracking ({} edges):", track_edges);
+        println!(
+            "    final slot_cycles: {} ({:.3} µs/slot)  →  drift from acq: {:+} iter ({:+.1} ppm)",
+            final_slot, final_slot_ns / 1000.0, slot_drift, slot_drift_ppm,
+        );
+        println!(
+            "    slot_cycles range during track: [{}, {}] ({:+.1} ns, {:+.1} ns from acq)",
+            slot_min, slot_max, slot_excursion_min_ns, slot_excursion_max_ns,
+        );
+        println!(
+            "    phase error per edge: mean {:+.2} iter ({:+.1} ns)  ± stddev {:.2} iter ({:.1} ns)",
+            err_mean, err_mean_ns, err_std, err_std_ns,
+        );
+        println!(
+            "    phase error range: [{}, {}] iter ([{:+.1}, {:+.1}] ns)",
+            err_min, err_max,
+            err_min as f64 * ns_per_iter, err_max as f64 * ns_per_iter,
+        );
+
+        // Lock quality interpretation: a clean lock has stddev << slot_cycles. >25% of slot → not really locked, <1% of slot → tight lock.
+        if acq_slot > 0 {
+            let std_frac = err_std / acq_slot as f64;
+            let quality = if std_frac < 0.01 {
+                "tight lock"
+            } else if std_frac < 0.05 {
+                "good lock"
+            } else if std_frac < 0.25 {
+                "loose lock"
+            } else {
+                "unlocked / noise dominated"
+            };
+            println!("    lock quality: {} (stddev = {:.2}% of slot)", quality, std_frac * 100.0);
+        }
+    } else {
+        println!();
+        println!("  no tracking edges within budget — increase MAX_ITER");
     }
 
     Ok(())
