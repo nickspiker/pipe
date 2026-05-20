@@ -26,7 +26,6 @@ extern crate alloc;
 
 use alloc::string::ToString;
 use alloc::vec;
-use core::cell::OnceCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -416,59 +415,60 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
 }
 
 // ---------------------------------------------------------------------------
-// Eagle Time epoch anchor — synced from the host on first cmd received.
+// Eagle Time epoch anchor — re-synced from the host on every cmd received.
 //
 // Host CLI uses `nunc-time` to source absolute Eagle Time and writes it into
-// every cmd's `creation_time` header field. On the first cmd received the
-// firmware records `(host_et, my_uptime_at_receive)` as the anchor. Subsequent
-// `next_eagle_time()` calls return `host_et + (now - anchor_uptime)` — an
-// absolute Eagle Time value monotonically increasing across responses.
+// every cmd's `creation_time` header field. The firmware re-anchors
+// `(host_et, my_uptime_at_receive)` on every cmd, so drift between cmds is
+// bounded by the inter-cmd interval rather than accumulating across the full
+// session. Subsequent `next_eagle_time()` calls return
+// `host_et + (now - anchor_uptime)` — an absolute Eagle Time value monotonic
+// across responses.
 //
 // `LAST_ET` enforces strict monotonicity: every emitted Eagle Time value is
-// strictly greater than the previous one. Two responses in the same tick get
-// distinct (consecutive) Eagle Time values, satisfying Nick's "add one
-// oscillation" rule for ordering.
+// strictly greater than the previous one. If the host's clock ever moves
+// backwards (NTP correction, DST, etc), the anchor moves with it but
+// `LAST_ET` still prevents emitted timestamps from decreasing.
 //
-// EPOCH lives in a `static mut OnceCell` (read-mostly, written exactly once on
-// the first cmd) accessed via `&raw const` to avoid the static_mut_refs
-// lint; the bridge handle_frames task is single-threaded on core 0.
+// EPOCH lives in a `static mut Option<(u64, u64)>` accessed via `&raw const`/
+// `&raw mut` to avoid the static_mut_refs lint; the bridge handle_frames task
+// is single-threaded on core 0, so reads and writes can't race.
 // ---------------------------------------------------------------------------
 
-static mut EPOCH: OnceCell<(u64, u64)> = OnceCell::new();
+static mut EPOCH: Option<(u64, u64)> = None;
 static LAST_ET: AtomicU64 = AtomicU64::new(0);
 
-/// Record (host_eagle_time, my_uptime_us_at_receive) from the first cmd
-/// received. Subsequent calls are no-ops.
+/// Record `(host_eagle_time, my_uptime_us_at_receive)` from the current cmd.
+/// Re-anchors on every call so drift is bounded by the inter-cmd interval.
+/// No-op if the cmd's header omits `creation_time` (clockless callers).
 fn anchor_epoch_from_cmd(input: &[u8]) {
-    // SAFETY: the bridge runs handle_frames on a single embassy task pinned to core 0; anchor_epoch_from_cmd is only called from there, so we have exclusive access to EPOCH.
-    let epoch_ref = unsafe { &mut *(&raw mut EPOCH) };
-    if epoch_ref.get().is_some() {
-        return;
-    }
     let (header, _) = match VsfHeader::decode(input) {
         Ok(h) => h,
         Err(_) => return,
     };
-    // creation_time is Option<VsfType>; host CLI always sets it (sourced from nunc-time), so we only anchor when it's actually present.
     let host_et = match &header.creation_time {
         Some(VsfType::e(EtType::e5(v))) => *v as u64,
         Some(VsfType::e(EtType::e6(v))) => *v as u64,
         Some(VsfType::e(EtType::e7(v))) => *v as u64,
         _ => return,
     };
-    let _ = epoch_ref.set((host_et, Instant::now().as_micros()));
+    // SAFETY: the bridge runs handle_frames on a single embassy task pinned to core 0; anchor_epoch_from_cmd is only called from there, so we have exclusive access to EPOCH and the write can't race with the read in next_eagle_time().
+    unsafe {
+        *(&raw mut EPOCH) = Some((host_et, Instant::now().as_micros()));
+    }
 }
 
 /// Return a strictly-monotonic Eagle Time value for the next outgoing packet.
 /// Returns `0` until the first cmd anchors the epoch.
 fn next_eagle_time() -> u64 {
     // SAFETY: see `anchor_epoch_from_cmd` — only called from the single bridge task.
-    let epoch_ref = unsafe { &*(&raw const EPOCH) };
-    let candidate = match epoch_ref.get() {
+    // Option<(u64, u64)> is Copy, so we get a snapshot — no torn reads possible on the single core 0 caller.
+    let snapshot = unsafe { *(&raw const EPOCH) };
+    let candidate = match snapshot {
         Some((host_et, anchor_us)) => {
             // host_et is in 21cm oscillations (~1.42 GHz); `Instant::as_micros()` is in microseconds.
             // Split-multiply by OSCILLATIONS_PER_SECOND so `secs * OPS` only overflows past ~400 years of uptime.
-            let delta_us = Instant::now().as_micros().saturating_sub(*anchor_us);
+            let delta_us = Instant::now().as_micros().saturating_sub(anchor_us);
             let delta_secs = delta_us / 1_000_000;
             let delta_sub_us = delta_us % 1_000_000;
             let delta_oscillations = delta_secs
@@ -480,6 +480,7 @@ fn next_eagle_time() -> u64 {
     };
     // Monotonic bump: never emit a value equal to or less than the previous one.
     // portable_atomic provides AtomicU64 CAS on Cortex-M0+ via critical_section polyfill.
+    // Survives host clock corrections that move the anchor backwards — emitted values stay strictly increasing.
     loop {
         let prev = LAST_ET.load(PaOrdering::Relaxed);
         let next = candidate.max(prev.saturating_add(1));
