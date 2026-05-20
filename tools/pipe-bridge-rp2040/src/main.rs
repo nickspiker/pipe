@@ -203,20 +203,37 @@ static STATS_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::
 const STATS_MAX_SAMPLES: u32 = 1 << 22;
 
 // ---------------------------------------------------------------------------
-// Wire sync — phase-locked loop on the enclave's slot clock.
+// Wire sync — bang-bang PLL with per-polarity phase anchoring.
 //
-// Per PROTOCOL.md Layer 2: idle wire is the 1010 pattern with 100% edge density (one edge per slot), the enclave drives the 1s actively, the pull-down handles the 0s. Each inter-edge interval IS one slot period.
+// The RC asymmetry on the wire (driver charges through ~800Ω fast, pull-down discharges through 5kΩ slow) means rising and falling threshold crossings sit at *different* offsets from the true slot boundary. A single mixed-polarity anchor inevitably locks to one polarity and rejects the other as half-slot-offset. Solution: each polarity has its own phase anchor (iter_since_rise / iter_since_fall, both increment every iteration); each accepted edge measures its own polarity's mod-folded interval against the shared slot estimate, both polarities contribute ±1 slews to the same `interval`.
 //
-// Algorithm:
-//   ACQUISITION — wait for first edge to anchor; then sum the next 256 inter-edge intervals (= 256 slots) in loop-iteration units. Initial slot_cycles = sum / 256. Strong noise rejection because loop is constant-time so iteration count ∝ wall time.
-//   TRACKING — on each subsequent edge: error = actual_interval - slot_cycles; slot_cycles += error / 256. Bounded slew: a single bad edge can only move the lock by 1/256 of itself, so glitches and noise can't slam it but real PVT drift (orders of magnitude slower) tracks smoothly.
+// ACQUISITION: 256 mixed-polarity inter-edge intervals seed interval = (sum / 256) << FRAC_BITS. Polarity-specific counters reset to zero on the first own-polarity edge after acquisition completes.
 //
-// Loop body must stay constant-time for the iteration↔wall-time mapping to hold; lives inside interrupt::free same as the other fast_* paths.
+// TRACKING per polarity P (P ∈ {rising, falling}):
+//   slot = interval >> 11
+//   n_slots = round(iter_since_P / slot)                  // typically 2 in idle (rise→rise spans 2 slots)
+//   phase_err = iter_since_P - n_slots * slot             // residual within slot grid
+//   if |phase_err| < slot/8:
+//     interval ± 1 (sign, ±1 deadband)
+//     iter_since_P = 0; record signed phase_err
+//     // ALSO: mod-fold iter_since_OTHER against slot; residual = RC offset contribution
+//     rc_offset_sum_from_P += residual
+//   else: reject this polarity for this edge (anchor stays)
+//
+// RC OFFSET MEASUREMENT: at falling acceptance, iter_since_rise gives time-since-last-rising. In idle that's ideally 1 slot; with RC, it's 1*slot + (rc_fall - rc_rise) = slot + Δrc. Mod-fold against slot, residual ≈ Δrc. At rising acceptance, iter_since_fall residual ≈ -Δrc. Difference between the two means = 2*Δrc directly, in iter units. This is the bridge-side measurement of the slot-grid offset between rising and falling threshold crossings.
+//
+// FIXED-POINT: interval is u32 with 11 frac bits (1/256 P × 1/8 window = 1/2048 = 2^11). Each ±1 step on interval = slot/2048 — bang-bang slew rate cap. 2048 same-direction accepts to shift integer slot by 1 iter — way above any realistic PVT drift rate.
+//
+// LOOP DISCIPLINE: body must stay constant-time per iter for the iter ↔ wall-time mapping to hold. Lives inside interrupt::free.
 // ---------------------------------------------------------------------------
 const SYNC_ACQ_EDGES: u32 = 256;
-const SYNC_SLEW_DIVISOR: i32 = 256;
+/// Fractional bits below the integer slot_cycles value. Each ±1 step on `interval` slews slot_cycles by 1/2^FRAC of a slot. Tune to trade P-gain for noise immunity: 11 = slot/2048 per edge (default), bigger = quieter/slower, smaller = faster/jitterier.
+const SYNC_FRAC_BITS: u32 = 11;
 /// Hard cap on inner-loop iterations to bound wall time even if the wire is dead. At ~24 MS/s ≈ 42 ns/iter, 2^22 ≈ 175 ms.
 const SYNC_MAX_ITERATIONS: u32 = 1 << 22;
+/// Per-polarity histogram bin count for signed phase_err. Centered on zero, covers ±SYNC_HIST_HALF_RANGE iter at 1-iter resolution. Edges beyond go to per-polarity overflow counters.
+const SYNC_HIST_BINS: usize = 256;
+const SYNC_HIST_HALF_RANGE: i32 = (SYNC_HIST_BINS as i32) / 2; // = 128, range is [-128, +127]
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -225,37 +242,45 @@ struct SyncResult {
     total_iterations: u32,
     /// 0 = locked OK, 1 = ran out of iterations during acquisition, 2 = no edge ever seen.
     status: u32,
-    edges_total: u32,
-    /// slot_cycles immediately after acquisition (mean of first 256 intervals).
+    /// Initial mean inter-edge interval after acquisition (raw iter, not fixed-point).
     acquisition_slot_cycles: u32,
-    /// slot_cycles at end of tracking (after all slew corrections).
-    final_slot_cycles: u32,
-    /// Extremes of slot_cycles observed during tracking.
-    slot_cycles_min: u32,
-    slot_cycles_max: u32,
-    /// Edge count during tracking phase only.
-    track_edges: u32,
-    /// Per-edge phase error stats during tracking, in iteration units. error = observed_interval - slot_cycles (before applying slew). Host derives mean + stddev from sum / sumsq.
-    err_sum: i64,
-    err_sumsq: u64,
-    err_min: i32,
-    err_max: i32,
+    /// Final `interval` value (fixed-point, SYNC_FRAC_BITS frac bits). Integer slot_cycles = final_interval_fp >> SYNC_FRAC_BITS.
+    final_interval_fp: u32,
+    /// Per-polarity tracking edge counts (no rejection — every edge counts).
+    rising_total: u32,
+    falling_total: u32,
+    /// Edges with phase_err outside the histogram range [-HALF, +HALF). Per polarity per sign.
+    rising_neg_overflow: u32,
+    rising_pos_overflow: u32,
+    falling_neg_overflow: u32,
+    falling_pos_overflow: u32,
+    /// Signed sum of phase_err (iter units) across all tracking edges, both polarities. Trends to zero in steady state — diagnostic for lock convergence.
+    phase_sum: i64,
+    /// RC offset measurement. At rising slew, fold iter_since_fall against slot → residual ≈ -Δrc. At falling slew, fold iter_since_rise → residual ≈ +Δrc. Means subtracted give 2*Δrc.
+    fall_to_rise_offset_sum: i64,
+    rise_to_fall_offset_sum: i64,
+    /// Per-polarity signed phase_err histogram. Bin i covers phase_err = i - SYNC_HIST_HALF_RANGE iter. u16 holds up to 65k edges per bin — well above any per-bin density at our edge rates.
+    rising_hist: [u16; SYNC_HIST_BINS],
+    falling_hist: [u16; SYNC_HIST_BINS],
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
     elapsed_us: 0,
     total_iterations: 0,
     status: 0,
-    edges_total: 0,
     acquisition_slot_cycles: 0,
-    final_slot_cycles: 0,
-    slot_cycles_min: 0,
-    slot_cycles_max: 0,
-    track_edges: 0,
-    err_sum: 0,
-    err_sumsq: 0,
-    err_min: 0,
-    err_max: 0,
+    final_interval_fp: 0,
+    rising_total: 0,
+    falling_total: 0,
+    rising_neg_overflow: 0,
+    rising_pos_overflow: 0,
+    falling_neg_overflow: 0,
+    falling_pos_overflow: 0,
+    phase_sum: 0,
+    fall_to_rise_offset_sum: 0,
+    rise_to_fall_offset_sum: 0,
+    rising_hist: [0; SYNC_HIST_BINS],
+    falling_hist: [0; SYNC_HIST_BINS],
 };
 
 static SYNC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
@@ -551,107 +576,177 @@ fn fast_sync(max_iter: u32) -> SyncResult {
     let start = embassy_time::Instant::now();
 
     let mut prev: u32 = unsafe { gpio_in.read_volatile() & 1 };
-    let mut cycles_since_edge: u32 = 0;
     let mut iter: u32 = 1;
     let mut edge_count: u32 = 0;
+    let mut any_anchored: bool = false;
 
-    // Unified acquisition+tracking loop. ONE inner loop body so the compiler can't emit different per-iteration code for the two phases — that's critical because we use iteration count as the timebase, and the iter↔wall-time mapping has to be constant across the entire run. The edge handler branches on edge_count to switch behavior, but the 99.9% common path (non-edge) is identical throughout.
+    // Acquisition (mixed-polarity sum of inter-edge intervals, mean = 1 slot in idle).
+    let mut iter_since_any_edge: u32 = 0;
     let mut acq_sum: u64 = 0;
     let mut acquisition_slot_cycles: u32 = 0;
-    let mut slot_cycles: i32 = 0;
-    let mut slot_min: i32 = i32::MAX;
-    let mut slot_max: i32 = i32::MIN;
-    let mut track_edges: u32 = 0;
-    let mut err_sum: i64 = 0;
-    let mut err_sumsq: u64 = 0;
-    let mut err_min: i32 = i32::MAX;
-    let mut err_max: i32 = i32::MIN;
-    let mut anchored: bool = false;
+
+    // Per-polarity tracking counters. Increment every iter regardless of edges.
+    let mut iter_since_rise: u32 = 0;
+    let mut iter_since_fall: u32 = 0;
+    let mut rise_anchored: bool = false;
+    let mut fall_anchored: bool = false;
+
+    // Shared slot estimate (fixed-point, SYNC_FRAC_BITS frac bits).
+    let mut interval_fp: u32 = 0;
+
+    let mut rising_total: u32 = 0;
+    let mut falling_total: u32 = 0;
+    let mut rising_neg_overflow: u32 = 0;
+    let mut rising_pos_overflow: u32 = 0;
+    let mut falling_neg_overflow: u32 = 0;
+    let mut falling_pos_overflow: u32 = 0;
+    let mut phase_sum: i64 = 0;
+    let mut fall_to_rise_offset_sum: i64 = 0;
+    let mut rise_to_fall_offset_sum: i64 = 0;
+    let mut rising_hist = [0u16; SYNC_HIST_BINS];
+    let mut falling_hist = [0u16; SYNC_HIST_BINS];
 
     while iter < max_iter {
         let cur = unsafe { gpio_in.read_volatile() & 1 };
         iter += 1;
-        cycles_since_edge += 1;
+        iter_since_any_edge += 1;
+        iter_since_rise += 1;
+        iter_since_fall += 1;
         if cur != prev {
+            let rising = cur == 1;
             prev = cur;
-            if !anchored {
-                // First edge: discard the partial pre-edge interval; from here on every interval is a real slot-to-slot measurement.
-                anchored = true;
-                cycles_since_edge = 0;
+            if !any_anchored {
+                any_anchored = true;
+                iter_since_any_edge = 0;
                 continue;
             }
             edge_count += 1;
             if edge_count <= SYNC_ACQ_EDGES {
-                acq_sum += cycles_since_edge as u64;
+                // Acquisition: sum mixed-polarity intervals; seed interval_fp at the boundary edge.
+                acq_sum += iter_since_any_edge as u64;
+                iter_since_any_edge = 0;
                 if edge_count == SYNC_ACQ_EDGES {
                     acquisition_slot_cycles = (acq_sum / SYNC_ACQ_EDGES as u64) as u32;
-                    slot_cycles = acquisition_slot_cycles as i32;
-                    slot_min = slot_cycles;
-                    slot_max = slot_cycles;
+                    interval_fp = acquisition_slot_cycles << SYNC_FRAC_BITS;
+                    // Anchor on whichever polarity this last acquisition edge was.
+                    if rising {
+                        iter_since_rise = 0;
+                        rise_anchored = true;
+                    } else {
+                        iter_since_fall = 0;
+                        fall_anchored = true;
+                    }
                 }
             } else {
-                let error: i32 = cycles_since_edge as i32 - slot_cycles;
-                err_sum += error as i64;
-                err_sumsq += (error as i64 * error as i64) as u64;
-                if error < err_min {
-                    err_min = error;
+                // Tracking. Per-polarity anchor + mod-fold against own counter. No rejection — every edge slews and counts.
+                let slot = (interval_fp >> SYNC_FRAC_BITS) as i32;
+                if slot < 8 {
+                    // Defensive — slot estimate collapsed; bump overflow and skip.
+                    if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
+                    continue;
                 }
-                if error > err_max {
-                    err_max = error;
+                let half_slot = slot / 2;
+
+                let own_anchored = if rising { rise_anchored } else { fall_anchored };
+                if !own_anchored {
+                    // First edge of this polarity post-acquisition; just anchor it.
+                    if rising {
+                        iter_since_rise = 0;
+                        rise_anchored = true;
+                        rising_total += 1;
+                    } else {
+                        iter_since_fall = 0;
+                        fall_anchored = true;
+                        falling_total += 1;
+                    }
+                    continue;
                 }
-                track_edges += 1;
-                slot_cycles += error / SYNC_SLEW_DIVISOR;
-                if slot_cycles < slot_min {
-                    slot_min = slot_cycles;
+
+                let own_iter = if rising { iter_since_rise as i32 } else { iter_since_fall as i32 };
+                let mut n_slots = (own_iter + half_slot) / slot;
+                if n_slots == 0 {
+                    n_slots = 1;
                 }
-                if slot_cycles > slot_max {
-                    slot_max = slot_cycles;
+                let expected = n_slots * slot;
+                let phase_err = own_iter - expected;
+
+                // Always slew on sign (no deadband). Float onto the actual lock.
+                if phase_err > 0 {
+                    interval_fp = interval_fp.wrapping_add(1);
+                } else if phase_err < 0 {
+                    interval_fp = interval_fp.wrapping_sub(1);
+                }
+                phase_sum += phase_err as i64;
+
+                // Bin phase_err into per-polarity histogram (±HALF_RANGE iter, 1-iter resolution).
+                let bin_signed = phase_err + SYNC_HIST_HALF_RANGE;
+                if bin_signed >= 0 && bin_signed < SYNC_HIST_BINS as i32 {
+                    if rising {
+                        rising_hist[bin_signed as usize] = rising_hist[bin_signed as usize].saturating_add(1);
+                    } else {
+                        falling_hist[bin_signed as usize] = falling_hist[bin_signed as usize].saturating_add(1);
+                    }
+                } else if phase_err < 0 {
+                    if rising { rising_neg_overflow += 1 } else { falling_neg_overflow += 1 };
+                } else {
+                    if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
+                }
+
+                // RC offset using the OTHER polarity's counter (folded against slot).
+                let other_iter = if rising { iter_since_fall as i32 } else { iter_since_rise as i32 };
+                let other_anchored = if rising { fall_anchored } else { rise_anchored };
+                if other_anchored {
+                    let mut o_n = (other_iter + half_slot) / slot;
+                    if o_n == 0 { o_n = 1; }
+                    let o_residual = other_iter - o_n * slot;
+                    if rising {
+                        fall_to_rise_offset_sum += o_residual as i64;
+                    } else {
+                        rise_to_fall_offset_sum += o_residual as i64;
+                    }
+                }
+
+                if rising {
+                    rising_total += 1;
+                    iter_since_rise = 0;
+                } else {
+                    falling_total += 1;
+                    iter_since_fall = 0;
                 }
             }
-            cycles_since_edge = 0;
         }
     }
 
-    // Status from how far we got.
-    let status: u32 = if !anchored {
-        2 // never saw an edge
+    let status: u32 = if !any_anchored {
+        2
     } else if edge_count < SYNC_ACQ_EDGES {
-        1 // acquisition incomplete
+        1
     } else {
-        0 // locked
+        0
     };
 
     if status == 1 && edge_count > 0 {
-        // Partial acquisition: report the partial mean as the "lock".
         acquisition_slot_cycles = (acq_sum / edge_count as u64) as u32;
-        slot_cycles = acquisition_slot_cycles as i32;
-        slot_min = slot_cycles;
-        slot_max = slot_cycles;
-    }
-
-    if track_edges == 0 {
-        err_min = 0;
-        err_max = 0;
-    }
-    if slot_min == i32::MAX {
-        slot_min = slot_cycles;
-        slot_max = slot_cycles;
+        interval_fp = acquisition_slot_cycles << SYNC_FRAC_BITS;
     }
 
     SyncResult {
         elapsed_us: start.elapsed().as_micros() as u32,
         total_iterations: iter,
         status,
-        edges_total: edge_count,
         acquisition_slot_cycles,
-        final_slot_cycles: slot_cycles as u32,
-        slot_cycles_min: slot_min as u32,
-        slot_cycles_max: slot_max as u32,
-        track_edges,
-        err_sum,
-        err_sumsq,
-        err_min,
-        err_max,
+        final_interval_fp: interval_fp,
+        rising_total,
+        falling_total,
+        rising_neg_overflow,
+        rising_pos_overflow,
+        falling_neg_overflow,
+        falling_pos_overflow,
+        phase_sum,
+        fall_to_rise_offset_sum,
+        rise_to_fall_offset_sum,
+        rising_hist,
+        falling_hist,
     }
 }
 
@@ -1425,21 +1520,39 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 fields.push(("err".to_string(), VsfType::a("sync_timeout".to_string())));
             } else {
                 let s = unsafe { SYNC_RESULT };
-                // Layout (all LE), 60 bytes: u32 elapsed_us, u32 total_iterations, u32 status, u32 edges_total, u32 acquisition_slot_cycles, u32 final_slot_cycles, u32 slot_cycles_min, u32 slot_cycles_max, u32 track_edges, i64 err_sum, u64 err_sumsq, i32 err_min, i32 err_max.
-                let mut payload = alloc::vec::Vec::with_capacity(60);
+                // Layout (all LE), 1092 bytes (11 × u32 + 3 × i64 + 2 × 256 × u16 hists + bin-count header u32):
+                //   u32 elapsed_us, total_iterations, status, frac_bits, acquisition_slot_cycles, final_interval_fp,
+                //   u32 rising_total, falling_total,
+                //   u32 rising_neg_overflow, rising_pos_overflow, falling_neg_overflow, falling_pos_overflow,
+                //   u32 hist_bins, hist_half_range,
+                //   i64 phase_sum, fall_to_rise_offset_sum, rise_to_fall_offset_sum,
+                //   u16[hist_bins] rising_hist, u16[hist_bins] falling_hist
+                let hist_bytes = SYNC_HIST_BINS * 2;
+                let cap = 14 * 4 + 3 * 8 + 2 * hist_bytes;
+                let mut payload = alloc::vec::Vec::with_capacity(cap);
                 payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
                 payload.extend_from_slice(&s.total_iterations.to_le_bytes());
                 payload.extend_from_slice(&s.status.to_le_bytes());
-                payload.extend_from_slice(&s.edges_total.to_le_bytes());
+                payload.extend_from_slice(&SYNC_FRAC_BITS.to_le_bytes());
                 payload.extend_from_slice(&s.acquisition_slot_cycles.to_le_bytes());
-                payload.extend_from_slice(&s.final_slot_cycles.to_le_bytes());
-                payload.extend_from_slice(&s.slot_cycles_min.to_le_bytes());
-                payload.extend_from_slice(&s.slot_cycles_max.to_le_bytes());
-                payload.extend_from_slice(&s.track_edges.to_le_bytes());
-                payload.extend_from_slice(&s.err_sum.to_le_bytes());
-                payload.extend_from_slice(&s.err_sumsq.to_le_bytes());
-                payload.extend_from_slice(&s.err_min.to_le_bytes());
-                payload.extend_from_slice(&s.err_max.to_le_bytes());
+                payload.extend_from_slice(&s.final_interval_fp.to_le_bytes());
+                payload.extend_from_slice(&s.rising_total.to_le_bytes());
+                payload.extend_from_slice(&s.falling_total.to_le_bytes());
+                payload.extend_from_slice(&s.rising_neg_overflow.to_le_bytes());
+                payload.extend_from_slice(&s.rising_pos_overflow.to_le_bytes());
+                payload.extend_from_slice(&s.falling_neg_overflow.to_le_bytes());
+                payload.extend_from_slice(&s.falling_pos_overflow.to_le_bytes());
+                payload.extend_from_slice(&(SYNC_HIST_BINS as u32).to_le_bytes());
+                payload.extend_from_slice(&(SYNC_HIST_HALF_RANGE as u32).to_le_bytes());
+                payload.extend_from_slice(&s.phase_sum.to_le_bytes());
+                payload.extend_from_slice(&s.fall_to_rise_offset_sum.to_le_bytes());
+                payload.extend_from_slice(&s.rise_to_fall_offset_sum.to_le_bytes());
+                for v in &s.rising_hist {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in &s.falling_hist {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

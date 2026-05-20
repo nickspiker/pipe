@@ -669,7 +669,7 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `wire_sync [MAX_ITER]` — runs the CDR sync loop on the bridge: locks to the enclave's idle 1010 pattern via 256-edge acquisition + bounded-slew tracking. Reports the locked slot period, lock quality (phase error stddev), and how much slot_cycles drifted during tracking.
+/// `wire_sync [MAX_ITER]` — runs the bang-bang CDR loop on the bridge: 256-edge mixed-polarity acquisition seeds a fixed-point `interval`, then per-edge mod-fold + ±1 slew tracks the slot rate. Reports the locked period plus per-polarity (rising / falling) phase offsets so the RC asymmetry is visible.
 fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     const SYNC_MAX_ITER: u32 = 1 << 22;
     let max_iter: u32 = args
@@ -701,36 +701,46 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
             _ => None,
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
-    if data.len() < 60 {
-        return Err(format!("sync response too short: {} bytes (want 60)", data.len()));
+    // Scalar header is 14 × u32 + 3 × i64 = 80 bytes; then 2 × hist_bins × u16.
+    if data.len() < 80 {
+        return Err(format!("sync response too short: {} bytes (want >= 80 scalar header)", data.len()));
     }
-
     let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-    let gi32 = |off: usize| i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-    let g64 = |off: usize| u64::from_le_bytes([
-        data[off], data[off+1], data[off+2], data[off+3],
-        data[off+4], data[off+5], data[off+6], data[off+7],
-    ]);
     let gi64 = |off: usize| i64::from_le_bytes([
         data[off], data[off+1], data[off+2], data[off+3],
         data[off+4], data[off+5], data[off+6], data[off+7],
     ]);
+    let g16 = |off: usize| u16::from_le_bytes([data[off], data[off+1]]);
 
     let elapsed_us = g32(0) as u64;
     let total_iter = g32(4) as u64;
     let status = g32(8);
-    let edges_total = g32(12);
+    let frac_bits = g32(12);
     let acq_slot = g32(16);
-    let final_slot = g32(20);
-    let slot_min = g32(24);
-    let slot_max = g32(28);
-    let track_edges = g32(32);
-    let err_sum = gi64(36);
-    let err_sumsq = g64(44);
-    let err_min = gi32(52);
-    let err_max = gi32(56);
+    let final_interval_fp = g32(20);
+    let rising_total = g32(24);
+    let falling_total = g32(28);
+    let rising_neg_overflow = g32(32);
+    let rising_pos_overflow = g32(36);
+    let falling_neg_overflow = g32(40);
+    let falling_pos_overflow = g32(44);
+    let hist_bins = g32(48) as usize;
+    let hist_half_range = g32(52) as i32;
+    let phase_sum = gi64(56);
+    let fall_to_rise_offset_sum = gi64(64);
+    let rise_to_fall_offset_sum = gi64(72);
 
-    // Iteration → ns: total wall time / total iterations.
+    let hist_off = 80;
+    let hist_bytes = hist_bins * 2;
+    if data.len() < hist_off + 2 * hist_bytes {
+        return Err(format!(
+            "sync response truncated: have {} bytes, need {} (scalars + 2 × {} bins)",
+            data.len(), hist_off + 2 * hist_bytes, hist_bins,
+        ));
+    }
+    let rising_hist: Vec<u16> = (0..hist_bins).map(|i| g16(hist_off + i * 2)).collect();
+    let falling_hist: Vec<u16> = (0..hist_bins).map(|i| g16(hist_off + hist_bytes + i * 2)).collect();
+
     let ns_per_iter = if total_iter > 0 {
         (elapsed_us as f64 * 1000.0) / total_iter as f64
     } else {
@@ -741,6 +751,7 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     } else {
         0.0
     };
+    let fp_to_iter = |fp: u32| (fp as f64) / (1u64 << frac_bits) as f64;
 
     let status_str = match status {
         0 => "LOCKED",
@@ -753,76 +764,96 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         total_iter, elapsed_us as f64 / 1000.0, iter_mhz, ns_per_iter,
     );
     println!("  status: {}", status_str);
-    println!("  edges seen: {} ({} acquisition + {} tracking)",
-        edges_total, edges_total.saturating_sub(track_edges), track_edges);
+    println!("  frac_bits: {} (1 fp unit = slot/{})", frac_bits, 1u32 << frac_bits);
 
-    if status != 0 && status != 1 {
+    if status == 2 {
         return Ok(());
     }
 
-    let slot_ns = acq_slot as f64 * ns_per_iter;
-    let slot_hz = if slot_ns > 0.0 { 1e9 / slot_ns } else { 0.0 };
-    let final_slot_ns = final_slot as f64 * ns_per_iter;
-    let slot_drift = final_slot as i64 - acq_slot as i64;
+    let slot_ns_acq = acq_slot as f64 * ns_per_iter;
+    let slot_hz_acq = if slot_ns_acq > 0.0 { 1e9 / slot_ns_acq } else { 0.0 };
+    let final_slot_iter = fp_to_iter(final_interval_fp);
+    let final_slot_ns = final_slot_iter * ns_per_iter;
+    let slot_drift_iter = final_slot_iter - acq_slot as f64;
     let slot_drift_ppm = if acq_slot > 0 {
-        slot_drift as f64 * 1_000_000.0 / acq_slot as f64
+        slot_drift_iter * 1_000_000.0 / acq_slot as f64
     } else {
         0.0
     };
 
     println!();
-    println!("  initial lock (after 256-edge acquisition):");
-    println!("    slot_cycles: {} iterations = {:.3} µs/slot", acq_slot, slot_ns / 1000.0);
-    println!("    slot rate:   {:.1} Hz", slot_hz);
+    println!("  acquisition (256 mixed-polarity edges):");
+    println!("    slot_cycles: {} iter = {:.3} µs/slot ({:.1} Hz)", acq_slot, slot_ns_acq / 1000.0, slot_hz_acq);
 
-    if track_edges > 0 {
-        let n = track_edges as f64;
-        let err_mean = err_sum as f64 / n;
-        let err_var = (err_sumsq as f64 / n - err_mean * err_mean).max(0.0);
-        let err_std = err_var.sqrt();
-        let err_mean_ns = err_mean * ns_per_iter;
-        let err_std_ns = err_std * ns_per_iter;
-        let slot_excursion_min_ns = (slot_min as i64 - acq_slot as i64) as f64 * ns_per_iter;
-        let slot_excursion_max_ns = (slot_max as i64 - acq_slot as i64) as f64 * ns_per_iter;
+    let total_edges = rising_total + falling_total;
+    let total_ov = rising_neg_overflow + rising_pos_overflow + falling_neg_overflow + falling_pos_overflow;
 
-        println!();
-        println!("  tracking ({} edges):", track_edges);
-        println!(
-            "    final slot_cycles: {} ({:.3} µs/slot)  →  drift from acq: {:+} iter ({:+.1} ppm)",
-            final_slot, final_slot_ns / 1000.0, slot_drift, slot_drift_ppm,
-        );
-        println!(
-            "    slot_cycles range during track: [{}, {}] ({:+.1} ns, {:+.1} ns from acq)",
-            slot_min, slot_max, slot_excursion_min_ns, slot_excursion_max_ns,
-        );
-        println!(
-            "    phase error per edge: mean {:+.2} iter ({:+.1} ns)  ± stddev {:.2} iter ({:.1} ns)",
-            err_mean, err_mean_ns, err_std, err_std_ns,
-        );
-        println!(
-            "    phase error range: [{}, {}] iter ([{:+.1}, {:+.1}] ns)",
-            err_min, err_max,
-            err_min as f64 * ns_per_iter, err_max as f64 * ns_per_iter,
-        );
+    println!();
+    println!("  tracking edges: {} total ({} rising + {} falling); {} hist overflow",
+        total_edges, rising_total, falling_total, total_ov,
+    );
 
-        // Lock quality interpretation: a clean lock has stddev << slot_cycles. >25% of slot → not really locked, <1% of slot → tight lock.
-        if acq_slot > 0 {
-            let std_frac = err_std / acq_slot as f64;
-            let quality = if std_frac < 0.01 {
-                "tight lock"
-            } else if std_frac < 0.05 {
-                "good lock"
-            } else if std_frac < 0.25 {
-                "loose lock"
-            } else {
-                "unlocked / noise dominated"
-            };
-            println!("    lock quality: {} (stddev = {:.2}% of slot)", quality, std_frac * 100.0);
-        }
-    } else {
-        println!();
-        println!("  no tracking edges within budget — increase MAX_ITER");
+    if total_edges == 0 {
+        println!("  no tracking edges — increase MAX_ITER or check wire");
+        return Ok(());
     }
+
+    println!();
+    println!("  final interval (fp): {} = {:.4} iter = {:.3} µs/slot   drift {:+.4} iter ({:+.1} ppm)",
+        final_interval_fp, final_slot_iter, final_slot_ns / 1000.0,
+        slot_drift_iter, slot_drift_ppm,
+    );
+
+    let phase_mean = phase_sum as f64 / total_edges as f64;
+    println!("  shared phase: mean {:+.3} iter ({:+.1} ns) over {} edges (trends to 0 when locked)",
+        phase_mean, phase_mean * ns_per_iter, total_edges);
+
+    if rising_total > 0 && falling_total > 0 {
+        let fr_mean = fall_to_rise_offset_sum as f64 / rising_total as f64;
+        let rf_mean = rise_to_fall_offset_sum as f64 / falling_total as f64;
+        let delta_rc = (rf_mean - fr_mean) / 2.0;
+        println!("  RC offset: rise→fall {:+.3} iter, fall→rise {:+.3} iter  →  Δrc = {:+.3} iter ({:+.1} ns)",
+            rf_mean, fr_mean, delta_rc, delta_rc * ns_per_iter);
+    }
+
+    // Per-polarity phase_err histograms. Bin i represents phase_err = (i - hist_half_range) iter.
+    // Trim to populated range, side-by-side bar chart.
+    let render_hist = |label: &str, hist: &[u16], neg_ov: u32, pos_ov: u32| {
+        let total: u64 = hist.iter().map(|&v| v as u64).sum::<u64>() + neg_ov as u64 + pos_ov as u64;
+        if total == 0 {
+            println!("    {} hist: (no edges)", label);
+            return;
+        }
+        let first = hist.iter().position(|&v| v > 0);
+        let last = hist.iter().rposition(|&v| v > 0);
+        let max_count: u16 = hist.iter().copied().max().unwrap_or(0);
+        if max_count == 0 {
+            println!("    {} hist: all in overflow ({} neg, {} pos)", label, neg_ov, pos_ov);
+            return;
+        }
+        let bar_max = 40usize;
+        println!("    {} hist (signed iter offset → count, total {}, overflow {} neg / {} pos):",
+            label, total, neg_ov, pos_ov);
+        if let (Some(f), Some(l)) = (first, last) {
+            for i in f..=l {
+                let count = hist[i];
+                if count == 0 { continue; }
+                let signed_off = i as i32 - hist_half_range;
+                let bar_w = (count as f64 / max_count as f64 * bar_max as f64).round() as usize;
+                println!("      {:+5} iter ({:+8.1} ns)  {:>5}  {}",
+                    signed_off,
+                    signed_off as f64 * ns_per_iter,
+                    count,
+                    "#".repeat(bar_w),
+                );
+            }
+        }
+    };
+
+    println!();
+    render_hist("rising", &rising_hist, rising_neg_overflow, rising_pos_overflow);
+    println!();
+    render_hist("falling", &falling_hist, falling_neg_overflow, falling_pos_overflow);
 
     Ok(())
 }
