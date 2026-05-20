@@ -323,7 +323,7 @@ impl From<EndpointError> for Disconnected {
 /// Phase 2 loop: parse VSF commands from USB, dispatch, respond with VSF.
 ///
 /// Wire format (each packet = one frame, fits in 64-byte CDC packet for now):
-///   Every packet is a complete VSF document with one section named "PIPE message".
+///   Every packet is a complete VSF document with one section named "pipe_message".
 ///   Body shape: [(d"op":a"<name>")(d"id":u<n>)(...optional fields...)]
 ///   The section name lives in the header TOC entry only; body is just fields.
 ///   Direction (cmd vs resp) is implicit from USB transfer direction.
@@ -449,10 +449,11 @@ fn anchor_epoch_from_cmd(input: &[u8]) {
         Ok(h) => h,
         Err(_) => return,
     };
+    // creation_time is Option<VsfType>; host CLI always sets it (sourced from nunc-time), so we only anchor when it's actually present.
     let host_et = match &header.creation_time {
-        VsfType::e(EtType::e5(v)) => *v as u64,
-        VsfType::e(EtType::e6(v)) => *v as u64,
-        VsfType::e(EtType::e7(v)) => *v as u64,
+        Some(VsfType::e(EtType::e5(v))) => *v as u64,
+        Some(VsfType::e(EtType::e6(v))) => *v as u64,
+        Some(VsfType::e(EtType::e7(v))) => *v as u64,
         _ => return,
     };
     let _ = epoch_ref.set((host_et, Instant::now().as_micros()));
@@ -531,12 +532,12 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         return (0, PostAction::None);
     }
 
-    // Locate the "PIPE message" section in the header TOC, then schema-parse its body.
+    // Locate the "pipe_message" section in the header TOC, then schema-parse its body.
     let (header, _) = match VsfHeader::decode(input) {
         Ok(h) => h,
         Err(_) => return (0, PostAction::None),
     };
-    let field = match header.fields.iter().find(|f| f.name == "PIPE message") {
+    let field = match header.fields.iter().find(|f| f.name == "pipe_message") {
         Some(f) => f,
         _ => return (0, PostAction::None),
     };
@@ -619,7 +620,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         .version(7, 7)
         .creation_time_oscillations(next_eagle_time() as i64)
         .provenance_only()
-        .add_section("PIPE message", fields)
+        .add_section("pipe_message", fields)
         .build();
     let bytes = match doc {
         Ok(b) => b,

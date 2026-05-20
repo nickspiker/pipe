@@ -137,7 +137,7 @@ fn build_cmd_doc(
         .version(7, 7)
         .creation_time_oscillations(now_eagle_oscillations())
         .provenance_only()
-        .add_section("PIPE message", fields)
+        .add_section("pipe_message", fields)
         .build()
 }
 
@@ -218,8 +218,8 @@ fn parse_resp(bytes: &[u8]) -> Result<SectionBuilder, String> {
     let field = header
         .fields
         .iter()
-        .find(|f| f.name == "PIPE message")
-        .ok_or_else(|| "response missing 'PIPE message' section".to_string())?;
+        .find(|f| f.name == "pipe_message")
+        .ok_or_else(|| "response missing 'pipe_message' section".to_string())?;
     let end = field.offset_bytes + field.size_bytes;
     if end > bytes.len() {
         return Err("section bounds out of range".into());
