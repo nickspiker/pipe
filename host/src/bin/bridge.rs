@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_status|wire_trace [SAMPLES [PERIOD_NS]]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -96,6 +96,8 @@ fn main() -> ExitCode {
         "info" => cmd_info(&port_path),
         "uptime" => cmd_uptime(&port_path),
         "random" => cmd_random(&port_path, cmd_args),
+        "wire_status" => cmd_wire_status(&port_path),
+        "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
         "reset" => cmd_action(&port_path, "reset"),
         "flash" => cmd_flash(&port_path, cmd_args),
@@ -337,6 +339,197 @@ fn cmd_random(port_path: &str, args: &[String]) -> Result<(), String> {
         print!("{:02X}", b);
     }
     println!();
+    Ok(())
+}
+
+fn cmd_wire_status(port_path: &str) -> Result<(), String> {
+    let (resp, _rtt) = send_cmd(port_path, "wire_status", 6, vec![])?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+    if data.len() != 24 {
+        return Err(format!("expected 24 bytes of stats, got {}", data.len()));
+    }
+    let u32_at = |i: usize| -> u32 {
+        u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]])
+    };
+    let samples = u32_at(0);
+    let high = u32_at(4);
+    let low = u32_at(8);
+    let zeros = u32_at(12);
+    let ones = u32_at(16);
+    let toggles = u32_at(20);
+    let pct = |n: u32, d: u32| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
+    println!("PIPE wire status:");
+    println!("  samples:            {}", samples);
+    println!("  high:               {} ({:.1}%)", high, pct(high, samples));
+    println!("  low:                {} ({:.1}%)", low, pct(low, samples));
+    println!("  toggles (sample→sample): {} ({:.1}% of intervals)",
+             toggles, pct(toggles, samples.saturating_sub(1).max(1)));
+    println!("  decoded zeros:      {} ({:.1}%)", zeros, pct(zeros, zeros + ones));
+    println!("  decoded ones:       {} ({:.1}%)", ones, pct(ones, zeros + ones));
+    println!();
+    println!("Diagnosis:");
+    if samples < 100 {
+        println!("  Need more samples — wait longer between flash and wire_status.");
+    } else if high < 10 || low < 10 {
+        println!("  Wire is stuck (essentially all-high or all-low).");
+        println!("  → FPGA not driving, wire not connected, or pull-down absent.");
+    } else if toggles < samples / 4 {
+        println!("  Wire has activity but not alternating reliably.");
+        println!("  → check slot rate (20 µs/sample), FPGA might be running at different clk.");
+    } else if pct(toggles, samples - 1) > 90.0 && zeros > 10 * ones {
+        println!("  IDEAL: ~50% high, ~50% low, ~100% alternation, decode = all-zeros.");
+        println!("  → FPGA enclave idle pattern detected, codec locked, mirror-XOR working.");
+    } else if pct(toggles, samples - 1) > 90.0 && ones > 10 * zeros {
+        println!("  Wire alternating but decoded as all-ones — phase off by one slot.");
+        println!("  → flip my_slot initial state in pipe_wire_task and reflash.");
+    } else {
+        println!("  Partial activity, no clean pattern — slot rate off or wire noisy.");
+    }
+    Ok(())
+}
+
+/// Capture 256 consecutive raw GP0 samples and print the bit pattern.
+/// Tells us instantly what's actually on the wire (idle 1010, stuck-HIGH, noisy, etc.)
+/// without depending on the codec interpretation or slot phase guessing.
+///
+/// Payload format from firmware: [slot_us u32 LE][32 bytes packed bits, LSB-first per byte].
+/// `wire_trace [SAMPLES [PERIOD_NS]]` — captures up to 8192 raw GP0 samples at
+/// the bridge's native loop rate (~8-12 MS/s) or at a host-specified period.
+/// Defaults: 8192 samples, native rate. Response carries the measured elapsed
+/// wall time so we report the true sample rate the device actually achieved.
+fn cmd_wire_trace(port_path: &str, args: &[String]) -> Result<(), String> {
+    const TRACE_MAX_SAMPLES: u32 = 8192;
+    let samples: u32 = args
+        .first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SAMPLES: {e}")))
+        .transpose()?
+        .unwrap_or(TRACE_MAX_SAMPLES)
+        .clamp(1, TRACE_MAX_SAMPLES);
+    let period_ns: u32 = args
+        .get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad PERIOD_NS: {e}")))
+        .transpose()?
+        .unwrap_or(0);
+
+    let mut params = Vec::with_capacity(8);
+    params.extend_from_slice(&samples.to_le_bytes());
+    params.extend_from_slice(&period_ns.to_le_bytes());
+
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_trace",
+        7,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+    if data.len() < 8 {
+        return Err(format!("trace response too short: {} bytes", data.len()));
+    }
+    let captured = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let elapsed_us = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
+    let expected_bytes = (captured + 7) >> 3;
+    if data.len() < 8 + expected_bytes {
+        return Err(format!(
+            "trace truncated: header says {captured} samples ({expected_bytes} bytes) but blob has only {} bytes after the 8-byte header",
+            data.len() - 8
+        ));
+    }
+    let bits = &data[8..8 + expected_bytes];
+    let samples_vec: Vec<u8> = (0..captured)
+        .map(|i| (bits[i >> 3] >> (i & 7)) & 1)
+        .collect();
+    let high = samples_vec.iter().filter(|&&b| b == 1).count();
+    let low = captured - high;
+    let toggles = samples_vec.windows(2).filter(|w| w[0] != w[1]).count();
+    let total_ms = elapsed_us as f64 / 1000.0;
+    let rate_mhz = if elapsed_us > 0 {
+        captured as f64 / elapsed_us as f64
+    } else {
+        0.0
+    };
+    let avg_period_ns = if captured > 0 {
+        (elapsed_us as f64 * 1000.0) / captured as f64
+    } else {
+        0.0
+    };
+
+    println!(
+        "PIPE wire trace ({} samples, {:.3} ms wall time, {:.3} MS/s, {:.1} ns/sample):",
+        captured, total_ms, rate_mhz, avg_period_ns
+    );
+    if period_ns == 0 {
+        println!("  mode: native loop rate");
+    } else {
+        println!("  mode: requested {} ns period", period_ns);
+    }
+    println!(
+        "  high: {} ({:.1}%)   low: {} ({:.1}%)   toggles: {}",
+        high,
+        100.0 * high as f64 / captured.max(1) as f64,
+        low,
+        100.0 * low as f64 / captured.max(1) as f64,
+        toggles,
+    );
+    if toggles > 0 {
+        let avg_interval_ns = (captured as f64 - 1.0) / toggles as f64 * avg_period_ns;
+        let est_freq_hz = if avg_interval_ns > 0.0 {
+            1_000_000_000.0 / (2.0 * avg_interval_ns)
+        } else {
+            0.0
+        };
+        println!(
+            "  avg gap between toggles: {:.1} ns → estimated signal freq: {:.0} Hz",
+            avg_interval_ns, est_freq_hz
+        );
+    }
+    println!();
+
+    // Hex dump — 16 bytes per row (= 128 samples per row), LSB-first within each
+    // byte so byte order on the page matches time order. Each row labels its
+    // µs-from-start offset using the *measured* per-sample period.
+    let bytes_per_row: usize = 16;
+    println!(
+        "  offset(µs)    hex (16 bytes = {} samples per row)",
+        bytes_per_row * 8
+    );
+    let mut byte_idx = 0;
+    while byte_idx < bits.len() {
+        let row_end = (byte_idx + bytes_per_row).min(bits.len());
+        let row_start_us = ((byte_idx * 8) as f64 * avg_period_ns / 1000.0) as usize;
+        let mut line = String::with_capacity(48);
+        for (i, b) in bits[byte_idx..row_end].iter().enumerate() {
+            if i > 0 && i % 4 == 0 {
+                line.push(' ');
+            }
+            line.push_str(&format!("{:02X}", b));
+        }
+        println!("  {:>6}        {}", row_start_us, line);
+        byte_idx += bytes_per_row;
+    }
     Ok(())
 }
 

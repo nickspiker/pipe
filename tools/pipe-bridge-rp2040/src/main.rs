@@ -37,7 +37,7 @@ use defmt::*;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Blocking, Flash};
-use embassy_rp::gpio::{Drive, Level, Output};
+use embassy_rp::gpio::{Drive, Flex, Level, Output, Pull};
 use embassy_rp::multicore::{Stack, spawn_core1};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
@@ -106,6 +106,97 @@ static USB_STATE: AtomicU8 = AtomicU8::new(STATE_IDLE);
 // load inside the LFSR loop catches state changes too).
 static WAKE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+// ---------------------------------------------------------------------------
+// PIPE wire stats. Written by core 1's pipe_wire_task, read by core 0's
+// dispatch handler when a `wire_status` cmd arrives. Single-writer / many-
+// reader pattern → portable_atomic with Relaxed ordering is fine.
+//
+// Idle math for the host-side codec talking to an enclave-side FPGA:
+//   - FPGA drives HIGH on its slots (idle wire = 1)
+//   - host releases on its slots (5kΩ pull-down → wire = 0)
+//   - wire trace alternates 1 0 1 0 …
+//   - host's codec.rx(1) at correct phase decodes 0; locked = all-zeros stream
+// ---------------------------------------------------------------------------
+static WIRE_SAMPLES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static WIRE_HIGH: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static WIRE_LOW: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static RX_ZEROS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static RX_ONES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static WIRE_TOGGLES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+/// Slot/sample period in µs. Build script estimates 600 kHz / 12 = 50 kHz → 20 µs/slot,
+/// but the ROSC is process-dependent and we currently run the FPGA at SLOT_DIV=192 as
+/// a dev-rig workaround for breadboard capacitance. Measured slot period via wire_trace:
+/// ~312 µs (3.2 kHz slot rate, enclave_clk ~615 kHz × 1/192). Re-measure with wire_trace
+/// after any FPGA re-program before trusting codec decode.
+const SLOT_US: u64 = 312;
+
+// ---------------------------------------------------------------------------
+// Fast wire-trace buffer — tight bit-banged GPIO read at native CPU rate
+// (~8-12 MS/s on M0+ @ 125 MHz). Up to TRACE_MAX_SAMPLES bits packed LSB-first
+// per byte, byte 0 = earliest samples. Triggered cross-core via TRACE_REQUEST:
+//   core 0 (dispatch): store sample count → TRACE_REQUEST
+//   core 1 (wire task): sees request, runs fast_capture, posts to TRACE_RESPONSE
+//   core 0: polls TRACE_RESPONSE, reads TRACE_FAST_BUF, builds VSF response
+//
+// TRACE_FAST_BUF is `static mut` rather than `[AtomicU8; N]` because AtomicU8
+// fetch_or/fetch_and on Cortex-M0+ uses a critical_section polyfill (no native
+// LDREX/STREX). At 8192 iterations that polyfill cost dominates capture time
+// and ruins the constant-period sampling. The Release store on TRACE_RESPONSE
+// pairs with the Acquire load on core 0 to publish all buffer writes safely.
+// ---------------------------------------------------------------------------
+const TRACE_MAX_SAMPLES: usize = 8192;
+const TRACE_MAX_BYTES: usize = TRACE_MAX_SAMPLES / 8;
+static mut TRACE_FAST_BUF: [u8; TRACE_MAX_BYTES] = [0u8; TRACE_MAX_BYTES];
+
+/// Cross-core request: number of samples to capture. 0 = idle, >0 = arm.
+/// Core 1 zeroes it after capture completes.
+static TRACE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Cross-core response: number of samples actually captured (set by core 1
+/// after fast_capture returns; Release ordering publishes TRACE_FAST_BUF too).
+static TRACE_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Measured elapsed time of the last capture, in microseconds. Host divides
+/// by sample count to compute actual sample rate (so we don't have to trust
+/// the loop's cycle count — the timer tells us what really happened).
+static TRACE_ELAPSED_US: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Desired sample period in nanoseconds. 0 = native loop rate (no delay
+/// between samples). Set by core 0 before storing TRACE_REQUEST.
+static TRACE_PERIOD_NS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+/// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs.
+/// Inlined here to keep the firmware crate self-contained for now; once the
+/// codec is stable we'll lift it into a shared `pipe_codec` crate that both
+/// host and firmware import.
+struct Codec {
+    own_idle: u8,
+    other_idle: u8,
+    own_last: u8,
+    other_last: u8,
+}
+
+impl Codec {
+    const fn host() -> Self {
+        Self {
+            own_idle: 0,
+            other_idle: 1,
+            own_last: 0,
+            other_last: 0,
+        }
+    }
+    fn tx(&mut self, data: u8) -> u8 {
+        let d = data & 1;
+        let wire = self.own_idle ^ d ^ self.other_last;
+        self.own_last = d;
+        wire & 1
+    }
+    fn rx(&mut self, wire: u8) -> u8 {
+        let w = wire & 1;
+        let data = w ^ self.other_idle ^ self.own_last;
+        self.other_last = data;
+        data
+    }
+}
+
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
 });
@@ -136,6 +227,105 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 ///   - Two 32-bit compares:  2
 ///   - Conditional GPIO:     1-2
 ///   Total: ~12-15 cycles → ~8-10 MHz at 125 MHz sys_clk
+/// Tight bit-banged GPIO read into TRACE_FAST_BUF. Caller must guarantee
+/// `samples ≤ TRACE_MAX_SAMPLES`, that GP0 is in input mode, and that no
+/// other code touches the buffer for the duration. Returns measured wall
+/// time in microseconds — host uses it to compute the true sample rate.
+/// The timer is ground truth; don't trust the loop's nominal cycle count.
+///
+/// **Native path (period_ns = 0):** 8x-unrolled inner loop reads SIO.gpio_in
+/// directly via `read_volatile` (bypassing Flex), shifts bit 0 into position,
+/// ORs into a u8 accumulator, stores one byte. Per-sample cost on M0+ is
+/// roughly LDR + AND + LSL + ORR ≈ 4-5 cycles → ~25-30 MS/s. The byte-store
+/// boundary adds maybe 6-8 cycles, so every 8th sample sees a ~2x stutter —
+/// irrelevant for diagnostic use; the *average* period that elapsed_us
+/// reports is what matters.
+///
+/// **Delay path (period_ns > 0):** simple per-sample loop with
+/// `cortex_m::asm::delay(cycles)` between reads, cycles = period_ns ×
+/// sys_clk_hz / 1e9. Effective period > requested at low values because
+/// the read+pack overhead floors it.
+fn fast_capture(samples: usize, period_ns: u32) -> u32 {
+    let samples = samples.min(TRACE_MAX_SAMPLES);
+    if samples == 0 {
+        return 0;
+    }
+    let bytes_used = (samples + 7) >> 3;
+
+    // Zero only the portion we'll write — saves 1 KiB of store traffic on
+    // short captures.
+    let buf_ptr = &raw mut TRACE_FAST_BUF as *mut u8;
+    unsafe {
+        for i in 0..bytes_used {
+            buf_ptr.add(i).write_volatile(0);
+        }
+    }
+
+    // SIO.gpio_in(0) is a single u32 mirror of GP0–GP29 input states; GP0 is bit 0.
+    // (bank 1 is QSPI pads, irrelevant here.) Hold the pointer so the inner loop
+    // is just LDR with no PAC handle marshalling.
+    let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
+
+    let sys_clk_hz = embassy_rp::clocks::clk_sys_freq() as u64;
+    let delay_cycles: u32 = if period_ns == 0 {
+        0
+    } else {
+        ((period_ns as u64) * sys_clk_hz / 1_000_000_000) as u32
+    };
+
+    let start = embassy_time::Instant::now();
+
+    if delay_cycles == 0 {
+        // Native rate: 8 samples → 1 byte, no per-sample byte_idx/bit_pos math.
+        let whole_bytes = samples >> 3;
+        let tail = samples & 7;
+        unsafe {
+            for byte_idx in 0..whole_bytes {
+                let b0 = (gpio_in.read_volatile() & 1) as u8;
+                let b1 = (gpio_in.read_volatile() & 1) as u8;
+                let b2 = (gpio_in.read_volatile() & 1) as u8;
+                let b3 = (gpio_in.read_volatile() & 1) as u8;
+                let b4 = (gpio_in.read_volatile() & 1) as u8;
+                let b5 = (gpio_in.read_volatile() & 1) as u8;
+                let b6 = (gpio_in.read_volatile() & 1) as u8;
+                let b7 = (gpio_in.read_volatile() & 1) as u8;
+                let byte = b0
+                    | (b1 << 1)
+                    | (b2 << 2)
+                    | (b3 << 3)
+                    | (b4 << 4)
+                    | (b5 << 5)
+                    | (b6 << 6)
+                    | (b7 << 7);
+                buf_ptr.add(byte_idx).write_volatile(byte);
+            }
+            // Tail: 0-7 partial bits at the end. Slower per sample but tiny.
+            if tail > 0 {
+                let mut byte: u8 = 0;
+                for bit in 0..tail {
+                    byte |= ((gpio_in.read_volatile() & 1) as u8) << bit;
+                }
+                buf_ptr.add(whole_bytes).write_volatile(byte);
+            }
+        }
+    } else {
+        // Delay path: per-sample timing, kept simple. Inter-byte stutter is
+        // irrelevant when delay_cycles dominates.
+        unsafe {
+            for i in 0..samples {
+                let bit = (gpio_in.read_volatile() & 1) as u8;
+                let byte_idx = i >> 3;
+                let bit_pos = (i & 7) as u8;
+                let p = buf_ptr.add(byte_idx);
+                p.write_volatile(p.read_volatile() | (bit << bit_pos));
+                cortex_m::asm::delay(delay_cycles);
+            }
+        }
+    }
+
+    start.elapsed().as_micros() as u32
+}
+
 /// Core 1's PIPE wire task — owns GP0.
 ///
 /// Phase 1 (current): holds the pin idle. Phase 2 will:
@@ -150,11 +340,75 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 /// The wire core stays single-purpose: PIO timing must not perturb (or be
 /// perturbed by) USB latency, so all USB work lives on core 0.
 #[embassy_executor::task]
-async fn pipe_wire_task(_wire: Output<'static>) {
+async fn pipe_wire_task(mut wire: Flex<'static>) {
+    // Configure GP0 as input with no pull — the FPGA-side 5kΩ external
+    // pull-down dominates the line when nobody's driving.
+    wire.set_as_input();
+    wire.set_pull(Pull::None);
+
+    let mut codec = Codec::host();
+
+    // my_slot alternates. We don't know the initial phase relative to the
+    // FPGA, so we start with `false` (assume first sample lands in the
+    // enclave's slot). If decoded data comes back as all-ones instead of
+    // all-zeros, we're off by one phase — host CLI can show this via
+    // wire_status and we flip my_slot manually for now.
+    let mut my_slot: bool = false;
+    let mut last_sample: u8 = 0;
+    let mut next_tick =
+        embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
+
     loop {
-        // Nothing to do until Phase 2. Long sleep to keep the task alive
-        // without burning core 1; embassy's time driver handles wake.
-        embassy_time::Timer::after_secs(60).await;
+        // Trace arm-check runs *before* awaiting the next slot tick so a capture
+        // request never waits up to a full SLOT_US to start. fast_capture runs
+        // inside interrupt::free so timer/USB IRQs can't perturb the cadence;
+        // duration is bounded (≤ TRACE_MAX_SAMPLES × period_ns + native overhead,
+        // ≤ ~1 ms at native rate, ≤ ~80 ms at 10 µs period). After it returns we
+        // re-anchor next_tick to "now" so the slot loop doesn't fire a burst of
+        // catch-up samples for the time we spent off-slot.
+        let req = TRACE_REQUEST.load(PaOrdering::Acquire);
+        if req != 0 {
+            let samples = (req as usize).min(TRACE_MAX_SAMPLES);
+            let period_ns = TRACE_PERIOD_NS.load(PaOrdering::Relaxed);
+            let elapsed_us = cortex_m::interrupt::free(|_| fast_capture(samples, period_ns));
+            TRACE_ELAPSED_US.store(elapsed_us, PaOrdering::Relaxed);
+            // Release: pairs with core 0's Acquire on TRACE_RESPONSE, publishing
+            // both TRACE_FAST_BUF writes and TRACE_ELAPSED_US.
+            TRACE_RESPONSE.store(samples as u32, PaOrdering::Release);
+            TRACE_REQUEST.store(0, PaOrdering::Relaxed);
+            next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
+        }
+
+        embassy_time::Timer::at(next_tick).await;
+        next_tick += embassy_time::Duration::from_micros(SLOT_US);
+
+        let sample: u8 = if wire.is_high() { 1 } else { 0 };
+
+        WIRE_SAMPLES.fetch_add(1, PaOrdering::Relaxed);
+        if sample == 1 {
+            WIRE_HIGH.fetch_add(1, PaOrdering::Relaxed);
+        } else {
+            WIRE_LOW.fetch_add(1, PaOrdering::Relaxed);
+        }
+        if sample != last_sample {
+            WIRE_TOGGLES.fetch_add(1, PaOrdering::Relaxed);
+        }
+        last_sample = sample;
+
+        if !my_slot {
+            // Enclave's slot: decode their bit.
+            let rx = codec.rx(sample);
+            if rx == 1 {
+                RX_ONES.fetch_add(1, PaOrdering::Relaxed);
+            } else {
+                RX_ZEROS.fetch_add(1, PaOrdering::Relaxed);
+            }
+        } else {
+            // Our slot: in v0 we never actually drive (TX added in next step).
+            // Still tick the codec so own_last stays consistent.
+            let _ = codec.tx(0);
+        }
+        my_slot = !my_slot;
     }
 }
 
@@ -323,9 +577,9 @@ async fn main(spawner: Spawner) {
 
     // ---- GPIO setup ------------------------------------------------------
     // GP0 = the PIPE wire pin. Ownership moves to core 1 (the wire core).
-    // Phase 2: core 1 hands this to a PIO state machine implementing the
-    // mirror-XOR codec. Phase 1 (current): core 1 just holds it idle.
-    let wire = Output::new(p.PIN_0, Level::Low);
+    // Flex so we can switch between Input (RX/listen) and Output (TX/drive HIGH).
+    // RX-only phase right now — input mode, FPGA-side 5kΩ pull-down handles LOW.
+    let wire = Flex::new(p.PIN_0);
 
     // GP25 = external heartbeat LED. Direct-soldered (no series resistor)
     // at 2 mA drive strength — pin's own current limit replaces the resistor.
@@ -443,9 +697,12 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
     // see `]` (end of cmd section). Host writes hp-validated cmds that are
     // typically 78-100 bytes — well over the 64-byte CDC packet limit — so a
     // single-packet read is never enough. `out_buf` is sized for the biggest
-    // response (`info` ≈ 180 B with hp + did) plus headroom.
+    // response: wire_trace at TRACE_MAX_SAMPLES (8192 bits = 1024 bytes) plus
+    // 8 B count/elapsed header plus ~100 B VSF framing → 2 KiB is comfortable.
+    // dispatch() silently drops responses that don't fit, so undersizing this
+    // surfaces as a mysterious host-side timeout (not an error code).
     let mut in_buf = [0u8; 256];
-    let mut out_buf = [0u8; 256];
+    let mut out_buf = [0u8; 2048];
     const MAX_PACKET: usize = 64;
     let mut acc_len = 0usize;
     loop {
@@ -703,6 +960,88 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             let mut buf = [0u8; 32];
             gather_random(&mut buf[..count]);
             fields.push(("data".to_string(), VsfType::v(b'b', buf[..count].to_vec())));
+        }
+        "wire_status" => {
+            // Pack 6 × u32 LE into the `data` blob:
+            //   samples, high, low, decoded_zeros, decoded_ones, toggles.
+            // Host CLI decodes and pretty-prints.
+            let s = WIRE_SAMPLES.load(PaOrdering::Relaxed);
+            let h = WIRE_HIGH.load(PaOrdering::Relaxed);
+            let l = WIRE_LOW.load(PaOrdering::Relaxed);
+            let z = RX_ZEROS.load(PaOrdering::Relaxed);
+            let o = RX_ONES.load(PaOrdering::Relaxed);
+            let t = WIRE_TOGGLES.load(PaOrdering::Relaxed);
+            let mut buf = [0u8; 24];
+            buf[0..4].copy_from_slice(&s.to_le_bytes());
+            buf[4..8].copy_from_slice(&h.to_le_bytes());
+            buf[8..12].copy_from_slice(&l.to_le_bytes());
+            buf[12..16].copy_from_slice(&z.to_le_bytes());
+            buf[16..20].copy_from_slice(&o.to_le_bytes());
+            buf[20..24].copy_from_slice(&t.to_le_bytes());
+            fields.push(("data".to_string(), VsfType::v(b'b', buf.to_vec())));
+        }
+        "wire_trace" => {
+            // Input params packed into the request `data` blob:
+            //   bytes 0..4  : samples (u32 LE) — output positions, clamped to
+            //                 [1, TRACE_MAX_SAMPLES]
+            //   bytes 4..8  : period_ns (u32 LE) — 0 = native loop rate,
+            //                 >0 = delay between samples in nanoseconds
+            // Missing/short blob → defaults: full buffer at native rate.
+            let data_in = cmd
+                .get("data")
+                .ok()
+                .and_then(|vs| vs.first().cloned())
+                .and_then(|v| match v {
+                    VsfType::v(b'b', bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let (samples_req, period_ns) = if data_in.len() >= 8 {
+                (
+                    u32::from_le_bytes([data_in[0], data_in[1], data_in[2], data_in[3]]),
+                    u32::from_le_bytes([data_in[4], data_in[5], data_in[6], data_in[7]]),
+                )
+            } else {
+                (TRACE_MAX_SAMPLES as u32, 0u32)
+            };
+            let samples_req = samples_req.min(TRACE_MAX_SAMPLES as u32);
+
+            if samples_req == 0 {
+                fields.push(("err".to_string(), VsfType::a("zero_samples".to_string())));
+            } else {
+                // Arm: clear response first (so the poll below can wait on a
+                // 0→N transition), publish period, then store samples count.
+                // Release on TRACE_REQUEST pairs with core 1's Acquire load.
+                TRACE_RESPONSE.store(0, PaOrdering::Relaxed);
+                TRACE_PERIOD_NS.store(period_ns, PaOrdering::Relaxed);
+                TRACE_REQUEST.store(samples_req, PaOrdering::Release);
+
+                // Worst-case wall time = samples × period_ns; cap at 2 s so a
+                // stuck wire task can't hang dispatch. At TRACE_MAX_SAMPLES
+                // (8192) and 100 µs/sample that's 819 ms — comfortably inside.
+                let deadline = Instant::now() + embassy_time::Duration::from_secs(2);
+                while TRACE_RESPONSE.load(PaOrdering::Acquire) == 0 {
+                    if Instant::now() > deadline {
+                        break;
+                    }
+                    cortex_m::asm::nop();
+                }
+
+                let captured = TRACE_RESPONSE.load(PaOrdering::Relaxed);
+                let elapsed_us = TRACE_ELAPSED_US.load(PaOrdering::Relaxed);
+                let bytes_used = ((captured as usize) + 7) >> 3;
+
+                // Response layout: [captured u32 LE][elapsed_us u32 LE][bitpacked samples].
+                // Host divides elapsed_us by captured to derive the true rate.
+                let mut payload = alloc::vec::Vec::with_capacity(8 + bytes_used);
+                payload.extend_from_slice(&captured.to_le_bytes());
+                payload.extend_from_slice(&elapsed_us.to_le_bytes());
+                let buf_ptr = &raw const TRACE_FAST_BUF as *const u8;
+                for i in 0..bytes_used {
+                    payload.push(unsafe { buf_ptr.add(i).read_volatile() });
+                }
+                fields.push(("data".to_string(), VsfType::v(b'b', payload)));
+            }
         }
         _ => {
             fields.push(("err".to_string(), VsfType::a("unknown_op".to_string())));
