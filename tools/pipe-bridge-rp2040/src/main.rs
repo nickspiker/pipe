@@ -458,26 +458,24 @@ fn anchor_epoch_from_cmd(input: &[u8]) {
     }
 }
 
-/// Return a strictly-monotonic Eagle Time value for the next outgoing packet.
-/// Returns `0` until the first cmd anchors the epoch.
-fn next_eagle_time() -> u64 {
+/// Return a strictly-monotonic Eagle Time value for the next outgoing packet, or `None` if the bridge has no clock anchor yet (no cmd has ever provided `creation_time`).
+/// When `None`, the response omits the `e` field entirely rather than emit a fake/zero timestamp — same honesty rule the VSF spec applies to clockless devices.
+fn next_eagle_time() -> Option<u64> {
     // SAFETY: see `anchor_epoch_from_cmd` — only called from the single bridge task.
     // Option<(u64, u64)> is Copy, so we get a snapshot — no torn reads possible on the single core 0 caller.
     let snapshot = unsafe { *(&raw const EPOCH) };
-    let candidate = match snapshot {
-        Some((host_et, anchor_us)) => {
-            // host_et is in 21cm oscillations (~1.42 GHz); `Instant::as_micros()` is in microseconds.
-            // Split-multiply by OSCILLATIONS_PER_SECOND so `secs * OPS` only overflows past ~400 years of uptime.
-            let delta_us = Instant::now().as_micros().saturating_sub(anchor_us);
-            let delta_secs = delta_us / 1_000_000;
-            let delta_sub_us = delta_us % 1_000_000;
-            let delta_oscillations = delta_secs
-                .saturating_mul(OSCILLATIONS_PER_SECOND)
-                .saturating_add(delta_sub_us * OSCILLATIONS_PER_SECOND / 1_000_000);
-            host_et.saturating_add(delta_oscillations)
-        }
-        None => 0,
-    };
+    let (host_et, anchor_us) = snapshot?;
+
+    // host_et is in 21cm oscillations (~1.42 GHz); `Instant::as_micros()` is in microseconds.
+    // Split-multiply by OSCILLATIONS_PER_SECOND so `secs * OPS` only overflows past ~400 years of uptime.
+    let delta_us = Instant::now().as_micros().saturating_sub(anchor_us);
+    let delta_secs = delta_us / 1_000_000;
+    let delta_sub_us = delta_us % 1_000_000;
+    let delta_oscillations = delta_secs
+        .saturating_mul(OSCILLATIONS_PER_SECOND)
+        .saturating_add(delta_sub_us * OSCILLATIONS_PER_SECOND / 1_000_000);
+    let candidate = host_et.saturating_add(delta_oscillations);
+
     // Monotonic bump: never emit a value equal to or less than the previous one.
     // portable_atomic provides AtomicU64 CAS on Cortex-M0+ via critical_section polyfill.
     // Survives host clock corrections that move the anchor backwards — emitted values stay strictly increasing.
@@ -488,7 +486,7 @@ fn next_eagle_time() -> u64 {
             .compare_exchange_weak(prev, next, PaOrdering::Relaxed, PaOrdering::Relaxed)
             .is_ok()
         {
-            return next;
+            return Some(next);
         }
     }
 }
@@ -617,12 +615,12 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         }
     }
 
-    let doc = VsfBuilder::new()
-        .version(7, 7)
-        .creation_time_oscillations(next_eagle_time() as i64)
-        .provenance_only()
-        .add_section("pipe_message", fields)
-        .build();
+    // Only attach a creation_time if we have an anchor; clockless responses honestly omit the `e` field.
+    let mut builder = VsfBuilder::new().version(7, 7).provenance_only();
+    if let Some(et) = next_eagle_time() {
+        builder = builder.creation_time_oscillations(et as i64);
+    }
+    let doc = builder.add_section("pipe_message", fields).build();
     let bytes = match doc {
         Ok(b) => b,
         Err(_) => return (0, PostAction::None),

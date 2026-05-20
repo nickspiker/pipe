@@ -35,6 +35,10 @@ const DEFAULT_PORT: &str = "/dev/ttyACM0";
 /// Global `--inspect` flag — set once during arg parsing, read by send_cmd to optionally pretty-print every request and response.
 static INSPECT: AtomicBool = AtomicBool::new(false);
 
+/// Global `--no-time` flag — when set, the host pretends to be a clockless device and omits `creation_time` from the cmd.
+/// Useful for testing the bridge's honest-when-clockless behaviour.
+static NO_TIME: AtomicBool = AtomicBool::new(false);
+
 /// Global `--save <prefix>` — set once during arg parsing; if non-empty, send_cmd writes raw request to `{prefix}_req.vsf` and raw response to `{prefix}_resp.vsf`.
 /// Useful for running `vsfinfo <path> verify` against the captured wire bytes.
 static SAVE_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -55,6 +59,11 @@ fn main() -> ExitCode {
         }
         if args[i] == "--inspect" {
             INSPECT.store(true, Ordering::Relaxed);
+            args.remove(i);
+            continue;
+        }
+        if args[i] == "--no-time" {
+            NO_TIME.store(true, Ordering::Relaxed);
             args.remove(i);
             continue;
         }
@@ -133,12 +142,11 @@ fn build_cmd_doc(
     fields.push(("id".to_string(), VsfType::u(id as usize, false)));
     fields.extend(extras);
 
-    VsfBuilder::new()
-        .version(7, 7)
-        .creation_time_oscillations(now_eagle_oscillations())
-        .provenance_only()
-        .add_section("pipe_message", fields)
-        .build()
+    let mut builder = VsfBuilder::new().version(7, 7).provenance_only();
+    if !NO_TIME.load(Ordering::Relaxed) {
+        builder = builder.creation_time_oscillations(now_eagle_oscillations());
+    }
+    builder.add_section("pipe_message", fields).build()
 }
 
 /// Send a cmd packet, read the response bytes (closes on `]`), return `(response_bytes, round_trip_time)`.
