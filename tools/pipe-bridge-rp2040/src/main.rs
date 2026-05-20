@@ -183,16 +183,21 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
     }
 
     // Outer state-driven loop:
-    //   IDLE  → run LFSR in bursts, yield between bursts so USB gets serviced
-    //   TX/RX → set LED, then await Signal — task sleeps, zero CPU
+    //   IDLE  → run a small LFSR burst, sleep on TIMER IRQ for SLEEP_US.
+    //   TX/RX → set LED, await Signal — task sleeps until USB activity ends.
     //
-    // The inner LFSR loop CANNOT be tight-spin because geiger shares core 0
-    // with the USB + dispatch task; without yields, the executor never polls
-    // those futures and the bridge looks bricked on the USB bus. Burst size
-    // tuned so the LED still flickers fast enough to look "geiger-counter"
-    // (sub-millisecond visual rate) while leaving USB IRQ work plenty of
-    // headroom.
+    // Both wait paths are interrupt-driven: TIMER IRQ on the IDLE side, USB
+    // IRQ (via WAKE_SIGNAL) on the TX/RX side. When all tasks are sleeping
+    // on their respective IRQs, the embassy executor calls `wfe` and the
+    // Cortex-M0+ enters sleep until something wakes it. No busy polling
+    // anywhere on core 0; USB events get serviced with minimum latency.
+    //
+    // BURST × (1 / SLEEP_US) = LFSR step rate.
+    //   64 steps / 125 µs = ~512 kHz — well above any visual-flicker
+    //   threshold (humans see <100 Hz), but multiple orders of magnitude
+    //   below the original ~8 MHz busy-loop rate, which saves the CPU.
     const BURST: u32 = 64;
+    const SLEEP_US: u64 = 125;
     loop {
         match USB_STATE.load(Ordering::Relaxed) {
             STATE_TX => {
@@ -204,7 +209,7 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
                 WAKE_SIGNAL.wait().await;
             }
             _ => {
-                // IDLE: BURST iterations of LFSR, then yield to let USB run.
+                // IDLE: BURST iterations of LFSR, then sleep on the timer.
                 for _ in 0..BURST {
                     if USB_STATE.load(Ordering::Relaxed) != STATE_IDLE {
                         break;
@@ -227,7 +232,7 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
                         heartbeat.set_low();
                     }
                 }
-                embassy_futures::yield_now().await;
+                embassy_time::Timer::after_micros(SLEEP_US).await;
             }
         }
     }
