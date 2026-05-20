@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_status|wire_trace [SAMPLES [PERIOD_NS]]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_status|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -98,6 +98,7 @@ fn main() -> ExitCode {
         "random" => cmd_random(&port_path, cmd_args),
         "wire_status" => cmd_wire_status(&port_path),
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
+        "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
         "reset" => cmd_action(&port_path, "reset"),
         "flash" => cmd_flash(&port_path, cmd_args),
@@ -530,6 +531,217 @@ fn cmd_wire_trace(port_path: &str, args: &[String]) -> Result<(), String> {
         println!("  {:>6}        {}", row_start_us, line);
         byte_idx += bytes_per_row;
     }
+    Ok(())
+}
+
+/// `wire_stats [SAMPLES]` — runs a tight bit-bang at the bridge's native loop
+/// rate over the requested sample budget, then reports duty cycle, average
+/// frequency, and per-state pulse-width stats (mean ± stddev, min, max).
+/// No buffer is held on the device — sample count caps wall-clock time only.
+fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
+    const STATS_MAX_SAMPLES: u32 = 1 << 22;
+    let samples: u32 = args
+        .first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SAMPLES: {e}")))
+        .transpose()?
+        .unwrap_or(1 << 20)
+        .clamp(2, STATS_MAX_SAMPLES);
+
+    let mut params = Vec::with_capacity(4);
+    params.extend_from_slice(&samples.to_le_bytes());
+
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_stats",
+        10,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+    // Firmware layout (LE), 200 bytes total:
+    //   u32 elapsed_us, u32 samples_taken, u32 final_state, u32 final_run,
+    //   u32 hi_count, u32 hi_min, u32 hi_max, u64 hi_sum, u64 hi_sumsq,
+    //   u32 lo_count, u32 lo_min, u32 lo_max, u64 lo_sum, u64 lo_sumsq,
+    //   16 × u32 hi_hist, 16 × u32 lo_hist
+    const HIST_BINS: usize = 16;
+    const SCALAR_BYTES: usize = 72;
+    const HIST_BYTES: usize = HIST_BINS * 4;
+    if data.len() < SCALAR_BYTES + 2 * HIST_BYTES {
+        return Err(format!(
+            "stats response too short: {} bytes (want {})",
+            data.len(),
+            SCALAR_BYTES + 2 * HIST_BYTES
+        ));
+    }
+    let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+    let g64 = |off: usize| u64::from_le_bytes([
+        data[off], data[off+1], data[off+2], data[off+3],
+        data[off+4], data[off+5], data[off+6], data[off+7],
+    ]);
+    let elapsed_us = g32(0) as u64;
+    let samples_taken = g32(4) as u64;
+    let final_state = g32(8);
+    let final_run = g32(12) as u64;
+    let hi_count = g32(16) as u64;
+    let hi_min = g32(20) as u64;
+    let hi_max = g32(24) as u64;
+    let hi_sum = g64(28);
+    let hi_sumsq = g64(36);
+    let lo_count = g32(44) as u64;
+    let lo_min = g32(48) as u64;
+    let lo_max = g32(52) as u64;
+    let lo_sum = g64(56);
+    let lo_sumsq = g64(64);
+    let hi_hist: Vec<u32> = (0..HIST_BINS)
+        .map(|i| g32(SCALAR_BYTES + i * 4))
+        .collect();
+    let lo_hist: Vec<u32> = (0..HIST_BINS)
+        .map(|i| g32(SCALAR_BYTES + HIST_BYTES + i * 4))
+        .collect();
+
+    let ns_per_sample = if samples_taken > 0 {
+        (elapsed_us as f64 * 1000.0) / samples_taken as f64
+    } else {
+        0.0
+    };
+    let rate_mhz = if elapsed_us > 0 {
+        samples_taken as f64 / elapsed_us as f64
+    } else {
+        0.0
+    };
+
+    // Duty cycle includes the final (unclosed) run so the total sample count
+    // matches samples_taken exactly. Run-length stats below exclude it
+    // (partial-run bias toward shorter values).
+    let total_hi_samples = hi_sum + if final_state == 1 { final_run } else { 0 };
+    let total_lo_samples = lo_sum + if final_state == 0 { final_run } else { 0 };
+    let total = (total_hi_samples + total_lo_samples).max(1);
+    let duty_hi = 100.0 * total_hi_samples as f64 / total as f64;
+    let duty_lo = 100.0 * total_lo_samples as f64 / total as f64;
+
+    // Average signal frequency: each full cycle has one closed HIGH run AND
+    // one closed LOW run, so we take the min — that's the count of complete
+    // cycles inside our window. Divide by elapsed seconds.
+    let full_cycles = hi_count.min(lo_count);
+    let elapsed_s = elapsed_us as f64 / 1_000_000.0;
+    let avg_freq_hz = if elapsed_s > 0.0 {
+        full_cycles as f64 / elapsed_s
+    } else {
+        0.0
+    };
+
+    let stats = |count: u64, sum: u64, sumsq: u64, min: u64, max: u64| -> (f64, f64, f64, f64) {
+        if count == 0 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let n = count as f64;
+        let mean = sum as f64 / n;
+        // Population variance: E[X²] − (E[X])². Clamp tiny negatives from
+        // float roundoff before sqrt.
+        let var = (sumsq as f64 / n - mean * mean).max(0.0);
+        let stddev = var.sqrt();
+        (mean * ns_per_sample, stddev * ns_per_sample,
+         min as f64 * ns_per_sample, max as f64 * ns_per_sample)
+    };
+    let (hi_mean_ns, hi_std_ns, hi_min_ns, hi_max_ns) =
+        stats(hi_count, hi_sum, hi_sumsq, hi_min, hi_max);
+    let (lo_mean_ns, lo_std_ns, lo_min_ns, lo_max_ns) =
+        stats(lo_count, lo_sum, lo_sumsq, lo_min, lo_max);
+
+    let fmt_ns = |ns: f64| -> String {
+        if ns >= 1_000_000.0 {
+            format!("{:.3} ms", ns / 1_000_000.0)
+        } else if ns >= 1_000.0 {
+            format!("{:.3} µs", ns / 1_000.0)
+        } else {
+            format!("{:.1} ns", ns)
+        }
+    };
+
+    println!(
+        "PIPE wire stats ({} samples, {:.3} ms wall time, {:.3} MS/s, {:.1} ns/sample):",
+        samples_taken,
+        elapsed_us as f64 / 1000.0,
+        rate_mhz,
+        ns_per_sample,
+    );
+    println!(
+        "  duty:       HIGH {:.2}%   LOW {:.2}%",
+        duty_hi, duty_lo,
+    );
+    println!(
+        "  full cycles: {}  →  avg signal freq: {:.1} Hz",
+        full_cycles, avg_freq_hz,
+    );
+    println!(
+        "  HIGH runs:  count {:>7}  mean {:>10}  ± {:>10}  min {:>10}  max {:>10}",
+        hi_count,
+        fmt_ns(hi_mean_ns), fmt_ns(hi_std_ns),
+        fmt_ns(hi_min_ns), fmt_ns(hi_max_ns),
+    );
+    println!(
+        "  LOW runs:   count {:>7}  mean {:>10}  ± {:>10}  min {:>10}  max {:>10}",
+        lo_count,
+        fmt_ns(lo_mean_ns), fmt_ns(lo_std_ns),
+        fmt_ns(lo_min_ns), fmt_ns(lo_max_ns),
+    );
+    println!(
+        "  final:      state {}  run {} ({})",
+        if final_state == 1 { "HIGH" } else { "LOW" },
+        final_run,
+        fmt_ns(final_run as f64 * ns_per_sample),
+    );
+
+    // Run-length distribution. Bin i = runs of length [2^i, 2^(i+1)) samples.
+    // Bar width scales to the larger of the two histograms so HIGH and LOW
+    // are visually comparable.
+    let max_bin_count = hi_hist.iter().chain(lo_hist.iter()).copied().max().unwrap_or(0);
+    if max_bin_count > 0 {
+        let bar_max = 40usize;
+        println!();
+        println!("  run-length distribution (log2 bins of samples, time = bin × ns/sample):");
+        println!(
+            "    {:>22}   {:>5}  HIGH  |  {:>5}   LOW",
+            "bin range (time)", "count", "count",
+        );
+        // Trim leading/trailing all-zero bins; show only the populated range.
+        let first = (0..HIST_BINS).find(|&i| hi_hist[i] > 0 || lo_hist[i] > 0).unwrap_or(0);
+        let last = (0..HIST_BINS).rev().find(|&i| hi_hist[i] > 0 || lo_hist[i] > 0).unwrap_or(HIST_BINS - 1);
+        for i in first..=last {
+            let lo_s = 1u64 << i;
+            let hi_s = (1u64 << (i + 1)) - 1;
+            let range_label = format!(
+                "{}-{}",
+                fmt_ns(lo_s as f64 * ns_per_sample),
+                fmt_ns(hi_s as f64 * ns_per_sample),
+            );
+            let h = hi_hist[i];
+            let l = lo_hist[i];
+            let h_bar = (h as f64 / max_bin_count as f64 * bar_max as f64).round() as usize;
+            let l_bar = (l as f64 / max_bin_count as f64 * bar_max as f64).round() as usize;
+            println!(
+                "    {:>22}   {:>5}  {:<bar_max$}  |  {:>5}   {:<bar_max$}",
+                range_label,
+                h,
+                "#".repeat(h_bar),
+                l,
+                "#".repeat(l_bar),
+                bar_max = bar_max,
+            );
+        }
+    }
+
     Ok(())
 }
 

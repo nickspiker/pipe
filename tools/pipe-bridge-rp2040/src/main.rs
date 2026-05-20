@@ -163,6 +163,82 @@ static TRACE_ELAPSED_US: portable_atomic::AtomicU32 = portable_atomic::AtomicU32
 /// between samples). Set by core 0 before storing TRACE_REQUEST.
 static TRACE_PERIOD_NS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
+// ---------------------------------------------------------------------------
+// Wire stats — streaming statistics at native sample rate, no buffer.
+// fast_capture maxes out at TRACE_MAX_SAMPLES bits because of BRAM; stats
+// doesn't store samples, so it can run for as long as we want and compute
+// duty cycle / freq / pulse-width distribution over a much larger window.
+//
+// Per-state accounting:
+//   - count of completed runs (toggle ended a HIGH or LOW span)
+//   - min, max run length (in samples)
+//   - sum, sumsq of completed run lengths → host derives mean + stddev
+// Plus final_state + final_run for the unclosed trailing run at the end of
+// the window; host folds it into total-sample-count duty math but excludes
+// it from run-length stats (partial-run bias).
+//
+// Inner loop on M0+ (non-toggle path): LDR + AND + CMP + BEQ + ADD ≈ 5-6
+// cycles. The toggle path is heavier (one u32×u32 → u64 mul, min/max, two
+// u64 adds with carry) but only runs on actual edges, not on every sample.
+// ---------------------------------------------------------------------------
+/// log2 histogram bin count per state. Bin i covers run lengths in
+/// [2^i, 2^(i+1)). 16 bins covers [1, 65536) samples, which at the ~9 MS/s
+/// stats sample rate spans [110 ns, 7 ms] — every realistic pulse width
+/// from a single-sample glitch to a multi-slot stretch.
+const STATS_HIST_BINS: usize = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WireStats {
+    elapsed_us: u32,
+    samples_taken: u32,
+    final_state: u32,
+    final_run: u32,
+    hi_count: u32,
+    hi_min: u32,
+    hi_max: u32,
+    hi_sum: u64,
+    hi_sumsq: u64,
+    lo_count: u32,
+    lo_min: u32,
+    lo_max: u32,
+    lo_sum: u64,
+    lo_sumsq: u64,
+    hi_hist: [u32; STATS_HIST_BINS],
+    lo_hist: [u32; STATS_HIST_BINS],
+}
+
+static mut STATS_RESULT: WireStats = WireStats {
+    elapsed_us: 0,
+    samples_taken: 0,
+    final_state: 0,
+    final_run: 0,
+    hi_count: 0,
+    hi_min: 0,
+    hi_max: 0,
+    hi_sum: 0,
+    hi_sumsq: 0,
+    lo_count: 0,
+    lo_min: 0,
+    lo_max: 0,
+    lo_sum: 0,
+    lo_sumsq: 0,
+    hi_hist: [0; STATS_HIST_BINS],
+    lo_hist: [0; STATS_HIST_BINS],
+};
+
+/// Number of samples to collect. 0 = idle, >0 = arm fast_stats.
+static STATS_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Set by core 1 to samples_taken after fast_stats completes (Release
+/// publishes STATS_RESULT writes to core 0's Acquire load).
+static STATS_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+/// Cap stats sample budget to keep wall time bounded. At ~24 MS/s native
+/// rate, 2^22 ≈ 175 ms — covers ~350 full periods of a 2 kHz signal so
+/// stats are well-converged, and stays under typical USB host timeouts
+/// (we're inside interrupt::free for the duration, so USB IRQs starve).
+const STATS_MAX_SAMPLES: u32 = 1 << 22;
+
 /// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs.
 /// Inlined here to keep the firmware crate self-contained for now; once the
 /// codec is stable we'll lift it into a shared `pipe_codec` crate that both
@@ -326,6 +402,139 @@ fn fast_capture(samples: usize, period_ns: u32) -> u32 {
     start.elapsed().as_micros() as u32
 }
 
+/// Tight bit-banged stats collector. Reads GP0 at native loop rate, tracks
+/// per-state run length stats (count, min, max, sum, sumsq) so the host can
+/// derive duty cycle, average frequency, and pulse-width stddev from one
+/// pass. No buffer — sample budget is the only bound.
+///
+/// Same disable-IRQs invariant as fast_capture: caller MUST wrap this in
+/// `cortex_m::interrupt::free` so the inner loop runs without USB/timer
+/// preemption. Returns measured wall time in microseconds; host divides by
+/// samples_taken for true sample rate (timer is ground truth).
+///
+/// Inner loop on M0+, non-toggle path:
+///   LDR gpio → AND #1 → CMP prev → BEQ same → ADD cur_run, #1 → branch
+/// ≈ 5-6 cycles → matches fast_capture's ~24 MS/s floor.
+///
+/// Toggle path closes the current run into hi_* or lo_* accumulators:
+/// one u32×u32→u32 MULS (M0+ single-cycle), two min/max compares, u64 sum
+/// with carry. Only runs on edges, so rare relative to sample count.
+fn fast_stats(samples: u32) -> WireStats {
+    let samples = samples.min(STATS_MAX_SAMPLES);
+    let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
+
+    let mut hi_count: u32 = 0;
+    let mut hi_min: u32 = u32::MAX;
+    let mut hi_max: u32 = 0;
+    let mut hi_sum: u64 = 0;
+    let mut hi_sumsq: u64 = 0;
+    let mut lo_count: u32 = 0;
+    let mut lo_min: u32 = u32::MAX;
+    let mut lo_max: u32 = 0;
+    let mut lo_sum: u64 = 0;
+    let mut lo_sumsq: u64 = 0;
+    let mut hi_hist = [0u32; STATS_HIST_BINS];
+    let mut lo_hist = [0u32; STATS_HIST_BINS];
+
+    if samples == 0 {
+        return WireStats {
+            elapsed_us: 0,
+            samples_taken: 0,
+            final_state: 0,
+            final_run: 0,
+            hi_count: 0,
+            hi_min: 0,
+            hi_max: 0,
+            hi_sum: 0,
+            hi_sumsq: 0,
+            lo_count: 0,
+            lo_min: 0,
+            lo_max: 0,
+            lo_sum: 0,
+            lo_sumsq: 0,
+            hi_hist,
+            lo_hist,
+        };
+    }
+
+    let start = embassy_time::Instant::now();
+
+    // Prime: first sample seeds prev + opens cur_run = 1.
+    let mut prev: u32 = unsafe { gpio_in.read_volatile() & 1 };
+    let mut cur_run: u32 = 1;
+
+    for _ in 1..samples {
+        let cur = unsafe { gpio_in.read_volatile() & 1 };
+        if cur == prev {
+            cur_run += 1;
+        } else {
+            // Close out the run we just left. prev is the state that ran.
+            let run = cur_run;
+            let run64 = run as u64;
+            let sq = run64 * run64;
+            // log2 bin: floor(log2(run)) clamped to [0, STATS_HIST_BINS-1].
+            // M0+ has no CLZ; leading_zeros lowers to __clzsi2 (~20 cyc), only
+            // hit per toggle (rare relative to sample count) so negligible.
+            let bin = (31 - run.leading_zeros()) as usize;
+            let bin = if bin >= STATS_HIST_BINS { STATS_HIST_BINS - 1 } else { bin };
+            if prev == 1 {
+                hi_count += 1;
+                if run < hi_min {
+                    hi_min = run;
+                }
+                if run > hi_max {
+                    hi_max = run;
+                }
+                hi_sum += run64;
+                hi_sumsq += sq;
+                hi_hist[bin] += 1;
+            } else {
+                lo_count += 1;
+                if run < lo_min {
+                    lo_min = run;
+                }
+                if run > lo_max {
+                    lo_max = run;
+                }
+                lo_sum += run64;
+                lo_sumsq += sq;
+                lo_hist[bin] += 1;
+            }
+            prev = cur;
+            cur_run = 1;
+        }
+    }
+
+    let elapsed_us = start.elapsed().as_micros() as u32;
+
+    // Clean up sentinel mins if no runs of that state were ever closed.
+    if hi_count == 0 {
+        hi_min = 0;
+    }
+    if lo_count == 0 {
+        lo_min = 0;
+    }
+
+    WireStats {
+        elapsed_us,
+        samples_taken: samples,
+        final_state: prev,
+        final_run: cur_run,
+        hi_count,
+        hi_min,
+        hi_max,
+        hi_sum,
+        hi_sumsq,
+        lo_count,
+        lo_min,
+        lo_max,
+        lo_sum,
+        lo_sumsq,
+        hi_hist,
+        lo_hist,
+    }
+}
+
 /// Core 1's PIPE wire task — owns GP0.
 ///
 /// Phase 1 (current): holds the pin idle. Phase 2 will:
@@ -376,6 +585,20 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             // both TRACE_FAST_BUF writes and TRACE_ELAPSED_US.
             TRACE_RESPONSE.store(samples as u32, PaOrdering::Release);
             TRACE_REQUEST.store(0, PaOrdering::Relaxed);
+            next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
+        }
+
+        let stats_req = STATS_REQUEST.load(PaOrdering::Acquire);
+        if stats_req != 0 {
+            let result = cortex_m::interrupt::free(|_| fast_stats(stats_req));
+            let taken = result.samples_taken;
+            unsafe {
+                STATS_RESULT = result;
+            }
+            // Release: pairs with core 0's Acquire on STATS_RESPONSE, publishing
+            // STATS_RESULT writes.
+            STATS_RESPONSE.store(taken, PaOrdering::Release);
+            STATS_REQUEST.store(0, PaOrdering::Relaxed);
             next_tick = embassy_time::Instant::now() + embassy_time::Duration::from_micros(SLOT_US);
         }
 
@@ -1041,6 +1264,76 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                     payload.push(unsafe { buf_ptr.add(i).read_volatile() });
                 }
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
+            }
+        }
+        "wire_stats" => {
+            // Input: bytes 0..4 = samples (u32 LE), clamped to STATS_MAX_SAMPLES.
+            // Missing/short → default 2^20 samples (~44 ms at 24 MS/s).
+            let data_in = cmd
+                .get("data")
+                .ok()
+                .and_then(|vs| vs.first().cloned())
+                .and_then(|v| match v {
+                    VsfType::v(b'b', bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let samples_req = if data_in.len() >= 4 {
+                u32::from_le_bytes([data_in[0], data_in[1], data_in[2], data_in[3]])
+            } else {
+                1u32 << 20
+            };
+            let samples_req = samples_req.min(STATS_MAX_SAMPLES);
+
+            if samples_req == 0 {
+                fields.push(("err".to_string(), VsfType::a("zero_samples".to_string())));
+            } else {
+                STATS_RESPONSE.store(0, PaOrdering::Relaxed);
+                STATS_REQUEST.store(samples_req, PaOrdering::Release);
+
+                // Worst case at STATS_MAX_SAMPLES (~4M) / ~24 MS/s ≈ 175 ms;
+                // 2 s deadline covers slower silicon variants comfortably.
+                let deadline = Instant::now() + embassy_time::Duration::from_secs(2);
+                while STATS_RESPONSE.load(PaOrdering::Acquire) == 0 {
+                    if Instant::now() > deadline {
+                        break;
+                    }
+                    cortex_m::asm::nop();
+                }
+
+                let taken = STATS_RESPONSE.load(PaOrdering::Relaxed);
+                if taken == 0 {
+                    fields.push(("err".to_string(), VsfType::a("stats_timeout".to_string())));
+                } else {
+                    // Acquire above already published STATS_RESULT.
+                    let s = unsafe { STATS_RESULT };
+                    // Layout (all LE), 200 bytes total:
+                    //   72 bytes scalars (see WireStats), then:
+                    //   16 × u32 hi_hist (log2 run-length bins, 1..65k samples)
+                    //   16 × u32 lo_hist
+                    let mut payload = alloc::vec::Vec::with_capacity(200);
+                    payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
+                    payload.extend_from_slice(&s.samples_taken.to_le_bytes());
+                    payload.extend_from_slice(&s.final_state.to_le_bytes());
+                    payload.extend_from_slice(&s.final_run.to_le_bytes());
+                    payload.extend_from_slice(&s.hi_count.to_le_bytes());
+                    payload.extend_from_slice(&s.hi_min.to_le_bytes());
+                    payload.extend_from_slice(&s.hi_max.to_le_bytes());
+                    payload.extend_from_slice(&s.hi_sum.to_le_bytes());
+                    payload.extend_from_slice(&s.hi_sumsq.to_le_bytes());
+                    payload.extend_from_slice(&s.lo_count.to_le_bytes());
+                    payload.extend_from_slice(&s.lo_min.to_le_bytes());
+                    payload.extend_from_slice(&s.lo_max.to_le_bytes());
+                    payload.extend_from_slice(&s.lo_sum.to_le_bytes());
+                    payload.extend_from_slice(&s.lo_sumsq.to_le_bytes());
+                    for bin in &s.hi_hist {
+                        payload.extend_from_slice(&bin.to_le_bytes());
+                    }
+                    for bin in &s.lo_hist {
+                        payload.extend_from_slice(&bin.to_le_bytes());
+                    }
+                    fields.push(("data".to_string(), VsfType::v(b'b', payload)));
+                }
             }
         }
         _ => {
