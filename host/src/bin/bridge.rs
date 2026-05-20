@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [WARMUP_ITER [MEASURE_ITER]]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -670,27 +670,25 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `wire_sync [WARMUP_ITER [MEASURE_ITER]]` — runs the bang-bang CDR loop on the bridge: 256-edge acquisition seeds a fixed-point `interval`, a warmup phase slews the lock to steady state (no binning), then a measurement phase records the per-polarity phase_err histogram on the converged lock.
+/// `wire_sync [MAX_ITER [FRAC_BITS]]` — runs the bridge CDR: same-polarity acquisition (128 rise-to-rise + 128 fall-to-fall, slot = sum >> 9), then a per-polarity bang-bang tracker slews interval_fp by ±1 fp unit per edge (slew = slot/2^FRAC_BITS). Bins per-polarity phase_err. Defaults: MAX_ITER = 2^25 (~6 s), FRAC_BITS = 11.
 fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     const SYNC_MAX_ITER: u32 = 1 << 26;
-    const SYNC_WARMUP_DEFAULT: u32 = 1 << 24;
-    const SYNC_MEASURE_DEFAULT: u32 = 1 << 22;
-    let warmup_iter: u32 = args
+    let max_iter: u32 = args
         .first()
-        .map(|s| s.parse::<u32>().map_err(|e| format!("bad WARMUP_ITER: {e}")))
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
         .transpose()?
-        .unwrap_or(SYNC_WARMUP_DEFAULT)
+        .unwrap_or(1 << 25)
         .clamp(2048, SYNC_MAX_ITER);
-    let measure_iter: u32 = args
+    let frac_bits: u32 = args
         .get(1)
-        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MEASURE_ITER: {e}")))
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
         .transpose()?
-        .unwrap_or(SYNC_MEASURE_DEFAULT)
-        .clamp(2048, SYNC_MAX_ITER - warmup_iter);
+        .unwrap_or(11)
+        .clamp(4, 19);
 
     let mut params = Vec::with_capacity(8);
-    params.extend_from_slice(&warmup_iter.to_le_bytes());
-    params.extend_from_slice(&measure_iter.to_le_bytes());
+    params.extend_from_slice(&max_iter.to_le_bytes());
+    params.extend_from_slice(&frac_bits.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -711,9 +709,9 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
             _ => None,
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
-    // Scalar header is 19 × u32 + 3 × i64 = 100 bytes; then 2 × hist_bins × u16.
-    if data.len() < 100 {
-        return Err(format!("sync response too short: {} bytes (want >= 100 scalar header)", data.len()));
+    // Scalar header is 17 × u32 + 3 × i64 = 92 bytes; then 2 × hist_bins × u16.
+    if data.len() < 92 {
+        return Err(format!("sync response too short: {} bytes (want >= 92 scalar header)", data.len()));
     }
     let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
     let gi64 = |off: usize| i64::from_le_bytes([
@@ -726,26 +724,25 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     let total_iter = g32(4) as u64;
     let status = g32(8);
     let frac_bits = g32(12);
-    let acq_slot = g32(16);
-    let interval_fp_after_warmup = g32(20);
-    let final_interval_fp = g32(24);
-    let warmup_iter_count = g32(28);
-    let measurement_iter_count = g32(32);
-    let warmup_rising = g32(36);
-    let warmup_falling = g32(40);
-    let rising_total = g32(44);
-    let falling_total = g32(48);
-    let rising_neg_overflow = g32(52);
-    let rising_pos_overflow = g32(56);
-    let falling_neg_overflow = g32(60);
-    let falling_pos_overflow = g32(64);
-    let hist_bins = g32(68) as usize;
-    let hist_half_range = g32(72) as i32;
-    let phase_sum = gi64(76);
-    let fall_to_rise_offset_sum = gi64(84);
-    let rise_to_fall_offset_sum = gi64(92);
+    let acquisition_slot_iter = g32(16);
+    let final_interval_fp = g32(20);
+    let acquisition_iter_count = g32(24);
+    let measurement_iter_count = g32(28);
+    let acq_rising = g32(32);
+    let acq_falling = g32(36);
+    let rising_total = g32(40);
+    let falling_total = g32(44);
+    let rising_neg_overflow = g32(48);
+    let rising_pos_overflow = g32(52);
+    let falling_neg_overflow = g32(56);
+    let falling_pos_overflow = g32(60);
+    let hist_bins = g32(64) as usize;
+    let hist_half_range = (hist_bins / 2) as i32;
+    let phase_sum = gi64(68);
+    let fall_to_rise_offset_sum = gi64(76);
+    let rise_to_fall_offset_sum = gi64(84);
 
-    let hist_off = 100;
+    let hist_off = 92;
     let hist_bytes = hist_bins * 2;
     if data.len() < hist_off + 2 * hist_bytes {
         return Err(format!(
@@ -766,11 +763,9 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     } else {
         0.0
     };
-    let fp_to_iter = |fp: u32| (fp as f64) / (1u64 << frac_bits) as f64;
-
     let status_str = match status {
         0 => "LOCKED",
-        1 => "acquisition timeout (not enough edges in budget)",
+        1 => "acquisition incomplete (not enough same-polarity intervals in budget)",
         2 => "no edges seen — wire dead?",
         _ => "unknown",
     };
@@ -779,52 +774,54 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         total_iter, elapsed_us as f64 / 1000.0, iter_mhz, ns_per_iter,
     );
     println!("  status: {}", status_str);
-    println!("  frac_bits: {} (1 fp unit = slot/{})", frac_bits, 1u32 << frac_bits);
 
     if status == 2 {
         return Ok(());
     }
 
-    let slot_ns_acq = acq_slot as f64 * ns_per_iter;
-    let slot_hz_acq = if slot_ns_acq > 0.0 { 1e9 / slot_ns_acq } else { 0.0 };
-    let warmup_slot_iter = fp_to_iter(interval_fp_after_warmup);
-    let final_slot_iter = fp_to_iter(final_interval_fp);
-    let final_slot_ns = final_slot_iter * ns_per_iter;
-    let slot_drift_warmup = warmup_slot_iter - acq_slot as f64;
-    let slot_drift_measure = final_slot_iter - warmup_slot_iter;
+    let fp_scale = (1u64 << frac_bits) as f64;
+    let acq_ns = acquisition_slot_iter as f64 * ns_per_iter;
+    let acq_hz = if acq_ns > 0.0 { 1e9 / acq_ns } else { 0.0 };
+    let final_slot_iter = final_interval_fp as f64 / fp_scale;
+    let final_ns = final_slot_iter * ns_per_iter;
+    let drift_iter = final_slot_iter - acquisition_slot_iter as f64;
+    let drift_ppm = if acquisition_slot_iter > 0 {
+        drift_iter * 1_000_000.0 / acquisition_slot_iter as f64
+    } else {
+        0.0
+    };
 
     println!();
-    println!("  acquisition: slot_cycles {} iter = {:.3} µs/slot ({:.1} Hz)",
-        acq_slot, slot_ns_acq / 1000.0, slot_hz_acq);
-    println!("  warmup:      {} iter ({:.3} ms), {} edges ({} rising + {} falling) — slewed to {:.4} iter (Δ {:+.4} from acquisition)",
-        warmup_iter_count,
-        warmup_iter_count as f64 * ns_per_iter / 1_000_000.0,
-        warmup_rising + warmup_falling, warmup_rising, warmup_falling,
-        warmup_slot_iter, slot_drift_warmup,
+    println!("  acquisition: {} edges ({} rise-to-rise + {} fall-to-fall) in {} iter ({:.3} ms); seed slot {} iter = {:.3} µs ({:.1} Hz)",
+        acq_rising + acq_falling, acq_rising, acq_falling,
+        acquisition_iter_count,
+        acquisition_iter_count as f64 * ns_per_iter / 1_000_000.0,
+        acquisition_slot_iter, acq_ns / 1000.0, acq_hz,
     );
 
     let total_edges = rising_total + falling_total;
     let total_ov = rising_neg_overflow + rising_pos_overflow + falling_neg_overflow + falling_pos_overflow;
 
-    println!("  measurement: {} iter ({:.3} ms), {} edges ({} rising + {} falling); {} hist overflow",
+    println!("  tracking:    {} edges ({} rising + {} falling) in {} iter ({:.3} ms); {} hist overflow; FRAC={} (slew ±slot/{} per edge)",
+        total_edges, rising_total, falling_total,
         measurement_iter_count,
         measurement_iter_count as f64 * ns_per_iter / 1_000_000.0,
-        total_edges, rising_total, falling_total, total_ov,
+        total_ov, frac_bits, 1u32 << frac_bits,
     );
 
     if total_edges == 0 {
-        println!("  no measurement edges — increase MEASURE_ITER or check wire");
+        println!("  no tracking edges — increase MAX_ITER or check wire");
         return Ok(());
     }
 
     println!();
-    println!("  final interval (fp): {} = {:.4} iter = {:.3} µs/slot   measure-phase Δ {:+.4} iter",
-        final_interval_fp, final_slot_iter, final_slot_ns / 1000.0,
-        slot_drift_measure,
+    println!("  final interval (fp): {} = {:.4} iter = {:.3} µs/slot   drift from acquisition: {:+.4} iter ({:+.1} ppm)",
+        final_interval_fp, final_slot_iter, final_ns / 1000.0,
+        drift_iter, drift_ppm,
     );
 
     let phase_mean = phase_sum as f64 / total_edges as f64;
-    println!("  shared phase: mean {:+.3} iter ({:+.1} ns) over {} edges (trends to 0 when locked)",
+    println!("  mean phase_err: {:+.3} iter ({:+.1} ns) over {} edges (trends to 0 when lock matches wire)",
         phase_mean, phase_mean * ns_per_iter, total_edges);
 
     if rising_total > 0 && falling_total > 0 {
