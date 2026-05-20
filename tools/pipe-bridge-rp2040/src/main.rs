@@ -182,22 +182,41 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
         state = 0xACE1DEED;
     }
 
-    // Outer state-driven loop:
-    //   IDLE  → run a small LFSR burst, sleep on TIMER IRQ for SLEEP_US.
-    //   TX/RX → set LED, await Signal — task sleeps until USB activity ends.
+    // Geiger blink, fully event-driven:
+    //   IDLE → set HIGH, sleep ON_us (one LFSR step picked it), set LOW, sleep OFF_us, repeat.
+    //   TX/RX → set LED, await WAKE_SIGNAL until USB goes idle again.
     //
-    // Both wait paths are interrupt-driven: TIMER IRQ on the IDLE side, USB
-    // IRQ (via WAKE_SIGNAL) on the TX/RX side. When all tasks are sleeping
-    // on their respective IRQs, the embassy executor calls `wfe` and the
-    // Cortex-M0+ enters sleep until something wakes it. No busy polling
-    // anywhere on core 0; USB events get serviced with minimum latency.
+    // The sleep on each phase is `select(Timer, WAKE_SIGNAL)` — if USB state
+    // changes mid-pulse we abort the sleep immediately and re-evaluate at
+    // the top of the loop, so TX/RX hold takes effect with USB-IRQ latency,
+    // not blink-cycle latency.
     //
-    // BURST × (1 / SLEEP_US) = LFSR step rate.
-    //   64 steps / 125 µs = ~512 kHz — well above any visual-flicker
-    //   threshold (humans see <100 Hz), but multiple orders of magnitude
-    //   below the original ~8 MHz busy-loop rate, which saves the CPU.
-    const BURST: u32 = 64;
-    const SLEEP_US: u64 = 125;
+    // One ROSC-mixed LFSR step picks each duration (ON, then OFF). At avg
+    // OFF ~600 ms + avg ON ~25 ms ≈ 1.5 blinks/sec on average — geiger-counter
+    // feel, occasional clusters and long quiet gaps. CPU wakes ~3×/sec when
+    // idle.
+    use embassy_futures::select::{select, Either};
+
+    // Min/max in microseconds. Tune to taste.
+    const ON_MIN_US: u32 = 5_000;       //   5 ms (visible flash, quick)
+    const ON_RANGE_US: u32 = 45_000;    //  +0..45 → 5–50 ms total
+    const OFF_MIN_US: u32 = 50_000;     //  50 ms (minimum gap between pulses)
+    const OFF_RANGE_US: u32 = 1_150_000;//  +0..1150 → 50–1200 ms total
+
+    fn lfsr_step(state: &mut u32) {
+        // SAFETY: PAC access — independent of any other core's reads. Fine to read concurrently with anything.
+        let trng = embassy_rp::pac::ROSC.randombit().read().randombit() as u32;
+        *state ^= trng;
+        let lsb = *state & 1;
+        *state >>= 1;
+        if lsb != 0 {
+            *state ^= GALOIS_TAPS;
+        }
+    }
+
+    let _ = ON_THRESHOLD;
+    let _ = OFF_THRESHOLD;
+
     loop {
         match USB_STATE.load(Ordering::Relaxed) {
             STATE_TX => {
@@ -209,30 +228,31 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
                 WAKE_SIGNAL.wait().await;
             }
             _ => {
-                // IDLE: BURST iterations of LFSR, then sleep on the timer.
-                for _ in 0..BURST {
-                    if USB_STATE.load(Ordering::Relaxed) != STATE_IDLE {
-                        break;
-                    }
-                    // 1. Mix in fresh hardware entropy
-                    let trng = pac::ROSC.randombit().read().randombit() as u32;
-                    state ^= trng;
-
-                    // 2. Galois LFSR step (single conditional XOR)
-                    let lsb = state & 1;
-                    state >>= 1;
-                    if lsb != 0 {
-                        state ^= GALOIS_TAPS;
-                    }
-
-                    // 3. Threshold check on the full 32-bit state
-                    if state < ON_THRESHOLD {
-                        heartbeat.set_high();
-                    } else if state < OFF_THRESHOLD {
-                        heartbeat.set_low();
-                    }
+                // --- ON phase ---
+                lfsr_step(&mut state);
+                let on_us = ON_MIN_US + (state % ON_RANGE_US);
+                heartbeat.set_high();
+                if let Either::Second(_) = select(
+                    embassy_time::Timer::after_micros(on_us as u64),
+                    WAKE_SIGNAL.wait(),
+                )
+                .await
+                {
+                    continue;
                 }
-                embassy_time::Timer::after_micros(SLEEP_US).await;
+
+                // --- OFF phase ---
+                lfsr_step(&mut state);
+                let off_us = OFF_MIN_US + (state % OFF_RANGE_US);
+                heartbeat.set_low();
+                if let Either::Second(_) = select(
+                    embassy_time::Timer::after_micros(off_us as u64),
+                    WAKE_SIGNAL.wait(),
+                )
+                .await
+                {
+                    continue;
+                }
             }
         }
     }
