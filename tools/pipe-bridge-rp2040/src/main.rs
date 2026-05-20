@@ -183,23 +183,28 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
     // Geiger blink, fully event-driven, geometric distribution (linear in µs).
     //
     // ON duration: one LFSR step → max(leading_ones, leading_zeros) of the
-    //   32-bit state. Always 1..=32. Distribution P(k) = 2^(-k): 50% are
-    //   1 µs, 25% are 2 µs, 12.5% are 3 µs, …, max 32 µs.
+    //   32-bit state. Always 1..=32. P(k) = 2^(-k): 50% are 1 µs, 25% are
+    //   2 µs, 12.5% are 3 µs, …, max 32 µs. Bits are unbiased so we have to
+    //   look both ways from the MSB.
     //
-    // OFF duration: AND four LFSR steps together (biases bits toward 0 —
-    //   each bit is now 1 with probability 1/16). max(clo, clz) of the
-    //   ANDed result. ~88% of the time we land here with leading_zeros
-    //   dominating (mean ~15 µs). If the AND is all zero (~12% of the
-    //   time), extend the curve: take four more readings, AND again,
-    //   treat the previous all-zero chunk as 32 leading zeros and add the
-    //   new chunk's leading_zeros on top. Repeat as long as each new
-    //   chunk is also zero — the tail extends to whatever bit-width we
-    //   need. No multiplier, every leading-zero counts as a literal µs.
+    // OFF duration: AND OFF_ANDS LFSR steps together — each output bit is
+    //   1 with probability 2^(-OFF_ANDS). At OFF_ANDS=12 that's 1/4096, so
+    //   the MSB is 0 ~99.98% of the time and `leading_zeros` alone is the
+    //   answer (no `leading_ones` to consider — Cortex-M0+ has no CLZ
+    //   instruction, so each count is ~10–30 cycles; dropping the one that
+    //   contributes nothing is a real save).
+    //   If the 32-bit chunk lands all-zero (P ≈ 99.2% with OFF_ANDS=12),
+    //   extend: another 32 leading zeros, another chunk, repeat. Tail
+    //   extends to whatever bit width the dice want, no cap.
+    //   Expected total OFF at OFF_ANDS=12: ~4 ms (1/p = 4096 bits ≈
+    //   4096 µs), heavy tail.
     //
     // Both sleeps are select(Timer, WAKE_SIGNAL) so a USB state change
     // mid-pulse aborts the sleep and re-evaluates at the loop head, giving
     // TX/RX hold USB-IRQ latency rather than blink-cycle latency.
     use embassy_futures::select::{select, Either};
+
+    const OFF_ANDS: u32 = 12;
 
     fn lfsr_step(state: &mut u32) {
         let trng = embassy_rp::pac::ROSC.randombit().read().randombit() as u32;
@@ -217,30 +222,23 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
         core::cmp::max(s.leading_ones(), s.leading_zeros()) as u64
     }
 
-    fn off_pulse_us(state: &mut u32) -> u64 {
-        // First chunk: 4 LFSR steps ANDed together.
+    fn and_chunk(state: &mut u32, ands: u32) -> u32 {
         let mut chunk: u32 = u32::MAX;
-        for _ in 0..4 {
+        for _ in 0..ands {
             lfsr_step(state);
             chunk &= *state;
         }
-        if chunk != 0 {
-            return core::cmp::max(chunk.leading_ones(), chunk.leading_zeros()) as u64;
-        }
-        // All zero — extend the leading-zero run by another 32 bits per round.
-        // Probability of needing another round = (15/16)^32 ≈ 12%, so this
-        // loop terminates fast in practice. No cap; the natural decay is the
-        // bound.
-        let mut total_zeros: u64 = 32;
+        chunk
+    }
+
+    fn off_pulse_us(state: &mut u32) -> u64 {
+        let mut total_zeros: u64 = 0;
         loop {
-            let mut chunk: u32 = u32::MAX;
-            for _ in 0..4 {
-                lfsr_step(state);
-                chunk &= *state;
-            }
+            let chunk = and_chunk(state, OFF_ANDS);
             if chunk != 0 {
                 return total_zeros + chunk.leading_zeros() as u64;
             }
+            // All zero this chunk — contributes 32 leading zeros, take another.
             total_zeros += 32;
         }
     }
