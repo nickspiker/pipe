@@ -833,7 +833,6 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     }
 
     // Per-polarity phase_err histograms. Bin i represents phase_err = (i - hist_half_range) iter.
-    // Trim to populated range, side-by-side bar chart.
     let render_hist = |label: &str, hist: &[u16], neg_ov: u32, pos_ov: u32| {
         let total: u64 = hist.iter().map(|&v| v as u64).sum::<u64>() + neg_ov as u64 + pos_ov as u64;
         if total == 0 {
@@ -842,12 +841,6 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         }
         let first = hist.iter().position(|&v| v > 0);
         let last = hist.iter().rposition(|&v| v > 0);
-        let max_count: u16 = hist.iter().copied().max().unwrap_or(0);
-        if max_count == 0 {
-            println!("    {} hist: all in overflow ({} neg, {} pos)", label, neg_ov, pos_ov);
-            return;
-        }
-        let bar_max = 40usize;
         println!("    {} hist (signed iter offset → count, total {}, overflow {} neg / {} pos):",
             label, total, neg_ov, pos_ov);
         if let (Some(f), Some(l)) = (first, last) {
@@ -855,12 +848,10 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
                 let count = hist[i];
                 if count == 0 { continue; }
                 let signed_off = i as i32 - hist_half_range;
-                let bar_w = (count as f64 / max_count as f64 * bar_max as f64).round() as usize;
-                println!("      {:+5} iter ({:+8.1} ns)  {:>5}  {}",
+                println!("      {:+5} iter ({:+8.1} ns)  {:>6}",
                     signed_off,
                     signed_off as f64 * ns_per_iter,
                     count,
-                    "#".repeat(bar_w),
                 );
             }
         }
