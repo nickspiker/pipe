@@ -1,8 +1,12 @@
-//! pipe-bridge-rp2040 — dumb USB-CDC ↔ PIPE wire bridge for RP2040-Zero
+//! pipe-bridge-rp2040 — USB-CDC ↔ PIPE wire bridge for RP2040-Zero
 //!
-//! Phase 1 (this file): scaffolding. USB-CDC enumerates as a serial port; any byte sent over USB toggles the wire GPIO (GP0) and is echoed back over USB. This proves the USB stack + GPIO are alive end-to-end.
+//! Core split:
+//!   Core 0: USB-CDC + VSF cmd/resp dispatch + heartbeat LED. The LED is a USB-activity indicator (TX/RX hold, geiger LFSR otherwise), so it cohabits with USB.
+//!   Core 1: PIPE wire. Owns GP0. Phase 1 = idle. Phase 2 = PIO mirror-XOR codec + DPLL clock recovery + cross-core ring buffers to relay wire bytes via USB.
 //!
-//! Phase 2 (next): replace the bit-bang loop with a PIO program implementing the mirror-XOR codec from rtl/codec.v and host/src/codec.rs. PIO runs at sys_clk (125 MHz default) so the ~20 µs slot rate has ~2500 PIO cycles per slot — plenty of headroom.
+//! Phase 1 (current): VSF Tier 1 protocol over USB-CDC works end-to-end (ping/info/uptime/random/bootsel/reset/flash). No wire traffic yet.
+//!
+//! Phase 2 (next): PIO program from rtl/codec.v reference. PIO runs at sys_clk (125 MHz default) so the ~20 µs slot rate has ~2500 PIO cycles per slot — plenty of headroom for DPLL phase nudging + crypto framing.
 //!
 //! Wiring on the RP2040-Zero:
 //!   GP0  → 470 Ω series resistor → PIPE wire pin (to ECP5 pipe_pad)
@@ -132,6 +136,28 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 ///   - Two 32-bit compares:  2
 ///   - Conditional GPIO:     1-2
 ///   Total: ~12-15 cycles → ~8-10 MHz at 125 MHz sys_clk
+/// Core 1's PIPE wire task — owns GP0.
+///
+/// Phase 1 (current): holds the pin idle. Phase 2 will:
+///   1. Hand GP0 to a PIO state machine implementing the mirror-XOR codec
+///      (rtl/codec.v reference).
+///   2. Run a DPLL on the line edges for clock recovery (8× oversample,
+///      ±1 sample phase nudge per edge — bridge XOSC ±20 ppm × 20 µs slot
+///      means we nudge maybe once every ~10 000 bits at most).
+///   3. Pump bytes between PIO FIFOs and a pair of cross-core ring buffers
+///      drained/filled by `handle_frames` on core 0.
+///
+/// The wire core stays single-purpose: PIO timing must not perturb (or be
+/// perturbed by) USB latency, so all USB work lives on core 0.
+#[embassy_executor::task]
+async fn pipe_wire_task(_wire: Output<'static>) {
+    loop {
+        // Nothing to do until Phase 2. Long sleep to keep the task alive
+        // without burning core 1; embassy's time driver handles wake.
+        embassy_time::Timer::after_secs(60).await;
+    }
+}
+
 #[embassy_executor::task]
 async fn geiger_task(mut heartbeat: Output<'static>) {
     use blake3::Hasher;
@@ -157,8 +183,16 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
     }
 
     // Outer state-driven loop:
-    //   IDLE  → run LFSR flat-out, check atomic each iter (one cheap load)
-    //   TX/RX → set LED, then await Signal — core 1 sleeps, zero CPU
+    //   IDLE  → run LFSR in bursts, yield between bursts so USB gets serviced
+    //   TX/RX → set LED, then await Signal — task sleeps, zero CPU
+    //
+    // The inner LFSR loop CANNOT be tight-spin because geiger shares core 0
+    // with the USB + dispatch task; without yields, the executor never polls
+    // those futures and the bridge looks bricked on the USB bus. Burst size
+    // tuned so the LED still flickers fast enough to look "geiger-counter"
+    // (sub-millisecond visual rate) while leaving USB IRQ work plenty of
+    // headroom.
+    const BURST: u32 = 64;
     loop {
         match USB_STATE.load(Ordering::Relaxed) {
             STATE_TX => {
@@ -170,8 +204,11 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
                 WAKE_SIGNAL.wait().await;
             }
             _ => {
-                // IDLE: ripping Galois LFSR until state leaves IDLE
-                while USB_STATE.load(Ordering::Relaxed) == STATE_IDLE {
+                // IDLE: BURST iterations of LFSR, then yield to let USB run.
+                for _ in 0..BURST {
+                    if USB_STATE.load(Ordering::Relaxed) != STATE_IDLE {
+                        break;
+                    }
                     // 1. Mix in fresh hardware entropy
                     let trng = pac::ROSC.randombit().read().randombit() as u32;
                     state ^= trng;
@@ -190,13 +227,14 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
                         heartbeat.set_low();
                     }
                 }
+                embassy_futures::yield_now().await;
             }
         }
     }
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     // Heap must come up before anything that allocates (VsfBuilder, etc).
     unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
 
@@ -220,28 +258,40 @@ async fn main(_spawner: Spawner) {
     info!("device_id derived from flash uid={=[u8]:02x}", flash_uid);
 
     // ---- GPIO setup ------------------------------------------------------
-    // GP0 = the wire output. Phase 2 will hand this to PIO; for now it's a
-    // plain GPIO bit-banged by the USB task.
-    let mut wire = Output::new(p.PIN_0, Level::Low);
+    // GP0 = the PIPE wire pin. Ownership moves to core 1 (the wire core).
+    // Phase 2: core 1 hands this to a PIO state machine implementing the
+    // mirror-XOR codec. Phase 1 (current): core 1 just holds it idle.
+    let wire = Output::new(p.PIN_0, Level::Low);
 
     // GP25 = external heartbeat LED. Direct-soldered (no series resistor)
     // at 2 mA drive strength — pin's own current limit replaces the resistor.
-    // Ownership of `heartbeat` is moved to core 1 below.
+    // Stays on core 0 alongside USB, because LED state IS USB activity state:
+    // the geiger task only runs the Galois LFSR when USB is idle, otherwise
+    // holds the LED to indicate TX/RX direction. Same-core means no
+    // cross-core signalling.
     let mut heartbeat = Output::new(p.PIN_25, Level::Low);
     heartbeat.set_drive_strength(Drive::_2mA);
 
-    // Launch core 1 with its own executor running the Geiger task.
-    // Core 0 stays focused on USB + the echo/bit-bang loop.
+    // ---- Core 1: PIPE wire ---------------------------------------------
+    // Dedicated to wire comms so PIO timing / clock recovery isn't perturbed
+    // by USB latency. Communicates with core 0 only via shared-memory ring
+    // buffers (to be wired up alongside the Phase 2 PIO codec).
     spawn_core1(
         p.CORE1,
         unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
         move || {
             let executor1 = EXECUTOR1.init(Executor::new());
             executor1.run(|spawner| {
-                spawner.spawn(geiger_task(heartbeat)).unwrap();
+                spawner.spawn(pipe_wire_task(wire)).unwrap();
             });
         },
     );
+
+    // ---- Core 0: USB + LED ---------------------------------------------
+    // Spawn geiger on this executor; it shares cooperatively with the USB
+    // future via the existing USB_STATE / WAKE_SIGNAL pair. Cross-core
+    // signalling overhead is gone now that both tasks live here.
+    spawner.spawn(geiger_task(heartbeat)).unwrap();
 
     // Onboard WS2812 RGB LED is on GP16 — not driven by this scaffold.
 
@@ -275,37 +325,18 @@ async fn main(_spawner: Spawner) {
     let mut class = CdcAcmClass::new(&mut builder, state, 64);
     let mut usb = builder.build();
 
-    // ---- Run USB + echo on core 0 (Geiger lives on core 1) --------------
+    // ---- Run USB + dispatch + geiger (all on core 0, cooperative) -------
     let usb_fut = usb.run();
-    let echo_fut = async {
+    let dispatch_fut = async {
         loop {
             class.wait_connection().await;
             info!("host connected");
-            let _ = handle_frames(&mut class, &mut wire, device_id).await;
+            let _ = handle_frames(&mut class, device_id).await;
             info!("host disconnected");
         }
     };
 
-    // (heartbeat_fut moved to core 1 as `geiger_task` above)
-    #[allow(unused)]
-    let _placeholder = async {
-        // Geiger LED, BLAKE3-XOF conditioned version.
-        //
-        // Raw ROSC RANDOMBIT is biased and looks visibly periodic (single ring,
-        // no health checks, no conditioner — RP2040 datasheet explicitly says
-        // it's not crypto-grade). Fix: gather 32 bytes of raw ROSC entropy at
-        // boot, BLAKE3-hash to seed an XOF (extendable output function), then
-        // pull a fresh uniform-random 32-byte block per tick.
-        //
-        // Threshold logic on the full 256-bit XOF block (big-endian):
-        //   value < 2^250  (top 6 bits zero ⇔ buf[0] < 4)  → turn OFF  ~1.56%
-        //   value < 2^248  (top 8 bits zero ⇔ buf[0] == 0) → turn ON   ~0.39%
-        // When both fire (buf[0]==0), turn-on runs second and wins.
-        //
-        // unused — kept so the type-checker has a valid future to drop later
-    };
-
-    embassy_futures::join::join(usb_fut, echo_fut).await;
+    embassy_futures::join::join(usb_fut, dispatch_fut).await;
 }
 
 struct Disconnected {}
@@ -342,7 +373,6 @@ impl From<EndpointError> for Disconnected {
 /// — drop it and let the host infer success from the disconnect.
 async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
     class: &mut CdcAcmClass<'d, T>,
-    _wire: &mut Output<'_>,
     device_id: &'static [u8; 32],
 ) -> Result<(), Disconnected> {
     // `in_buf` accumulates incoming bytes across multiple CDC packets until we
