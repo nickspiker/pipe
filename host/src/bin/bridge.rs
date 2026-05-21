@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -122,9 +122,9 @@ fn main() -> ExitCode {
 type Port = Box<dyn serialport::SerialPort>;
 
 fn open_port(path: &str) -> Result<Port, String> {
-    // 30s read timeout — wire_sync can spin for >20s during the warmup+measurement budget while core 1 holds interrupt::free; other commands respond quickly and won't notice.
+    // 150s read timeout — wire_sync with the full 2^28 iteration budget can run up to ~90s on the bridge before responding. Other commands respond quickly and won't care.
     serialport::new(path, 115_200)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(150))
         .open()
         .map_err(|e| format!("opening {path}: {e}"))
 }
@@ -672,7 +672,7 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
 
 /// `wire_sync [MAX_ITER [FRAC_BITS]]` — runs the bridge CDR: same-polarity acquisition (128 rise-to-rise + 128 fall-to-fall, slot = sum >> 9), then a per-polarity bang-bang tracker slews interval_fp by ±1 fp unit per edge (slew = slot/2^FRAC_BITS). Bins per-polarity phase_err. Defaults: MAX_ITER = 2^25 (~6 s), FRAC_BITS = 11.
 fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
-    const SYNC_MAX_ITER: u32 = 1 << 26;
+    const SYNC_MAX_ITER: u32 = 1 << 28;
     let max_iter: u32 = args
         .first()
         .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
@@ -684,11 +684,17 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
         .transpose()?
         .unwrap_or(13)
-        .clamp(4, 19);
+        .clamp(2, 19);
+    let settle_iter: u32 = args
+        .get(2)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SETTLE_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(0);
 
-    let mut params = Vec::with_capacity(8);
+    let mut params = Vec::with_capacity(12);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
+    params.extend_from_slice(&settle_iter.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,

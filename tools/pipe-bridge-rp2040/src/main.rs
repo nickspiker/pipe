@@ -222,11 +222,11 @@ const SYNC_ACQ_SHIFT: u32 = 9;
 ///
 /// Picked 13 (slew = slot/8192) from the empirical sweep on the current FPGA wire. Aggressive values (FRAC ≤ 9) converged interval_fp to the centroid of the wire's multimodal edge clusters — which drove mean phase_err to zero but smeared the per-polarity histogram, making the wire's actual cluster structure unreadable. Slow values (FRAC ≥ 13) kept the lock anchored near the acquisition seed, the histogram resolved the wire's discrete clusters cleanly, and slow drift (~hundreds of ppm/sec from chip self-heating) still got tracked correctly over multi-second runs. 13 balances drift-tracking responsiveness against histogram clarity; bumping to 14-15 makes the lock even quieter but slower to follow real drift.
 const SYNC_FRAC_BITS_DEFAULT: u32 = 13;
-/// Bounds on runtime frac_bits. Upper bound keeps interval_fp from overflowing u32 for typical slot values (~1500 iter × 2^19 ≈ 8×10^8, safe). Lower bound keeps the slew meaningful.
-const SYNC_FRAC_BITS_MIN: u32 = 4;
+/// Bounds on runtime frac_bits. Upper bound keeps interval_fp from overflowing u32 for typical slot values (~1500 iter × 2^19 ≈ 8×10^8, safe). Lower bound keeps the slew meaningful (FRAC=1 = ±slot/2 per edge = chaos).
+const SYNC_FRAC_BITS_MIN: u32 = 2;
 const SYNC_FRAC_BITS_MAX: u32 = 19;
-/// Hard cap on inner-loop iterations to bound wall time even if the wire is dead. At ~290 ns/iter, 2^26 ≈ 19 s.
-const SYNC_MAX_ITERATIONS: u32 = 1 << 26;
+/// Hard cap on inner-loop iterations to bound wall time even if the wire is dead. 2^28 ≈ 45-90 s depending on iter rate.
+const SYNC_MAX_ITERATIONS: u32 = 1 << 28;
 /// Per-polarity histogram bin count for signed phase_err. Centered on zero, covers ±SYNC_HIST_HALF_RANGE iter at 1-iter resolution. Edges beyond go to per-polarity overflow counters.
 const SYNC_HIST_BINS: usize = 256;
 const SYNC_HIST_HALF_RANGE: i32 = (SYNC_HIST_BINS as i32) / 2;
@@ -296,6 +296,8 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
 static SYNC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 /// FRAC_BITS for the run. Set before SYNC_REQUEST goes non-zero.
 static SYNC_FRAC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Settle iterations: slew but skip binning/accumulators for this many inner-loop iters after acquisition completes. Lets the tracker converge from the seed before the histogram captures it.
+static SYNC_SETTLE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 /// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs. Inlined here to keep the firmware crate self-contained for now; once the codec is stable we'll lift it into a shared `pipe_codec` crate that both host and firmware import. Not currently used in the runtime — the slot loop was nuked along with the hardcoded SLOT_US, and the next iteration will plug Codec back in driven by wire_sync's locked slot_cycles.
@@ -582,7 +584,7 @@ fn fast_stats(samples: u32) -> WireStats {
 }
 
 /// CDR sync loop. Caller MUST run inside `cortex_m::interrupt::free` — the per-iteration↔wall-time mapping requires no IRQ preemption. `max_iter` caps wall time even if the wire is silent.
-fn fast_sync(max_iter: u32, frac_bits: u32) -> SyncResult {
+fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32) -> SyncResult {
     let max_iter = max_iter.min(SYNC_MAX_ITERATIONS);
     let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
     let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
@@ -675,38 +677,46 @@ fn fast_sync(max_iter: u32, frac_bits: u32) -> SyncResult {
             let expected = n_slots * slot;
             let phase_err = own_iter - expected;
 
-            // Bang-bang ±1 fp unit on sign of phase_err, no deadband, no rejection.
+            // Bang-bang ±1 fp unit on sign of phase_err, no deadband, no rejection. Slew always happens — settle period only gates binning/accumulators.
             if phase_err > 0 {
                 interval_fp = interval_fp.wrapping_add(1);
             } else if phase_err < 0 {
                 interval_fp = interval_fp.wrapping_sub(1);
             }
-            phase_sum += phase_err as i64;
 
-            let bin_signed = phase_err + SYNC_HIST_HALF_RANGE;
-            if bin_signed >= 0 && bin_signed < SYNC_HIST_BINS as i32 {
-                if rising {
-                    rising_hist[bin_signed as usize] = rising_hist[bin_signed as usize].saturating_add(1);
+            let in_settle = iter < acquisition_iter_count + settle_iter;
+            if !in_settle {
+                phase_sum += phase_err as i64;
+
+                let bin_signed = phase_err + SYNC_HIST_HALF_RANGE;
+                if bin_signed >= 0 && bin_signed < SYNC_HIST_BINS as i32 {
+                    if rising {
+                        rising_hist[bin_signed as usize] = rising_hist[bin_signed as usize].saturating_add(1);
+                    } else {
+                        falling_hist[bin_signed as usize] = falling_hist[bin_signed as usize].saturating_add(1);
+                    }
+                } else if phase_err < 0 {
+                    if rising { rising_neg_overflow += 1 } else { falling_neg_overflow += 1 };
                 } else {
-                    falling_hist[bin_signed as usize] = falling_hist[bin_signed as usize].saturating_add(1);
+                    if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
                 }
-            } else if phase_err < 0 {
-                if rising { rising_neg_overflow += 1 } else { falling_neg_overflow += 1 };
-            } else {
-                if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
+
+                // RC offset: fold the OTHER polarity's counter against the same slot.
+                let other_iter = if rising { iter_since_fall as i32 } else { iter_since_rise as i32 };
+                let mut o_n = (other_iter + half_slot) / slot;
+                if o_n == 0 { o_n = 1; }
+                let o_residual = other_iter - o_n * slot;
+                if rising {
+                    fall_to_rise_offset_sum += o_residual as i64;
+                } else {
+                    rise_to_fall_offset_sum += o_residual as i64;
+                }
             }
 
-            // RC offset: fold the OTHER polarity's counter against the same slot.
-            let other_iter = if rising { iter_since_fall as i32 } else { iter_since_rise as i32 };
-            let mut o_n = (other_iter + half_slot) / slot;
-            if o_n == 0 { o_n = 1; }
-            let o_residual = other_iter - o_n * slot;
             if rising {
-                fall_to_rise_offset_sum += o_residual as i64;
                 rising_total += 1;
                 iter_since_rise = 0;
             } else {
-                rise_to_fall_offset_sum += o_residual as i64;
                 falling_total += 1;
                 iter_since_fall = 0;
             }
@@ -795,7 +805,8 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
         let sync_req = SYNC_REQUEST.load(PaOrdering::Acquire);
         if sync_req != 0 {
             let frac_req = SYNC_FRAC_REQUEST.load(PaOrdering::Relaxed);
-            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req));
+            let settle_req = SYNC_SETTLE_REQUEST.load(PaOrdering::Relaxed);
+            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req));
             let iters = result.total_iterations.max(1);
             unsafe {
                 SYNC_RESULT = result;
@@ -1487,7 +1498,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
         }
         "wire_sync" => {
-            // Input: bytes 0..4 = max_iter (u32 LE), bytes 4..8 = frac_bits (u32 LE, optional). Defaults: max_iter = 2^25 (~6 s at native rate), frac_bits = 11.
+            // Input: bytes 0..4 = max_iter, 4..8 = frac_bits (optional), 8..12 = settle_iter (optional). All u32 LE.
             let data_in = cmd
                 .get("data")
                 .ok()
@@ -1507,15 +1518,22 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 SYNC_FRAC_BITS_DEFAULT
             };
+            let settle_iter = if data_in.len() >= 12 {
+                u32::from_le_bytes([data_in[8], data_in[9], data_in[10], data_in[11]])
+            } else {
+                0
+            };
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
             let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
+            let settle_iter = settle_iter.min(max_iter / 2);
 
             SYNC_RESPONSE.store(0, PaOrdering::Relaxed);
             SYNC_FRAC_REQUEST.store(frac_bits, PaOrdering::Relaxed);
+            SYNC_SETTLE_REQUEST.store(settle_iter, PaOrdering::Relaxed);
             SYNC_REQUEST.store(max_iter, PaOrdering::Release);
 
-            // Worst case at SYNC_MAX_ITERATIONS = 2^26 × 290 ns ≈ 19 s; 25 s deadline gives margin. USB CDC stays up on core 0 during this because interrupt::free on core 1 doesn't gate core 0's IRQs.
-            let deadline = Instant::now() + embassy_time::Duration::from_secs(25);
+            // SYNC_MAX_ITERATIONS = 2^28 = ~45-90 s worst case; 120 s deadline gives margin. USB CDC stays up on core 0 during this because interrupt::free on core 1 doesn't gate core 0's IRQs.
+            let deadline = Instant::now() + embassy_time::Duration::from_secs(120);
             while SYNC_RESPONSE.load(PaOrdering::Acquire) == 0 {
                 if Instant::now() > deadline {
                     break;
