@@ -92,8 +92,8 @@ enum PostAction {
 
 // Shared LED-state flag between core 0 (USB task) and core 1 (geiger task).
 //   STATE_IDLE → geiger runs normally (no USB activity right now)
-//   STATE_TX   → core 1 forces LED ON  (host → bridge → wire)
-//   STATE_RX   → core 1 forces LED OFF (wire → bridge → host)
+//   STATE_TX   → core 1 forces LED ON  (bridge transmitting USB response to host)
+//   STATE_RX   → core 1 forces LED OFF (bridge receiving USB cmd from host)
 const STATE_IDLE: u8 = 0;
 const STATE_TX: u8 = 1;
 const STATE_RX: u8 = 2;
@@ -1428,14 +1428,14 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
         let frame_len = acc_len;
         acc_len = 0;
 
-        // USB activity → core 1 holds LED high during processing
-        USB_STATE.store(STATE_TX, Ordering::Relaxed);
+        // USB activity LED: receiving cmd from host = LED OFF; transmitting response to host = LED solid ON. Mental model is from the USB direction, not the wire direction. Idle reverts to the geiger heartbeat.
+        USB_STATE.store(STATE_RX, Ordering::Relaxed);
         WAKE_SIGNAL.signal(());
 
         let (resp_len, action) = dispatch(&in_buf[..frame_len], &mut out_buf, device_id);
 
         if resp_len > 0 {
-            USB_STATE.store(STATE_RX, Ordering::Relaxed);
+            USB_STATE.store(STATE_TX, Ordering::Relaxed);
             WAKE_SIGNAL.signal(());
             // Chunk into MAX_PACKET-sized writes. CDC-ACM bulk endpoints want
             // one packet per write call.
