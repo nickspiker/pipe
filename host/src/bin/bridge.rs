@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|wire_decode [MAX_ITER]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -872,7 +872,7 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `wire_decode [MAX_ITER]` — runs the edge-triggered bridge decoder: anchors phase on first rising edge, tracks per-polarity HIGH/LOW running averages, samples each phase at its midpoint, and decodes via codec.rx during enclave (HIGH) phases. Reports per-polarity timing stats (so RC bias is visible) and the last 256 decoded bits.
+/// `wire_decode [MAX_ITER [FRAC_BITS]]` — runs the bridge decoder: same acquisition + bang-bang CDR as wire_sync, plus a continuous slot clock driven by interval_fp that ticks every slot regardless of edge density. Samples mid-slot, decodes via codec.rx during enclave slots, codec.tx(0) during host slots. Reports the locked slot, per-polarity HIGH/LOW widths (RC asymmetry), slot count, and last 256 decoded bits.
 fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
     const DECODE_MAX_ITER: u32 = 1 << 28;
     let max_iter: u32 = args
@@ -881,9 +881,16 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
         .transpose()?
         .unwrap_or(5_000_000)
         .clamp(2048, DECODE_MAX_ITER);
+    let frac_bits: u32 = args
+        .get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
+        .transpose()?
+        .unwrap_or(13)
+        .clamp(2, 19);
 
-    let mut params = Vec::with_capacity(4);
+    let mut params = Vec::with_capacity(8);
     params.extend_from_slice(&max_iter.to_le_bytes());
+    params.extend_from_slice(&frac_bits.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -904,9 +911,9 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
             _ => None,
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
-    // Layout (LE): 12 × u32 + 2 × u64 (hi/lo sums) + 4 × u64 (recent_bits) = 96 bytes.
-    if data.len() < 96 {
-        return Err(format!("decode response too short: {} bytes (want 96)", data.len()));
+    // Layout (LE): 16 × u32 + 2 × u64 (hi/lo sums) + 4 × u64 (recent_bits) = 112 bytes.
+    if data.len() < 112 {
+        return Err(format!("decode response too short: {} bytes (want 112)", data.len()));
     }
 
     let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
@@ -918,18 +925,22 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
     let elapsed_us = g32(0) as u64;
     let total_iter = g32(4) as u64;
     let status = g32(8);
-    let hi_count = g32(12);
-    let hi_sum = g64(16);
-    let hi_min = g32(24);
-    let hi_max = g32(28);
-    let lo_count = g32(32);
-    let lo_sum = g64(36);
-    let lo_min = g32(44);
-    let lo_max = g32(48);
-    let bits_decoded = g32(52);
-    let ones = g32(56);
-    let zeros = g32(60);
-    let recent_bits: [u64; 4] = [g64(64), g64(72), g64(80), g64(88)];
+    let frac_bits = g32(12);
+    let acquisition_slot_iter = g32(16);
+    let final_interval_fp = g32(20);
+    let hi_count = g32(24);
+    let hi_sum = g64(28);
+    let hi_min = g32(36);
+    let hi_max = g32(40);
+    let lo_count = g32(44);
+    let lo_sum = g64(48);
+    let lo_min = g32(56);
+    let lo_max = g32(60);
+    let slots_total = g32(64);
+    let bits_decoded = g32(68);
+    let ones = g32(72);
+    let zeros = g32(76);
+    let recent_bits: [u64; 4] = [g64(80), g64(88), g64(96), g64(104)];
 
     let ns_per_iter = if total_iter > 0 {
         (elapsed_us as f64 * 1000.0) / total_iter as f64
@@ -939,41 +950,54 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
 
     let status_str = match status {
         0 => "DECODED",
-        2 => "never anchored — no rising edge seen",
+        1 => "acquisition incomplete",
+        2 => "no edges seen",
+        3 => "phase anchor not found (no rising edge after acquisition)",
         _ => "unknown",
     };
     println!(
         "PIPE wire decode ({} iterations, {:.3} ms wall time, {:.1} ns/iter):",
         total_iter, elapsed_us as f64 / 1000.0, ns_per_iter,
     );
-    println!("  status: {}", status_str);
+    println!("  status: {} (frac_bits={})", status_str, frac_bits);
 
-    if status != 0 || hi_count == 0 {
+    if status == 2 {
         return Ok(());
     }
 
-    let hi_avg_iter = hi_sum as f64 / hi_count as f64;
-    let lo_avg_iter = if lo_count > 0 { lo_sum as f64 / lo_count as f64 } else { 0.0 };
-    let hi_avg_ns = hi_avg_iter * ns_per_iter;
-    let lo_avg_ns = lo_avg_iter * ns_per_iter;
-    let cycle_ns = hi_avg_ns + lo_avg_ns;
-    let cycle_hz = if cycle_ns > 0.0 { 1e9 / cycle_ns } else { 0.0 };
+    let fp_scale = (1u64 << frac_bits) as f64;
+    let final_slot_iter = final_interval_fp as f64 / fp_scale;
+    let final_slot_ns = final_slot_iter * ns_per_iter;
+    let final_slot_hz = if final_slot_ns > 0.0 { 1e9 / final_slot_ns } else { 0.0 };
+    let acq_slot_ns = acquisition_slot_iter as f64 * ns_per_iter;
+    let drift_iter = final_slot_iter - acquisition_slot_iter as f64;
 
     println!();
-    println!("  HIGH phase: count {}, mean {:.3} µs (range [{:.3}, {:.3}] µs)",
-        hi_count, hi_avg_ns / 1000.0,
-        hi_min as f64 * ns_per_iter / 1000.0,
-        hi_max as f64 * ns_per_iter / 1000.0);
-    println!("  LOW phase:  count {}, mean {:.3} µs (range [{:.3}, {:.3}] µs)",
-        lo_count, lo_avg_ns / 1000.0,
-        lo_min as f64 * ns_per_iter / 1000.0,
-        lo_max as f64 * ns_per_iter / 1000.0);
-    println!("  cycle:      {:.3} µs ({:.1} Hz)  →  effective slot {:.3} µs",
-        cycle_ns / 1000.0, cycle_hz, cycle_ns / 2000.0);
-    if hi_avg_ns > 0.0 && lo_avg_ns > 0.0 {
-        let asym_pct = 100.0 * (lo_avg_ns - hi_avg_ns).abs() / cycle_ns;
+    println!("  acquisition seed slot: {} iter ({:.3} µs)",
+        acquisition_slot_iter, acq_slot_ns / 1000.0);
+    println!("  final locked slot:     {:.4} iter ({:.3} µs, {:.1} Hz)   drift: {:+.4} iter",
+        final_slot_iter, final_slot_ns / 1000.0, final_slot_hz, drift_iter);
+    println!("  slots ticked:          {} (slot clock fires every slot regardless of edge density)",
+        slots_total);
+
+    if hi_count > 0 && lo_count > 0 {
+        let hi_avg_iter = hi_sum as f64 / hi_count as f64;
+        let lo_avg_iter = lo_sum as f64 / lo_count as f64;
+        let hi_avg_ns = hi_avg_iter * ns_per_iter;
+        let lo_avg_ns = lo_avg_iter * ns_per_iter;
+        let asym_ns = (lo_avg_ns - hi_avg_ns).abs();
+        let asym_pct = 100.0 * asym_ns / (hi_avg_ns + lo_avg_ns);
+        println!();
+        println!("  HIGH width: count {}, mean {:.3} µs (range [{:.3}, {:.3}] µs)",
+            hi_count, hi_avg_ns / 1000.0,
+            hi_min as f64 * ns_per_iter / 1000.0,
+            hi_max as f64 * ns_per_iter / 1000.0);
+        println!("  LOW width:  count {}, mean {:.3} µs (range [{:.3}, {:.3}] µs)",
+            lo_count, lo_avg_ns / 1000.0,
+            lo_min as f64 * ns_per_iter / 1000.0,
+            lo_max as f64 * ns_per_iter / 1000.0);
         println!("  RC asymmetry: |HIGH-LOW| = {:.2} µs ({:.2}% of cycle)",
-            (lo_avg_ns - hi_avg_ns).abs() / 1000.0, asym_pct);
+            asym_ns / 1000.0, asym_pct);
     }
 
     println!();

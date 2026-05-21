@@ -315,9 +315,14 @@ static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::n
 struct DecodeResult {
     elapsed_us: u32,
     total_iterations: u32,
-    /// 0 = OK, 2 = never anchored (no rising edge seen).
+    /// 0 = OK, 1 = acquisition incomplete, 2 = no edges, 3 = phase anchor not found.
     status: u32,
-    /// Per-polarity edge-to-edge phase durations (in iter units). hi = rising-to-falling = HIGH phase width. lo = falling-to-rising = LOW phase width. Independent because the dev rig's RC asymmetry makes them differ.
+    frac_bits: u32,
+    /// Initial slot_iter from acquisition (raw iter, sum >> 9).
+    acquisition_slot_iter: u32,
+    /// Final interval_fp after bang-bang CDR tracking (fixed-point, FRAC_BITS frac bits).
+    final_interval_fp: u32,
+    /// Per-polarity wire-state widths (just-ended phase durations). hi = HIGH width = rising-to-falling. lo = LOW width = falling-to-rising. Independent because RC asymmetry makes them differ. These are diagnostic only — the SLOT timing for decoding comes from interval_fp / 2 (since one HIGH-LOW cycle = 2 slots).
     hi_count: u32,
     hi_sum_iter: u64,
     hi_min_iter: u32,
@@ -326,11 +331,13 @@ struct DecodeResult {
     lo_sum_iter: u64,
     lo_min_iter: u32,
     lo_max_iter: u32,
-    /// Decoded bit counts (one per enclave / HIGH phase).
+    /// Slot-clock samples taken (one per slot after phase anchor).
+    slots_total: u32,
+    /// Decoded bit counts (one per enclave slot).
     bits_decoded: u32,
     ones: u32,
     zeros: u32,
-    /// Last 256 decoded bits. Push: new bit shifts into [0] LSB, propagates left.
+    /// Last 256 decoded bits. Push: new bit shifts into [0] LSB.
     recent_bits: [u64; 4],
 }
 
@@ -338,6 +345,9 @@ static mut DECODE_RESULT: DecodeResult = DecodeResult {
     elapsed_us: 0,
     total_iterations: 0,
     status: 0,
+    frac_bits: 0,
+    acquisition_slot_iter: 0,
+    final_interval_fp: 0,
     hi_count: 0,
     hi_sum_iter: 0,
     hi_min_iter: 0,
@@ -346,6 +356,7 @@ static mut DECODE_RESULT: DecodeResult = DecodeResult {
     lo_sum_iter: 0,
     lo_min_iter: 0,
     lo_max_iter: 0,
+    slots_total: 0,
     bits_decoded: 0,
     ones: 0,
     zeros: 0,
@@ -353,6 +364,7 @@ static mut DECODE_RESULT: DecodeResult = DecodeResult {
 };
 
 static DECODE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static DECODE_FRAC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 static DECODE_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 /// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs. Inlined here to keep the firmware crate self-contained for now; once the codec is stable we'll lift it into a shared `pipe_codec` crate that both host and firmware import.
@@ -811,28 +823,43 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32) -> SyncResult {
     }
 }
 
-/// Edge-triggered slot decoder. Sampling timing is anchored by each wire transition rather than a slot grid: after each edge, the next sample fires at "half of the average duration of the polarity we just entered". This is inherently iter-rate-agnostic (we measure delta-iter between edges, no absolute slot calibration needed) and naturally accommodates RC asymmetry (HIGH and LOW averages are tracked independently).
+/// Slot-clock decoder. Acquisition + bang-bang CDR (same as fast_sync) seeds and tracks `interval_fp`. A continuous slot clock — driven by `interval_fp >> FRAC_BITS` — ticks autonomously regardless of edge density on the wire. Each tick advances slot_phase (enclave/host) and fires a mid-slot sample event. Edges feed the bang-bang to refine `interval_fp` (drift tracking) and update per-polarity wire-state width stats (RC bias diagnostic).
 ///
-/// Phase anchor: first rising edge marks the start of an enclave (HIGH) phase. From there each transition alternates polarity, so we know which polarity is enclave's slot vs host's. Decoded bits accumulate during enclave (HIGH) phases.
+/// Why slot clock independent of edges: real protocol data has multi-slot HIGH/LOW dropouts (PROTOCOL.md Examples 2-5 show wire-LOW spans across multiple slot owners). An edge-triggered sampler would miss those slots entirely. The slot clock keeps ticking and we sample the wire's current state on every slot — codec decodes whatever the wire actually says, including extended LOWs.
+///
+/// Phase anchor: first rising edge after acquisition marks the start of an enclave (even) slot. From there the slot clock alternates polarity every `slot_iter` iter.
 ///
 /// Caller MUST run inside `cortex_m::interrupt::free`.
-fn fast_decode(max_iter: u32) -> DecodeResult {
+fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
     let max_iter = max_iter.min(SYNC_MAX_ITERATIONS);
+    let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
     let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
     let start = embassy_time::Instant::now();
 
     let mut prev: u32 = unsafe { gpio_in.read_volatile() & 1 };
     let mut iter: u32 = 1;
-    let mut iter_since_last_edge: u32 = 0;
+    let mut any_anchored: bool = false;
+    let mut iter_since_rise: u32 = 0;
+    let mut iter_since_fall: u32 = 0;
+    let mut rise_anchored: bool = false;
+    let mut fall_anchored: bool = false;
 
-    // Phase anchor: first rising edge marks entry into a HIGH (enclave) phase.
+    // Acquisition (mirror of fast_sync).
+    let mut acq_sum: u64 = 0;
+    let mut acq_rising: u32 = 0;
+    let mut acq_falling: u32 = 0;
+    let mut acquisition_done: bool = false;
+    let mut acquisition_slot_iter: u32 = 0;
+    let mut interval_fp: u32 = 0;
+
+    // Slot clock state. The state machine ticks every iter (post-acquisition); actions are gated by phase_anchored so the per-iter cost is uniform across the acquisition window and the decode window. Without that uniformity, the iter rate during acquisition (lean loop) differs from the iter rate during decode (slot-clock + codec call), and acquisition_slot_iter calibrates wrong in decode's iter frame — bang-bang then slews interval_fp to compensate, observable as drift of tens of iter over multi-second runs.
     let mut phase_anchored: bool = false;
-    let mut in_hi_phase: bool = false;
-    let mut sample_done_this_phase: bool = false;
-
+    let mut iter_in_slot: u32 = 0;
+    let mut slot_phase: u32 = 0; // 0 = enclave, 1 = host
+    let mut sample_done_this_slot: bool = false;
     let mut codec = Codec::host();
 
-    // Per-polarity running stats — independent because RC asymmetry typically makes hi/lo widths differ.
+    // Per-polarity wire-state width diagnostic.
     let mut hi_count: u32 = 0;
     let mut hi_sum: u64 = 0;
     let mut hi_min: u32 = u32::MAX;
@@ -842,6 +869,7 @@ fn fast_decode(max_iter: u32) -> DecodeResult {
     let mut lo_min: u32 = u32::MAX;
     let mut lo_max: u32 = 0;
 
+    let mut slots_total: u32 = 0;
     let mut bits_decoded: u32 = 0;
     let mut ones: u32 = 0;
     let mut zeros: u32 = 0;
@@ -850,50 +878,110 @@ fn fast_decode(max_iter: u32) -> DecodeResult {
     while iter < max_iter {
         let cur = unsafe { gpio_in.read_volatile() & 1 };
         iter += 1;
-        iter_since_last_edge += 1;
+        iter_since_rise += 1;
+        iter_since_fall += 1;
 
         if cur != prev {
             let rising = cur == 1;
             prev = cur;
 
-            // Phase that just ended has duration = iter_since_last_edge.
-            if phase_anchored {
-                let dur = iter_since_last_edge;
-                if in_hi_phase {
-                    // Just-ended phase was HIGH.
-                    hi_sum += dur as u64;
-                    hi_count += 1;
-                    if dur < hi_min { hi_min = dur; }
-                    if dur > hi_max { hi_max = dur; }
+            if !any_anchored {
+                any_anchored = true;
+                if rising {
+                    iter_since_rise = 0;
+                    rise_anchored = true;
                 } else {
-                    // Just-ended phase was LOW.
-                    lo_sum += dur as u64;
-                    lo_count += 1;
-                    if dur < lo_min { lo_min = dur; }
-                    if dur > lo_max { lo_max = dur; }
+                    iter_since_fall = 0;
+                    fall_anchored = true;
                 }
-            } else if rising {
-                // Anchor on first rising edge — we're entering a HIGH phase next.
-                phase_anchored = true;
+                continue;
             }
 
-            in_hi_phase = rising;
-            iter_since_last_edge = 0;
-            sample_done_this_phase = false;
-            continue;
+            if !acquisition_done {
+                // Same-polarity acquisition: mirror fast_sync.
+                if rising {
+                    if !rise_anchored {
+                        iter_since_rise = 0;
+                        rise_anchored = true;
+                    } else if acq_rising < SYNC_ACQ_PER_POLARITY {
+                        acq_sum += iter_since_rise as u64;
+                        acq_rising += 1;
+                        iter_since_rise = 0;
+                    }
+                } else {
+                    if !fall_anchored {
+                        iter_since_fall = 0;
+                        fall_anchored = true;
+                    } else if acq_falling < SYNC_ACQ_PER_POLARITY {
+                        acq_sum += iter_since_fall as u64;
+                        acq_falling += 1;
+                        iter_since_fall = 0;
+                    }
+                }
+                if acq_rising >= SYNC_ACQ_PER_POLARITY && acq_falling >= SYNC_ACQ_PER_POLARITY {
+                    acquisition_slot_iter = (acq_sum >> SYNC_ACQ_SHIFT) as u32;
+                    interval_fp = acquisition_slot_iter << frac_bits;
+                    acquisition_done = true;
+                }
+                continue;
+            }
+
+            // Post-acquisition: bang-bang CDR + per-polarity wire-width stats.
+            let slot = (interval_fp >> frac_bits) as i32;
+            if slot >= 8 {
+                let half_slot = slot / 2;
+                let own_iter = if rising { iter_since_rise as i32 } else { iter_since_fall as i32 };
+                let mut n_slots = (own_iter + half_slot) / slot;
+                if n_slots == 0 { n_slots = 1; }
+                let phase_err = own_iter - n_slots * slot;
+                if phase_err > 0 {
+                    interval_fp = interval_fp.wrapping_add(1);
+                } else if phase_err < 0 {
+                    interval_fp = interval_fp.wrapping_sub(1);
+                }
+            }
+
+            // Width of the phase that just ended. Rising edge → previous phase was LOW (iter_since_fall counts iter since last falling). Falling edge → previous phase was HIGH.
+            if rising {
+                let dur = iter_since_fall;
+                if dur < lo_min { lo_min = dur; }
+                if dur > lo_max { lo_max = dur; }
+                lo_sum += dur as u64;
+                lo_count += 1;
+            } else {
+                let dur = iter_since_rise;
+                if dur < hi_min { hi_min = dur; }
+                if dur > hi_max { hi_max = dur; }
+                hi_sum += dur as u64;
+                hi_count += 1;
+            }
+
+            // Phase anchor: first rising edge after acquisition fires the slot clock.
+            if !phase_anchored && rising {
+                phase_anchored = true;
+                iter_in_slot = 0;
+                slot_phase = 0;
+                sample_done_this_slot = false;
+            }
+
+            if rising {
+                iter_since_rise = 0;
+            } else {
+                iter_since_fall = 0;
+            }
         }
 
-        // Mid-phase sample: target = half of the running-average duration for this polarity.
-        if phase_anchored && !sample_done_this_phase {
-            let half_target = if in_hi_phase {
-                if hi_count == 0 { 0 } else { (hi_sum / (hi_count as u64 * 2)) as u32 }
-            } else {
-                if lo_count == 0 { 0 } else { (lo_sum / (lo_count as u64 * 2)) as u32 }
-            };
-            if half_target > 0 && iter_since_last_edge >= half_target {
+        // Continuous slot clock — state machine ticks every iter, actions gated by phase_anchored. Pre-acquisition (interval_fp == 0), slot_int saturates to 8 via .max(8) so the boundary check stays well-defined and constant-cost. mid_slot_hit and slot_boundary_hit do the same work pre- and post-anchor; only the codec call and bit accounting are skipped pre-anchor.
+        iter_in_slot += 1;
+        let slot_int = ((interval_fp >> frac_bits) as u32).max(8);
+        let half_slot = slot_int >> 1;
+        let mid_slot_hit = !sample_done_this_slot && iter_in_slot >= half_slot;
+        let slot_boundary_hit = iter_in_slot >= slot_int;
+
+        if mid_slot_hit {
+            if phase_anchored {
                 let sample = cur as u8;
-                if in_hi_phase {
-                    // HIGH phase = enclave's slot — decode.
+                if slot_phase == 0 {
                     let bit = codec.rx(sample);
                     if bit & 1 == 1 { ones += 1 } else { zeros += 1 };
                     bits_decoded += 1;
@@ -902,10 +990,18 @@ fn fast_decode(max_iter: u32) -> DecodeResult {
                     recent_bits[1] = (recent_bits[1] << 1) | (recent_bits[0] >> 63);
                     recent_bits[0] = (recent_bits[0] << 1) | (bit as u64 & 1);
                 } else {
-                    // LOW phase = host's slot — keep codec.own_last in sync.
                     let _ = codec.tx(0);
                 }
-                sample_done_this_phase = true;
+            }
+            sample_done_this_slot = true;
+        }
+
+        if slot_boundary_hit {
+            iter_in_slot -= slot_int;
+            slot_phase ^= 1;
+            sample_done_this_slot = false;
+            if phase_anchored {
+                slots_total += 1;
             }
         }
     }
@@ -913,12 +1009,23 @@ fn fast_decode(max_iter: u32) -> DecodeResult {
     if hi_count == 0 { hi_min = 0; }
     if lo_count == 0 { lo_min = 0; }
 
-    let status: u32 = if !phase_anchored { 2 } else { 0 };
+    let status: u32 = if !any_anchored {
+        2
+    } else if !acquisition_done {
+        1
+    } else if !phase_anchored {
+        3
+    } else {
+        0
+    };
 
     DecodeResult {
         elapsed_us: start.elapsed().as_micros() as u32,
         total_iterations: iter,
         status,
+        frac_bits,
+        acquisition_slot_iter,
+        final_interval_fp: interval_fp,
         hi_count,
         hi_sum_iter: hi_sum,
         hi_min_iter: hi_min,
@@ -927,6 +1034,7 @@ fn fast_decode(max_iter: u32) -> DecodeResult {
         lo_sum_iter: lo_sum,
         lo_min_iter: lo_min,
         lo_max_iter: lo_max,
+        slots_total,
         bits_decoded,
         ones,
         zeros,
@@ -994,7 +1102,8 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
 
         let decode_req = DECODE_REQUEST.load(PaOrdering::Acquire);
         if decode_req != 0 {
-            let result = cortex_m::interrupt::free(|_| fast_decode(decode_req));
+            let frac_req = DECODE_FRAC_REQUEST.load(PaOrdering::Relaxed);
+            let result = cortex_m::interrupt::free(|_| fast_decode(decode_req, frac_req));
             let iters = result.total_iterations.max(1);
             unsafe {
                 DECODE_RESULT = result;
@@ -1769,7 +1878,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
         }
         "wire_decode" => {
-            // Input: bytes 0..4 = max_iter (u32 LE). Defaults: max_iter = 5M (~1 s).
+            // Input: bytes 0..4 = max_iter (u32 LE), bytes 4..8 = frac_bits (u32 LE, optional).
             let data_in = cmd
                 .get("data")
                 .ok()
@@ -1784,9 +1893,16 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 5_000_000
             };
+            let frac_bits = if data_in.len() >= 8 {
+                u32::from_le_bytes([data_in[4], data_in[5], data_in[6], data_in[7]])
+            } else {
+                SYNC_FRAC_BITS_DEFAULT
+            };
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
+            let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
 
             DECODE_RESPONSE.store(0, PaOrdering::Relaxed);
+            DECODE_FRAC_REQUEST.store(frac_bits, PaOrdering::Relaxed);
             DECODE_REQUEST.store(max_iter, PaOrdering::Release);
 
             let deadline = Instant::now() + embassy_time::Duration::from_secs(120);
@@ -1801,12 +1917,18 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 fields.push(("err".to_string(), VsfType::a("decode_timeout".to_string())));
             } else {
                 let d = unsafe { DECODE_RESULT };
-                // Layout (all LE): 12 × u32 + 2 × u64 (hi_sum, lo_sum) + 4 × u64 (recent_bits) = 96 bytes.
-                let cap = 12 * 4 + 2 * 8 + 4 * 8;
+                // Layout (all LE), 112 bytes total:
+                //   16 × u32: elapsed_us, total_iterations, status, frac_bits, acquisition_slot_iter, final_interval_fp, hi_count, hi_min_iter, hi_max_iter, lo_count, lo_min_iter, lo_max_iter, slots_total, bits_decoded, ones, zeros
+                //   2 × u64: hi_sum_iter, lo_sum_iter
+                //   4 × u64: recent_bits[]
+                let cap = 16 * 4 + 2 * 8 + 4 * 8;
                 let mut payload = alloc::vec::Vec::with_capacity(cap);
                 payload.extend_from_slice(&d.elapsed_us.to_le_bytes());
                 payload.extend_from_slice(&d.total_iterations.to_le_bytes());
                 payload.extend_from_slice(&d.status.to_le_bytes());
+                payload.extend_from_slice(&d.frac_bits.to_le_bytes());
+                payload.extend_from_slice(&d.acquisition_slot_iter.to_le_bytes());
+                payload.extend_from_slice(&d.final_interval_fp.to_le_bytes());
                 payload.extend_from_slice(&d.hi_count.to_le_bytes());
                 payload.extend_from_slice(&d.hi_sum_iter.to_le_bytes());
                 payload.extend_from_slice(&d.hi_min_iter.to_le_bytes());
@@ -1815,6 +1937,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&d.lo_sum_iter.to_le_bytes());
                 payload.extend_from_slice(&d.lo_min_iter.to_le_bytes());
                 payload.extend_from_slice(&d.lo_max_iter.to_le_bytes());
+                payload.extend_from_slice(&d.slots_total.to_le_bytes());
                 payload.extend_from_slice(&d.bits_decoded.to_le_bytes());
                 payload.extend_from_slice(&d.ones.to_le_bytes());
                 payload.extend_from_slice(&d.zeros.to_le_bytes());
