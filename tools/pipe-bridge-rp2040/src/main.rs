@@ -33,7 +33,6 @@ use alloc::vec;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use defmt::*;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Blocking, Flash};
@@ -55,7 +54,7 @@ use vsf::schema::{pipe_message_schema, SectionBuilder};
 use vsf::types::{EtType, VsfType, OSCILLATIONS_PER_SECOND};
 use vsf::verification::is_original;
 use vsf::vsf_builder::VsfBuilder;
-use {defmt_rtt as _, panic_probe as _};
+use panic_halt as _;
 
 // ---------------------------------------------------------------------------
 // Global heap — 32 KB linked-list-first-fit, initialised at boot.
@@ -853,8 +852,10 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
     let mut interval_fp: u32 = 0;
 
     // Slot clock state. The state machine ticks every iter (post-acquisition); actions are gated by phase_anchored so the per-iter cost is uniform across the acquisition window and the decode window. Without that uniformity, the iter rate during acquisition (lean loop) differs from the iter rate during decode (slot-clock + codec call), and acquisition_slot_iter calibrates wrong in decode's iter frame — bang-bang then slews interval_fp to compensate, observable as drift of tens of iter over multi-second runs.
+    //
+    // iter_in_slot_fp tracks the slot counter at the SAME fixed-point precision as interval_fp. Increment by 1<<frac_bits per iter; boundary fires when iter_in_slot_fp >= interval_eff and subtracts interval_eff. The fractional component of interval_fp is preserved across every boundary — no integer truncation, so non-integer wire periods (e.g. 28.5 iter) stay phase-locked instead of drifting 0.5 iter per slot.
     let mut phase_anchored: bool = false;
-    let mut iter_in_slot: u32 = 0;
+    let mut iter_in_slot_fp: u32 = 0;
     let mut slot_phase: u32 = 0; // 0 = enclave, 1 = host
     let mut sample_done_this_slot: bool = false;
     let mut codec = Codec::host();
@@ -926,7 +927,7 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
                 continue;
             }
 
-            // Post-acquisition: bang-bang CDR + per-polarity wire-width stats.
+            // Post-acquisition period-locking bang-bang — same formulation as wire_sync. Compare iter_since_X to integer-multiple-of-slot; slew interval_fp ±1 based on phase_err sign. This is the histogram-validated lock that keeps interval_fp pinned to the wire's actual same-polarity interval. It does NOT correct phase between our boundary and the wire transition — that's a known limitation; bounded random-walk drift of iter_in_slot_fp shows up as ~5-50% ones-ratio variance in idle decode. A proper second-order PLL is a separate problem.
             let slot = (interval_fp >> frac_bits) as i32;
             if slot >= 8 {
                 let half_slot = slot / 2;
@@ -959,7 +960,7 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
             // Phase anchor: first rising edge after acquisition fires the slot clock.
             if !phase_anchored && rising {
                 phase_anchored = true;
-                iter_in_slot = 0;
+                iter_in_slot_fp = 0;
                 slot_phase = 0;
                 sample_done_this_slot = false;
             }
@@ -971,12 +972,15 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
             }
         }
 
-        // Continuous slot clock — state machine ticks every iter, actions gated by phase_anchored. Pre-acquisition (interval_fp == 0), slot_int saturates to 8 via .max(8) so the boundary check stays well-defined and constant-cost. mid_slot_hit and slot_boundary_hit do the same work pre- and post-anchor; only the codec call and bit accounting are skipped pre-anchor.
-        iter_in_slot += 1;
-        let slot_int = ((interval_fp >> frac_bits) as u32).max(8);
-        let half_slot = slot_int >> 1;
-        let mid_slot_hit = !sample_done_this_slot && iter_in_slot >= half_slot;
-        let slot_boundary_hit = iter_in_slot >= slot_int;
+        // Continuous slot clock — state machine ticks every iter at fixed-point precision matching interval_fp. iter_in_slot_fp += 1<<frac_bits per iter; boundary fires at iter_in_slot_fp >= interval_eff and subtracts interval_eff. Working in the SAME fp width as interval_fp preserves the fractional period across every boundary — no integer truncation, so non-integer wire periods stay phase-locked indefinitely.
+        //
+        // Pre-acquisition (interval_fp == 0), interval_eff saturates to 8<<frac_bits so the boundary check stays well-defined and constant-cost. Actions are gated by phase_anchored; checks themselves run every iter to keep the per-iter cost uniform across acquisition / pre-anchor / post-anchor.
+        let one_iter_fp: u32 = 1u32 << frac_bits;
+        iter_in_slot_fp = iter_in_slot_fp.wrapping_add(one_iter_fp);
+        let interval_eff = interval_fp.max(8u32 << frac_bits);
+        let half_interval = interval_eff >> 1;
+        let mid_slot_hit = !sample_done_this_slot && iter_in_slot_fp >= half_interval;
+        let slot_boundary_hit = iter_in_slot_fp >= interval_eff;
 
         if mid_slot_hit {
             if phase_anchored {
@@ -997,7 +1001,7 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
         }
 
         if slot_boundary_hit {
-            iter_in_slot -= slot_int;
+            iter_in_slot_fp -= interval_eff;
             slot_phase ^= 1;
             sample_done_this_slot = false;
             if phase_anchored {
@@ -1261,7 +1265,6 @@ async fn main(spawner: Spawner) {
     unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
 
     let p = embassy_rp::init(Default::default());
-    info!("pipe-bridge-rp2040 boot");
 
     // ---- Device public ID -------------------------------------------------
     // Read the flash chip's 8-byte unique ID via SPI cmd 0x4B, hash it together
@@ -1277,7 +1280,6 @@ async fn main(spawner: Spawner) {
     static DEVICE_ID: StaticCell<[u8; 32]> = StaticCell::new();
     let device_id: &'static [u8; 32] =
         DEVICE_ID.init(blake3::derive_key(DEVICE_ID_DOMAIN, &flash_uid));
-    info!("device_id derived from flash uid={=[u8]:02x}", flash_uid);
 
     // ---- GPIO setup ------------------------------------------------------
     // GP0 = the PIPE wire pin. Ownership moves to core 1 (the wire core).
@@ -1352,9 +1354,7 @@ async fn main(spawner: Spawner) {
     let dispatch_fut = async {
         loop {
             class.wait_connection().await;
-            info!("host connected");
             let _ = handle_frames(&mut class, device_id).await;
-            info!("host disconnected");
         }
     };
 

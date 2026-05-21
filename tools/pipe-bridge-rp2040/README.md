@@ -38,6 +38,27 @@ The RP2040-Zero board has both BOOT and RESET buttons, so flashing doesn't requi
 
 First-flash with a fresh board: same sequence (hold BOOT, tap RESET, release BOOT, then `cargo run --release`).
 
+## Hot-iteration workflow via picotool (no flash writes)
+
+After the initial UF2 flash, every subsequent dev iteration can load directly into SRAM via the RP2040 boot ROM's PICOBOOT interface — no flash writes, no flash wear, no manual BOOTSEL button presses between iterations.
+
+```bash
+# 1. Build the dev image (links at SRAM 0x20000000, fits in 176 KB of low SRAM):
+cargo build --release --features ram-image
+
+# 2. From the running flash firmware, drop into PICOBOOT:
+cargo run -p pipe-host --bin bridge -- bootsel
+
+# 3. picotool loads the ELF into RAM at its link addresses, then jumps to vector[1]:
+picotool load --execute target/thumbv6m-none-eabi/release/pipe-bridge-rp2040 -t elf
+```
+
+The bridge re-enumerates as USB-CDC running the freshly-loaded code. To iterate, just repeat from step 1 → 2 → 3.
+
+**Why this works:** the RP2040's silicon boot ROM exposes PICOBOOT (a bulk USB endpoint, distinct from the UF2 mass-storage interface) whenever BOOT is asserted at reset. `picotool` writes raw bytes to any RAM address and can reboot to an arbitrary PC/SP, all without touching flash. Our `bootsel` host command (`reset_to_usb_boot(0,0)`) drops the chip into that state on demand — so after the first flash you never press the hardware BOOT button again.
+
+**Layout split:** `memory-flash.x` (default, runs from XIP flash) and `memory-ram.x` (with `ram-image` feature, links text/rodata/data into low SRAM, bss/stack into high SRAM) — `build.rs` picks one based on the cargo feature.
+
 ## Phase 1: USB-CDC echo + GPIO bit-bang (this scaffold)
 
 What it does:
