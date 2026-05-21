@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|wire_decode [MAX_ITER]|bootsel|reset|flash <uf2>>"
             );
             return ExitCode::from(2);
         }
@@ -99,6 +99,7 @@ fn main() -> ExitCode {
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
+        "wire_decode" => cmd_wire_decode(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
         "reset" => cmd_action(&port_path, "reset"),
         "flash" => cmd_flash(&port_path, cmd_args),
@@ -867,6 +868,143 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     render_hist("rising", &rising_hist, rising_neg_overflow, rising_pos_overflow);
     println!();
     render_hist("falling", &falling_hist, falling_neg_overflow, falling_pos_overflow);
+
+    Ok(())
+}
+
+/// `wire_decode [MAX_ITER]` — runs the edge-triggered bridge decoder: anchors phase on first rising edge, tracks per-polarity HIGH/LOW running averages, samples each phase at its midpoint, and decodes via codec.rx during enclave (HIGH) phases. Reports per-polarity timing stats (so RC bias is visible) and the last 256 decoded bits.
+fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
+    const DECODE_MAX_ITER: u32 = 1 << 28;
+    let max_iter: u32 = args
+        .first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(5_000_000)
+        .clamp(2048, DECODE_MAX_ITER);
+
+    let mut params = Vec::with_capacity(4);
+    params.extend_from_slice(&max_iter.to_le_bytes());
+
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_decode",
+        14,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+    // Layout (LE): 12 × u32 + 2 × u64 (hi/lo sums) + 4 × u64 (recent_bits) = 96 bytes.
+    if data.len() < 96 {
+        return Err(format!("decode response too short: {} bytes (want 96)", data.len()));
+    }
+
+    let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+    let g64 = |off: usize| u64::from_le_bytes([
+        data[off], data[off+1], data[off+2], data[off+3],
+        data[off+4], data[off+5], data[off+6], data[off+7],
+    ]);
+
+    let elapsed_us = g32(0) as u64;
+    let total_iter = g32(4) as u64;
+    let status = g32(8);
+    let hi_count = g32(12);
+    let hi_sum = g64(16);
+    let hi_min = g32(24);
+    let hi_max = g32(28);
+    let lo_count = g32(32);
+    let lo_sum = g64(36);
+    let lo_min = g32(44);
+    let lo_max = g32(48);
+    let bits_decoded = g32(52);
+    let ones = g32(56);
+    let zeros = g32(60);
+    let recent_bits: [u64; 4] = [g64(64), g64(72), g64(80), g64(88)];
+
+    let ns_per_iter = if total_iter > 0 {
+        (elapsed_us as f64 * 1000.0) / total_iter as f64
+    } else {
+        0.0
+    };
+
+    let status_str = match status {
+        0 => "DECODED",
+        2 => "never anchored — no rising edge seen",
+        _ => "unknown",
+    };
+    println!(
+        "PIPE wire decode ({} iterations, {:.3} ms wall time, {:.1} ns/iter):",
+        total_iter, elapsed_us as f64 / 1000.0, ns_per_iter,
+    );
+    println!("  status: {}", status_str);
+
+    if status != 0 || hi_count == 0 {
+        return Ok(());
+    }
+
+    let hi_avg_iter = hi_sum as f64 / hi_count as f64;
+    let lo_avg_iter = if lo_count > 0 { lo_sum as f64 / lo_count as f64 } else { 0.0 };
+    let hi_avg_ns = hi_avg_iter * ns_per_iter;
+    let lo_avg_ns = lo_avg_iter * ns_per_iter;
+    let cycle_ns = hi_avg_ns + lo_avg_ns;
+    let cycle_hz = if cycle_ns > 0.0 { 1e9 / cycle_ns } else { 0.0 };
+
+    println!();
+    println!("  HIGH phase: count {}, mean {:.3} µs (range [{:.3}, {:.3}] µs)",
+        hi_count, hi_avg_ns / 1000.0,
+        hi_min as f64 * ns_per_iter / 1000.0,
+        hi_max as f64 * ns_per_iter / 1000.0);
+    println!("  LOW phase:  count {}, mean {:.3} µs (range [{:.3}, {:.3}] µs)",
+        lo_count, lo_avg_ns / 1000.0,
+        lo_min as f64 * ns_per_iter / 1000.0,
+        lo_max as f64 * ns_per_iter / 1000.0);
+    println!("  cycle:      {:.3} µs ({:.1} Hz)  →  effective slot {:.3} µs",
+        cycle_ns / 1000.0, cycle_hz, cycle_ns / 2000.0);
+    if hi_avg_ns > 0.0 && lo_avg_ns > 0.0 {
+        let asym_pct = 100.0 * (lo_avg_ns - hi_avg_ns).abs() / cycle_ns;
+        println!("  RC asymmetry: |HIGH-LOW| = {:.2} µs ({:.2}% of cycle)",
+            (lo_avg_ns - hi_avg_ns).abs() / 1000.0, asym_pct);
+    }
+
+    println!();
+    println!("  bits decoded: {} ({} zeros, {} ones)", bits_decoded, zeros, ones);
+    if bits_decoded > 0 {
+        let pct_ones = 100.0 * ones as f64 / bits_decoded as f64;
+        println!("  ones ratio:   {:.1}%  (idle wire decodes to all zeros)", pct_ones);
+    }
+
+    if bits_decoded == 0 {
+        return Ok(());
+    }
+
+    let to_show = (bits_decoded as usize).min(256);
+    println!();
+    println!("  last {} decoded bits (oldest → newest):", to_show);
+    let mut bitstr = String::with_capacity(256 + 64);
+    for i in (0..256).rev() {
+        let word = i / 64;
+        let pos = i % 64;
+        let bit = (recent_bits[word] >> pos) & 1;
+        if !bitstr.is_empty() && bitstr.len() % 64 == 0 {
+            bitstr.push('\n');
+            bitstr.push_str("    ");
+        } else if bitstr.len() % 8 == 0 && !bitstr.is_empty() && bitstr.chars().last() != Some('\n') {
+            bitstr.push(' ');
+        }
+        bitstr.push(if bit == 1 { '1' } else { '0' });
+        if to_show < 256 && (255 - i) >= to_show { break; }
+    }
+    println!("    {}", bitstr);
 
     Ok(())
 }
