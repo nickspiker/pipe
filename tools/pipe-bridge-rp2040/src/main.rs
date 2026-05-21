@@ -858,6 +858,7 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
     let mut iter_in_slot_fp: u32 = 0;
     let mut slot_phase: u32 = 0; // 0 = enclave, 1 = host
     let mut sample_done_this_slot: bool = false;
+    let mut phase_adj_done: bool = false;
     let mut codec = Codec::host();
 
     // Per-polarity wire-state width diagnostic.
@@ -927,18 +928,32 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
                 continue;
             }
 
-            // Post-acquisition period-locking bang-bang — same formulation as wire_sync. Compare iter_since_X to integer-multiple-of-slot; slew interval_fp ±1 based on phase_err sign. This is the histogram-validated lock that keeps interval_fp pinned to the wire's actual same-polarity interval. It does NOT correct phase between our boundary and the wire transition — that's a known limitation; bounded random-walk drift of iter_in_slot_fp shows up as ~5-50% ones-ratio variance in idle decode. A proper second-order PLL is a separate problem.
-            let slot = (interval_fp >> frac_bits) as i32;
-            if slot >= 8 {
-                let half_slot = slot / 2;
-                let own_iter = if rising { iter_since_rise as i32 } else { iter_since_fall as i32 };
-                let mut n_slots = (own_iter + half_slot) / slot;
-                if n_slots == 0 { n_slots = 1; }
-                let phase_err = own_iter - n_slots * slot;
-                if phase_err > 0 {
-                    interval_fp = interval_fp.wrapping_add(1);
-                } else if phase_err < 0 {
-                    interval_fp = interval_fp.wrapping_sub(1);
+            // Post-acquisition gated phase detector with continuous P (gain 1/512). At most one adjustment per slot — first qualifying edge wins. iter_in_slot_fp is the error signal: V=0 is the target (boundary aligned with wire transition).
+            //
+            // Two cases based on which side of V the edge falls:
+            //   V SMALL (<= half): edge happened just past our boundary in the new slot. Our clock fired too soon — slow down. Expected polarity = transition INTO new slot (slot_phase has already toggled): slot_phase==0 (now enclave) → rising; slot_phase==1 (now host) → falling. signed_offset = V (positive); adj = V >> 9 (positive); interval_fp += adj.
+            //   V LARGE (> half): edge happened in the second half of the current slot, BEFORE our boundary. Our clock period is too long — speed up. Expected polarity = transition OUT of current slot: slot_phase==0 (enclave ending) → falling; slot_phase==1 (host ending) → rising. signed_offset = V - interval_eff (negative); adj = signed_offset >> 9 (negative); interval_fp += adj → decreases.
+            //
+            // Polarity check rejects edges from wrong-direction transitions (noise, RC ringing, real protocol data bits mid-slot). Continuous P with target=0 has no bias at perfect lock — adj == 0 when V == 0. Gain 1/512 = slot/512 per qualifying edge, well below the slot/256 cap from crypto's 256-bit max-run guarantee. Skips chasing every edge: at most one P adjustment per slot, survives long zero-runs in protocol data.
+            if phase_anchored && !phase_adj_done {
+                let interval_eff_pd = interval_fp.max(8u32 << frac_bits);
+                let half_pd = interval_eff_pd >> 1;
+                let in_first_half = iter_in_slot_fp <= half_pd;
+                let expected_rising = if in_first_half {
+                    slot_phase == 0
+                } else {
+                    slot_phase == 1
+                };
+                if rising == expected_rising {
+                    let signed_offset = if in_first_half {
+                        iter_in_slot_fp as i32
+                    } else {
+                        iter_in_slot_fp as i32 - interval_eff_pd as i32
+                    };
+                    // P gain 1/32 — higher than the user's suggested 1/512, but the loop is undamped (pure P on a phase error → 2nd-order oscillator) so we trade convergence speed against oscillation amplitude. Stronger gain damps oscillation faster.
+                    let adj = signed_offset >> 5;
+                    interval_fp = (interval_fp as i32).wrapping_add(adj) as u32;
+                    phase_adj_done = true;
                 }
             }
 
@@ -1004,6 +1019,7 @@ fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
             iter_in_slot_fp -= interval_eff;
             slot_phase ^= 1;
             sample_done_this_slot = false;
+            phase_adj_done = false;
             if phase_anchored {
                 slots_total += 1;
             }
