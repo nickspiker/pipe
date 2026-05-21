@@ -58,6 +58,7 @@ module codec #(
     // Asymmetric drive: only drive when it's our slot AND we want a HIGH on the wire. Releases (HIGH-Z) otherwise; the external 5kΩ pull-down handles LOW.
     assign drive_en = my_slot && wire_out;
 
+    // NOTE: slot_clk fires `clk` (= slot_tick) AT slot boundary, AND toggles my_slot at the same edge. So at posedge clk, my_slot is the UPCOMING slot's owner, while wire_in (synchronized) reflects the just-ended slot. Decode therefore happens when my_slot toggled to 1 (enclave slot upcoming → host slot just ended → wire_in is host's slot value). own_last update happens when my_slot toggled to 0 (host slot upcoming → enclave slot just ended → tx_data was what we just drove).
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
             own_last   <= 1'b0;
@@ -67,11 +68,13 @@ module codec #(
         end else begin
             rx_valid <= 1'b0;
             if (my_slot) begin
-                own_last <= tx_data;
-            end else begin
+                // Enclave slot upcoming → host slot just ended → decode host's bit
                 rx_data    <= wire_in ^ OTHER_IDLE ^ own_last;
                 other_last <= wire_in ^ OTHER_IDLE ^ own_last;
                 rx_valid   <= 1'b1;
+            end else begin
+                // Host slot upcoming → enclave slot just ended → record what we drove
+                own_last <= tx_data;
             end
         end
     end
