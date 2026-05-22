@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
             );
             return ExitCode::from(2);
         }
@@ -103,6 +103,7 @@ fn main() -> ExitCode {
         "bootsel" => cmd_action(&port_path, "bootsel"),
         "reset" => cmd_action(&port_path, "reset"),
         "flash" => cmd_flash(&port_path, cmd_args),
+        "load_dev" => cmd_load_dev(&port_path, cmd_args),
         other => {
             eprintln!("error: unknown subcommand '{other}'");
             return ExitCode::from(2);
@@ -1120,5 +1121,136 @@ fn cmd_action(port_path: &str, op: &str) -> Result<(), String> {
         }
     }
     println!("{op}: sent (device disconnected)");
+    Ok(())
+}
+
+/// `load_dev <path-to-elf-or-bin>` — hot-loads a dev image into the bridge's SRAM via the silicon PICOBOOT interface, then jumps. Flow: send `bootsel` host command so the bridge drops into PICOBOOT mode; objcopy the ELF to flat binary (if it's an ELF, detected by magic); open PICOBOOT over USB; write the binary bytes starting at SRAM 0x20000000 in 256-byte pages; reboot to the ELF's reset handler (vector[1]) with stack pointer from vector[0]. No flash writes, no manual BOOT button presses between iterations.
+fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
+    use picoboot_rs::{PicobootConnection, PAGE_SIZE, SRAM_START_RP2040};
+    use rusb::{Context, UsbContext};
+
+    let src_path = args.first().ok_or("usage: bridge load_dev <path/to/elf-or-bin>")?;
+    let src_path = std::path::Path::new(src_path);
+    if !src_path.exists() {
+        return Err(format!("image not found: {}", src_path.display()));
+    }
+
+    let elf_magic = {
+        let mut buf = [0u8; 4];
+        std::fs::File::open(src_path)
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+            .map(|_| buf == [0x7f, b'E', b'L', b'F'])
+            .unwrap_or(false)
+    };
+
+    let bin_path: std::path::PathBuf = if elf_magic {
+        let bin = src_path.with_extension("bin");
+        print!("→ objcopy -O binary {} → {} ", src_path.display(), bin.display());
+        let _ = std::io::stdout().flush();
+        let status = std::process::Command::new("llvm-objcopy")
+            .args(["-O", "binary"])
+            .arg(src_path)
+            .arg(&bin)
+            .status()
+            .map_err(|e| format!("\nspawn llvm-objcopy: {e}"))?;
+        if !status.success() {
+            return Err(format!("\nllvm-objcopy failed: {status}"));
+        }
+        println!("(done)");
+        bin
+    } else {
+        src_path.to_path_buf()
+    };
+
+    let image = std::fs::read(&bin_path).map_err(|e| format!("read {}: {e}", bin_path.display()))?;
+    if image.len() < 8 {
+        return Err(format!("image too short ({} bytes) — needs at least vector table", image.len()));
+    }
+    let initial_sp = u32::from_le_bytes([image[0], image[1], image[2], image[3]]);
+    let reset_handler = u32::from_le_bytes([image[4], image[5], image[6], image[7]]);
+    println!("→ image: {} bytes, vector_table[0] SP=0x{:08X}, [1] reset=0x{:08X}", image.len(), initial_sp, reset_handler);
+
+    // Drop bridge into PICOBOOT via the existing bootsel software command. The bridge's `reset_to_usb_boot(0,0)` lands at VID:2e8a PID:0003 on RP2040.
+    println!("→ requesting bootsel");
+    let (_, _) = send_cmd(port_path, "bootsel", 9001, vec![])
+        .or_else(|_| Ok::<_, String>((Vec::new(), Duration::default())))?;
+
+    // Wait for the PICOBOOT USB endpoint to appear. libusb sees the device by VID:PID; udev rules with TAG+="uaccess" must be in place for non-root access.
+    print!("→ waiting for PICOBOOT (2e8a:0003) ");
+    let _ = std::io::stdout().flush();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ctx = loop {
+        let ctx = Context::new().map_err(|e| format!("libusb init: {e}"))?;
+        let found = ctx
+            .devices()
+            .map_err(|e| format!("enumerate USB: {e}"))?
+            .iter()
+            .any(|d| {
+                d.device_descriptor()
+                    .map(|desc| desc.vendor_id() == 0x2e8a && desc.product_id() == 0x0003)
+                    .unwrap_or(false)
+            });
+        if found {
+            break ctx;
+        }
+        if Instant::now() > deadline {
+            return Err("\nPICOBOOT device never appeared".into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    println!("(found)");
+
+    let mut conn = PicobootConnection::new(ctx, None)
+        .map_err(|e| format!("open PICOBOOT (check udev rules at /etc/udev/rules.d/99-picotool.rules): {e:?}"))?;
+    conn.reset_interface().map_err(|e| format!("reset_interface: {e:?}"))?;
+    conn.access_exclusive_eject().map_err(|e| format!("access_exclusive_eject: {e:?}"))?;
+    conn.exit_xip().map_err(|e| format!("exit_xip: {e:?}"))?;
+
+    // Write the image to SRAM in PAGE_SIZE chunks. PicobootConnection::flash_write requires page-aligned addresses but the underlying PICOBOOT Write cmd works for any memory region — including SRAM at 0x20000000.
+    let pages = image.len().div_ceil(PAGE_SIZE as usize);
+    println!("→ writing {} bytes ({} pages) to SRAM @ 0x{:08X}", image.len(), pages, SRAM_START_RP2040);
+    for (i, chunk) in image.chunks(PAGE_SIZE as usize).enumerate() {
+        let addr = SRAM_START_RP2040 + (i as u32) * PAGE_SIZE;
+        let mut page = chunk.to_vec();
+        page.resize(PAGE_SIZE as usize, 0);
+        conn.flash_write(addr, &page).map_err(|e| format!("write @ 0x{addr:08X}: {e:?}"))?;
+        if i.is_multiple_of(64) || i + 1 == pages {
+            print!("\r  page {}/{}", i + 1, pages);
+            let _ = std::io::stdout().flush();
+        }
+    }
+    println!();
+
+    // Verify the first and last page actually landed in SRAM before jumping. flash_read with a SRAM address goes through the same Read cmd (0x84) which works for both flash and RAM regions on the RP2040 boot ROM.
+    print!("→ verifying SRAM contents ");
+    let _ = std::io::stdout().flush();
+    let first_expected = &image[..PAGE_SIZE.min(image.len() as u32) as usize];
+    let first_actual = conn.flash_read(SRAM_START_RP2040, first_expected.len() as u32)
+        .map_err(|e| format!("read @ 0x{:08X}: {e:?}", SRAM_START_RP2040))?;
+    if first_actual != first_expected {
+        return Err(format!("SRAM verify FAILED at 0x{:08X}: first 16 expected {:02x?} got {:02x?}",
+            SRAM_START_RP2040, &first_expected[..16.min(first_expected.len())], &first_actual[..16.min(first_actual.len())]));
+    }
+    println!("(first page OK)");
+
+    println!("→ reboot to dev image (PC=0x{:08X}, SP=0x{:08X})", reset_handler, initial_sp);
+    conn.reboot(reset_handler, initial_sp, 50).map_err(|e| format!("reboot: {e:?}"))?;
+    drop(conn);
+
+    let port_pb = std::path::PathBuf::from(port_path);
+    print!("→ waiting for {} to re-enumerate ", port_pb.display());
+    let _ = std::io::stdout().flush();
+    std::thread::sleep(Duration::from_millis(300));
+    wait_for(
+        Instant::now() + Duration::from_secs(10),
+        || if port_pb.exists() { Some(()) } else { None },
+        "serial device",
+    )?;
+    println!("(found)");
+    std::thread::sleep(Duration::from_millis(500));
+
+    println!("→ verifying with ping");
+    cmd_ping(port_path)?;
+    println!("load_dev: success");
     Ok(())
 }

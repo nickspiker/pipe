@@ -1277,6 +1277,18 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // ram-image variant: clean up state PICOBOOT's REBOOT cmd leaves behind. (1) VTOR points at 0x10000000 (flash) but our vector table is at 0x20000000 — set it so IRQ handlers come from the right place. (2) PSM_FRCE_ON / PSM_FRCE_OFF retain whatever state PICOBOOT was running with; embassy_rp::init's reset sequence reads back PSM_FRCE_ON and spins until it exactly matches the bit it just wrote (0x8000 = PROC0), so any stale PROC1/SIO/etc. force-on bit → infinite hang at the very first bl in the reset handler (LED dark, no enumeration). Clear both before init.
+    #[cfg(feature = "ram-image")]
+    unsafe {
+        let scb = &*cortex_m::peripheral::SCB::PTR;
+        scb.vtor.write(0x2000_0000);
+
+        let psm_frce_on:  *mut u32 = 0x4001_0000 as *mut u32;
+        let psm_frce_off: *mut u32 = 0x4001_0004 as *mut u32;
+        psm_frce_on.write_volatile(0);
+        psm_frce_off.write_volatile(0);
+    }
+
     // Heap must come up before anything that allocates (VsfBuilder, etc).
     unsafe { HEAP.init(&raw mut HEAP_MEM as usize, HEAP_SIZE) }
 
