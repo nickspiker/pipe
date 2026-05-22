@@ -42,9 +42,9 @@ vsf = { path = "../../../vsf", default-features = false }
 embedded-alloc = "0.5"
 
 [profile.release]
-debug         = false
+debug = true
 opt-level     = "z"
 lto           = "fat"
 codegen-units = 1
 overflow-checks = false
-strip         = true
+# strip = true

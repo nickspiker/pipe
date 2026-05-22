@@ -1221,6 +1221,31 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     }
     println!();
 
+    // Trampoline at 0x2002C000 (start of dev-image's RAM region — overlaps .data VMA which gets copied by the dev image's own startup, so we can clobber it). PICOBOOT REBOOT lands here; the trampoline clears PSM_FRCE_ON/OFF (which embassy_rp's __pre_init would otherwise spin on if PICOBOOT left bits set), then reads the dev image's vector[0]/vector[1] from 0x20000000, sets MSP, and BX's to the reset handler. Hand-assembled Thumb-1 for Cortex-M0+, 32 bytes:
+    //   ldr  r0, [pc, #20]   ; r0 = 0x40010000 (PSM_FRCE_ON)
+    //   movs r1, #0
+    //   str  r1, [r0]        ; PSM_FRCE_ON  = 0
+    //   str  r1, [r0, #4]    ; PSM_FRCE_OFF = 0
+    //   ldr  r0, [pc, #16]   ; r0 = 0x20000000 (main vector table)
+    //   ldr  r1, [r0]        ; r1 = initial SP
+    //   ldr  r2, [r0, #4]    ; r2 = reset handler
+    //   msr  msp, r1
+    //   bx   r2
+    //   .word 0x40010000
+    //   .word 0x20000000
+    const TRAMPOLINE_ADDR: u32 = 0x2002_C000;
+    const TRAMPOLINE: [u8; 32] = [
+        0x05, 0x48, 0x00, 0x21, 0x01, 0x60, 0x41, 0x60,
+        0x04, 0x48, 0x01, 0x68, 0x42, 0x68, 0x81, 0xF3,
+        0x08, 0x88, 0x10, 0x47, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x00, 0x20,
+    ];
+    let mut tramp_page = TRAMPOLINE.to_vec();
+    tramp_page.resize(PAGE_SIZE as usize, 0);
+    conn.flash_write(TRAMPOLINE_ADDR, &tramp_page)
+        .map_err(|e| format!("write trampoline @ 0x{TRAMPOLINE_ADDR:08X}: {e:?}"))?;
+    println!("→ trampoline written @ 0x{:08X}", TRAMPOLINE_ADDR);
+
     // Verify the first and last page actually landed in SRAM before jumping. flash_read with a SRAM address goes through the same Read cmd (0x84) which works for both flash and RAM regions on the RP2040 boot ROM.
     print!("→ verifying SRAM contents ");
     let _ = std::io::stdout().flush();
@@ -1233,8 +1258,10 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     }
     println!("(first page OK)");
 
-    println!("→ reboot to dev image (PC=0x{:08X}, SP=0x{:08X})", reset_handler, initial_sp);
-    conn.reboot(reset_handler, initial_sp, 50).map_err(|e| format!("reboot: {e:?}"))?;
+    // Reboot to the trampoline (Thumb bit = +1). The trampoline clears PSM then jumps to the dev image's reset handler using SP/PC from its vector table. SP arg here is unused by the trampoline body (it uses BX, no stack writes before the BX) but we hand it the dev image's SP for safety.
+    let trampoline_pc = TRAMPOLINE_ADDR | 1;
+    println!("→ reboot to trampoline @ 0x{:08X} (will jump to dev image PC=0x{:08X})", trampoline_pc, reset_handler);
+    conn.reboot(trampoline_pc, initial_sp, 50).map_err(|e| format!("reboot: {e:?}"))?;
     drop(conn);
 
     let port_pb = std::path::PathBuf::from(port_path);
