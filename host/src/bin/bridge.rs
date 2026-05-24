@@ -685,6 +685,11 @@ struct SyncResultParsed {
     status: u32,
     frac_bits: u32,
     p_shift: u32,
+    locked: bool,
+    edges_to_lock: u32,
+    /// Seed slot in SYSTICK cycles (8 ns each at 125 MHz). Keeping the historical
+    /// `iter` suffix here only because the on-wire byte name didn't change; the unit
+    /// is now cycles.
     acquisition_slot_iter: u32,
     final_interval_fp: u32,
     acquisition_iter_count: u32,
@@ -741,7 +746,7 @@ fn run_wire_sync(
             _ => None,
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
-    const SCALAR_BYTES: usize = 18 * 4 + 3 * 8; // 96
+    const SCALAR_BYTES: usize = 20 * 4 + 3 * 8; // 104
     if data.len() < SCALAR_BYTES {
         return Err(format!("sync response too short: {} bytes (want >= {SCALAR_BYTES} scalar header)", data.len()));
     }
@@ -752,7 +757,7 @@ fn run_wire_sync(
     ]);
     let g16 = |off: usize| u16::from_le_bytes([data[off], data[off+1]]);
 
-    let hist_bins = g32(68) as usize;
+    let hist_bins = g32(76) as usize;
     let hist_off = SCALAR_BYTES;
     let hist_bytes = hist_bins * 2;
     if data.len() < hist_off + 2 * hist_bytes {
@@ -769,23 +774,25 @@ fn run_wire_sync(
         status: g32(8),
         frac_bits: g32(12),
         p_shift: g32(16),
-        acquisition_slot_iter: g32(20),
-        final_interval_fp: g32(24),
-        acquisition_iter_count: g32(28),
-        measurement_iter_count: g32(32),
-        acq_rising: g32(36),
-        acq_falling: g32(40),
-        rising_total: g32(44),
-        falling_total: g32(48),
-        rising_neg_overflow: g32(52),
-        rising_pos_overflow: g32(56),
-        falling_neg_overflow: g32(60),
-        falling_pos_overflow: g32(64),
+        locked: g32(20) != 0,
+        edges_to_lock: g32(24),
+        acquisition_slot_iter: g32(28),
+        final_interval_fp: g32(32),
+        acquisition_iter_count: g32(36),
+        measurement_iter_count: g32(40),
+        acq_rising: g32(44),
+        acq_falling: g32(48),
+        rising_total: g32(52),
+        falling_total: g32(56),
+        rising_neg_overflow: g32(60),
+        rising_pos_overflow: g32(64),
+        falling_neg_overflow: g32(68),
+        falling_pos_overflow: g32(72),
         hist_bins,
         hist_half_range: (hist_bins / 2) as i32,
-        phase_sum: gi64(72),
-        fall_to_rise_offset_sum: gi64(80),
-        rise_to_fall_offset_sum: gi64(88),
+        phase_sum: gi64(80),
+        fall_to_rise_offset_sum: gi64(88),
+        rise_to_fall_offset_sum: gi64(96),
         rising_hist,
         falling_hist,
     })
@@ -819,22 +826,24 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
 
     let r = run_wire_sync(port_path, max_iter, frac_bits, settle_iter, p_shift)?;
     let SyncResultParsed { elapsed_us, total_iter, status, frac_bits, p_shift: _,
-        acquisition_slot_iter, final_interval_fp, acquisition_iter_count, measurement_iter_count,
+        locked, edges_to_lock,
+        acquisition_slot_iter: acquisition_slot_cyc, final_interval_fp,
+        acquisition_iter_count, measurement_iter_count,
         acq_rising, acq_falling, rising_total, falling_total,
         rising_neg_overflow, rising_pos_overflow, falling_neg_overflow, falling_pos_overflow,
         hist_half_range, phase_sum, fall_to_rise_offset_sum, rise_to_fall_offset_sum,
         rising_hist, falling_hist, .. } = r;
 
-    let ns_per_iter = if total_iter > 0 {
+    // SYSTICK ticks at the AHB clock = 125 MHz on RP2040 → 8 ns per cycle. All slot
+    // / phase_err / RC values are in cycles now; the iter-rate of the inner loop only
+    // shows up in the wall-time-per-iter sanity print.
+    const NS_PER_CYC: f64 = 8.0;
+    let inner_loop_ns_per_iter = if total_iter > 0 {
         (elapsed_us as f64 * 1000.0) / total_iter as f64
-    } else {
-        0.0
-    };
+    } else { 0.0 };
     let iter_mhz = if elapsed_us > 0 {
         total_iter as f64 / elapsed_us as f64
-    } else {
-        0.0
-    };
+    } else { 0.0 };
     let status_str = match status {
         0 => "LOCKED",
         1 => "acquisition incomplete (not enough same-polarity intervals in budget)",
@@ -842,8 +851,8 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         _ => "unknown",
     };
     println!(
-        "PIPE wire sync ({} iterations, {:.3} ms wall time, {:.3} Miter/s, {:.1} ns/iter):",
-        total_iter, elapsed_us as f64 / 1000.0, iter_mhz, ns_per_iter,
+        "PIPE wire sync ({} iterations, {:.3} ms wall time, {:.3} Miter/s, {:.1} ns/iter inner loop):",
+        total_iter, elapsed_us as f64 / 1000.0, iter_mhz, inner_loop_ns_per_iter,
     );
     println!("  status: {}", status_str);
 
@@ -852,34 +861,36 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     }
 
     let fp_scale = (1u64 << frac_bits) as f64;
-    let acq_ns = acquisition_slot_iter as f64 * ns_per_iter;
+    let acq_ns = acquisition_slot_cyc as f64 * NS_PER_CYC;
     let acq_hz = if acq_ns > 0.0 { 1e9 / acq_ns } else { 0.0 };
-    let final_slot_iter = final_interval_fp as f64 / fp_scale;
-    let final_ns = final_slot_iter * ns_per_iter;
-    let drift_iter = final_slot_iter - acquisition_slot_iter as f64;
-    let drift_ppm = if acquisition_slot_iter > 0 {
-        drift_iter * 1_000_000.0 / acquisition_slot_iter as f64
-    } else {
-        0.0
-    };
+    let final_slot_cyc = final_interval_fp as f64 / fp_scale;
+    let final_ns = final_slot_cyc * NS_PER_CYC;
+    let drift_cyc = final_slot_cyc - acquisition_slot_cyc as f64;
+    let drift_ppm = if acquisition_slot_cyc > 0 {
+        drift_cyc * 1_000_000.0 / acquisition_slot_cyc as f64
+    } else { 0.0 };
 
     println!();
-    println!("  acquisition: {} edges ({} rise-to-rise + {} fall-to-fall) in {} iter ({:.3} ms); seed slot {} iter = {:.3} µs ({:.1} Hz)",
+    println!("  acquisition: {} edges ({} rise-to-rise + {} fall-to-fall) in {} iter; seed slot {} cyc = {:.3} µs ({:.1} Hz)",
         acq_rising + acq_falling, acq_rising, acq_falling,
         acquisition_iter_count,
-        acquisition_iter_count as f64 * ns_per_iter / 1_000_000.0,
-        acquisition_slot_iter, acq_ns / 1000.0, acq_hz,
+        acquisition_slot_cyc, acq_ns / 1000.0, acq_hz,
     );
 
     let total_edges = rising_total + falling_total;
     let total_ov = rising_neg_overflow + rising_pos_overflow + falling_neg_overflow + falling_pos_overflow;
 
-    println!("  tracking:    {} edges ({} rising + {} falling) in {} iter ({:.3} ms); {} hist overflow; FRAC={} (slew ±slot/{} per edge)",
+    println!("  tracking:    {} edges ({} rising + {} falling) in {} iter; {} hist overflow; FRAC={}",
         total_edges, rising_total, falling_total,
         measurement_iter_count,
-        measurement_iter_count as f64 * ns_per_iter / 1_000_000.0,
-        total_ov, frac_bits, 1u32 << frac_bits,
+        total_ov, frac_bits,
     );
+
+    if locked {
+        println!("  LOCK:        achieved after {} edges (|phase_err| under threshold for 256 consecutive)", edges_to_lock);
+    } else {
+        println!("  LOCK:        not achieved (need 256 consecutive edges with |phase_err| under threshold)");
+    }
 
     if total_edges == 0 {
         println!("  no tracking edges — increase MAX_ITER or check wire");
@@ -887,24 +898,24 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     }
 
     println!();
-    println!("  final interval (fp): {} = {:.4} iter = {:.3} µs/slot   drift from acquisition: {:+.4} iter ({:+.1} ppm)",
-        final_interval_fp, final_slot_iter, final_ns / 1000.0,
-        drift_iter, drift_ppm,
+    println!("  final interval (fp): {} = {:.4} cyc = {:.3} µs/slot   drift from acquisition: {:+.4} cyc ({:+.1} ppm)",
+        final_interval_fp, final_slot_cyc, final_ns / 1000.0,
+        drift_cyc, drift_ppm,
     );
 
     let phase_mean = phase_sum as f64 / total_edges as f64;
-    println!("  mean phase_err: {:+.3} iter ({:+.1} ns) over {} edges (trends to 0 when lock matches wire)",
-        phase_mean, phase_mean * ns_per_iter, total_edges);
+    println!("  mean phase_err: {:+.3} cyc ({:+.1} ns) over {} edges (trends to 0 when lock matches wire)",
+        phase_mean, phase_mean * NS_PER_CYC, total_edges);
 
     if rising_total > 0 && falling_total > 0 {
         let fr_mean = fall_to_rise_offset_sum as f64 / rising_total as f64;
         let rf_mean = rise_to_fall_offset_sum as f64 / falling_total as f64;
         let delta_rc = (rf_mean - fr_mean) / 2.0;
-        println!("  RC offset: rise→fall {:+.3} iter, fall→rise {:+.3} iter  →  Δrc = {:+.3} iter ({:+.1} ns)",
-            rf_mean, fr_mean, delta_rc, delta_rc * ns_per_iter);
+        println!("  RC offset: rise→fall {:+.3} cyc, fall→rise {:+.3} cyc  →  Δrc = {:+.3} cyc ({:+.1} ns)",
+            rf_mean, fr_mean, delta_rc, delta_rc * NS_PER_CYC);
     }
 
-    // Per-polarity phase_err histograms. Bin i represents phase_err = (i - hist_half_range) iter.
+    // Per-polarity phase_err histograms. Bin i represents phase_err = (i - hist_half_range) cyc.
     let render_hist = |label: &str, hist: &[u16], neg_ov: u32, pos_ov: u32| {
         let total: u64 = hist.iter().map(|&v| v as u64).sum::<u64>() + neg_ov as u64 + pos_ov as u64;
         if total == 0 {
@@ -913,16 +924,16 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         }
         let first = hist.iter().position(|&v| v > 0);
         let last = hist.iter().rposition(|&v| v > 0);
-        println!("    {} hist (signed iter offset → count, total {}, overflow {} neg / {} pos):",
+        println!("    {} hist (signed cycle offset → count, total {}, overflow {} neg / {} pos):",
             label, total, neg_ov, pos_ov);
         if let (Some(f), Some(l)) = (first, last) {
             for i in f..=l {
                 let count = hist[i];
                 if count == 0 { continue; }
                 let signed_off = i as i32 - hist_half_range;
-                println!("      {:+5} iter ({:+8.1} ns)  {:>6}",
+                println!("      {:+5} cyc ({:+8.1} ns)  {:>6}",
                     signed_off,
-                    signed_off as f64 * ns_per_iter,
+                    signed_off as f64 * NS_PER_CYC,
                     count,
                 );
             }
@@ -982,14 +993,12 @@ fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
         (p_max - p_min + 1) * (max_iter / 4_000_000),
     );
     println!();
-    println!("  p_shift | locked? |  final µs  | drift ppm  | mean phase ns | lock %  | overflow");
-    println!("  --------+---------+------------+------------+---------------+---------+---------");
+    println!("  p_shift | locked? |  final µs  | drift ppm  | mean phase ns | lock %  | overflow | LOCKED  | →lock @");
+    println!("  --------+---------+------------+------------+---------------+---------+----------+---------+---------");
 
+    const NS_PER_CYC: f64 = 8.0; // SYSTICK @ 125 MHz
     for p in p_min..=p_max {
         let r = run_wire_sync(port_path, max_iter, frac_bits, 0, p)?;
-        let ns_per_iter = if r.total_iter > 0 {
-            (r.elapsed_us as f64 * 1000.0) / r.total_iter as f64
-        } else { 0.0 };
         let status_str = match r.status {
             0 => "ok",
             1 => "acq?",
@@ -997,15 +1006,15 @@ fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
             _ => "?",
         };
         let fp_scale = (1u64 << r.frac_bits) as f64;
-        let final_iter = r.final_interval_fp as f64 / fp_scale;
-        let final_ns = final_iter * ns_per_iter;
-        let drift_iter = final_iter - r.acquisition_slot_iter as f64;
+        let final_cyc = r.final_interval_fp as f64 / fp_scale;
+        let final_ns = final_cyc * NS_PER_CYC;
+        let drift_cyc = final_cyc - r.acquisition_slot_iter as f64; // field is cycles now despite name
         let drift_ppm = if r.acquisition_slot_iter > 0 {
-            drift_iter * 1_000_000.0 / r.acquisition_slot_iter as f64
+            drift_cyc * 1_000_000.0 / r.acquisition_slot_iter as f64
         } else { 0.0 };
         let total_edges = r.rising_total + r.falling_total;
         let phase_mean_ns = if total_edges > 0 {
-            (r.phase_sum as f64 / total_edges as f64) * ns_per_iter
+            (r.phase_sum as f64 / total_edges as f64) * NS_PER_CYC
         } else { 0.0 };
         // "lock %" = sum of central 5 bins (-2..+2) / (total_edges + overflow). Tight
         // lock → most edges fall in those bins. Loose lock or oscillation → spread.
@@ -1017,9 +1026,12 @@ fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
         let lock_denom = total_edges as u64 + total_ov as u64;
         let lock_pct = if lock_denom > 0 { 100.0 * center as f64 / lock_denom as f64 } else { 0.0 };
 
+        let lock_flag = if r.locked { "  yes  " } else { "  no   " };
+        let lock_at: String = if r.locked { format!("{}", r.edges_to_lock) } else { "—".to_string() };
+
         println!(
-            "  {:>7} | {:>7} | {:>9.3}  | {:>+9.0}  | {:>+12.1}  | {:>5.1}%  | {:>7}",
-            p, status_str, final_ns / 1000.0, drift_ppm, phase_mean_ns, lock_pct, total_ov,
+            "  {:>7} | {:>7} | {:>9.3}  | {:>+9.0}  | {:>+12.1}  | {:>5.1}%  | {:>8} | {} | {:>7}",
+            p, status_str, final_ns / 1000.0, drift_ppm, phase_mean_ns, lock_pct, total_ov, lock_flag, lock_at,
         );
     }
     Ok(())
