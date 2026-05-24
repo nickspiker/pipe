@@ -260,6 +260,8 @@ struct SyncResult {
     status: u32,
     /// FRAC_BITS used for this run (interval_fp has this many fractional bits below integer slot).
     frac_bits: u32,
+    /// Proportional shift used for this run. slew_fp = (phase_err << FRAC_BITS) >> p_shift.
+    p_shift: u32,
     /// Seed slot value computed at end of acquisition (raw iter units; sum_of_same_polarity_intervals >> SYNC_ACQ_SHIFT). interval_fp_initial = acquisition_slot << frac_bits.
     acquisition_slot_iter: u32,
     /// Final interval_fp at end of run. Tracking slot value = final_interval_fp >> frac_bits. Difference from acquisition seed is the drift the integrator absorbed.
@@ -293,6 +295,7 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     total_iterations: 0,
     status: 0,
     frac_bits: 0,
+    p_shift: 0,
     acquisition_slot_iter: 0,
     final_interval_fp: 0,
     acquisition_iter_count: 0,
@@ -318,6 +321,14 @@ static SYNC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::ne
 static SYNC_FRAC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 /// Settle iterations: slew but skip binning/accumulators for this many inner-loop iters after acquisition completes. Lets the tracker converge from the seed before the histogram captures it.
 static SYNC_SETTLE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Proportional-tracker shift. Per-edge slew_fp = (phase_err << FRAC_BITS) >> p_shift, so
+/// effective gain = 1 / 2^p_shift (in iter units per iter of phase error). Bang-bang
+/// (slew = sign of phase_err in fp units, the original behaviour) corresponds to a very
+/// small slew per edge; the proportional form converges faster on the magnitude of the
+/// error. Default of 8 = gain 1/256: one 256-bit exchange = one full iter of slew if
+/// phase_err is consistently 1 iter, which converges in roughly one exchange. Larger
+/// shifts (10-12) are gentler / more averaging-friendly.
+static SYNC_P_SHIFT_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(8);
 static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
@@ -669,7 +680,7 @@ fn fast_stats(samples: u32) -> WireStats {
 }
 
 /// CDR sync loop. Caller MUST run inside `cortex_m::interrupt::free` — the per-iteration↔wall-time mapping requires no IRQ preemption. `max_iter` caps wall time even if the wire is silent.
-fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32) -> SyncResult {
+fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> SyncResult {
     let max_iter = max_iter.min(SYNC_MAX_ITERATIONS);
     let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
     let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
@@ -762,12 +773,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32) -> SyncResult {
             let expected = n_slots * slot;
             let phase_err = own_iter - expected;
 
-            // Bang-bang ±1 fp unit on sign of phase_err, no deadband, no rejection. Slew always happens — settle period only gates binning/accumulators.
-            if phase_err > 0 {
-                interval_fp = interval_fp.wrapping_add(1);
-            } else if phase_err < 0 {
-                interval_fp = interval_fp.wrapping_sub(1);
-            }
+            // Proportional slew: slew_fp = (phase_err << FRAC_BITS) >> p_shift. Effective
+            // tracker gain (in iter per iter-of-error per edge) = 1 / 2^p_shift. p_shift=8
+            // → gain 1/256, ~one 256-bit exchange to converge a 1-iter error. p_shift=12
+            // → gain 1/4096, gentler / averages over many exchanges. Per-edge cost is one
+            // shift + one add; well within the inner-loop budget at 170 kHz wire.
+            //
+            // The (phase_err << FRAC_BITS) sign-extends through i64 to avoid overflow at
+            // large phase_err (which happens when slot is briefly mis-estimated and a
+            // bunch of edges land 10s of iter off).
+            let slew_fp = ((phase_err as i64) << frac_bits) >> p_shift;
+            interval_fp = (interval_fp as i64).wrapping_add(slew_fp) as u32;
 
             let in_settle = iter < acquisition_iter_count + settle_iter;
             if !in_settle {
@@ -823,6 +839,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32) -> SyncResult {
         total_iterations: iter,
         status,
         frac_bits,
+        p_shift,
         acquisition_slot_iter,
         final_interval_fp: interval_fp,
         acquisition_iter_count,
@@ -1131,7 +1148,8 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
         if sync_req != 0 {
             let frac_req = SYNC_FRAC_REQUEST.load(PaOrdering::Relaxed);
             let settle_req = SYNC_SETTLE_REQUEST.load(PaOrdering::Relaxed);
-            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req));
+            let p_shift_req = SYNC_P_SHIFT_REQUEST.load(PaOrdering::Relaxed);
+            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req, p_shift_req));
             let iters = result.total_iterations.max(1);
             unsafe {
                 SYNC_RESULT = result;
@@ -1976,13 +1994,23 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 0
             };
+            let p_shift = if data_in.len() >= 16 {
+                u32::from_le_bytes([data_in[12], data_in[13], data_in[14], data_in[15]])
+            } else {
+                8 // default proportional gain 1/256 — converges in ~one 256-bit exchange
+            };
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
             let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
             let settle_iter = settle_iter.min(max_iter / 2);
+            // Clamp p_shift to a sane range. Lower bound 0 = full iter correction per
+            // edge (aggressive, risks oscillation). Upper bound 24 = effective no-op
+            // (slew << small for any reasonable phase_err).
+            let p_shift = p_shift.min(24);
 
             SYNC_RESPONSE.store(0, PaOrdering::Relaxed);
             SYNC_FRAC_REQUEST.store(frac_bits, PaOrdering::Relaxed);
             SYNC_SETTLE_REQUEST.store(settle_iter, PaOrdering::Relaxed);
+            SYNC_P_SHIFT_REQUEST.store(p_shift, PaOrdering::Relaxed);
             SYNC_REQUEST.store(max_iter, PaOrdering::Release);
 
             // SYNC_MAX_ITERATIONS = 2^28 = ~45-90 s worst case; 120 s deadline gives margin. USB CDC stays up on core 0 during this because interrupt::free on core 1 doesn't gate core 0's IRQs.
@@ -1998,17 +2026,18 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 fields.push(("err".to_string(), VsfType::a("sync_timeout".to_string())));
             } else {
                 let s = unsafe { SYNC_RESULT };
-                // Layout (all LE): 17 × u32 + 3 × i64 + 2 × SYNC_HIST_BINS × u16.
-                //   u32: elapsed_us, total_iterations, status, frac_bits, acquisition_slot_iter, final_interval_fp, acquisition_iter_count, measurement_iter_count, acq_rising, acq_falling, rising_total, falling_total, rising_neg_overflow, rising_pos_overflow, falling_neg_overflow, falling_pos_overflow, hist_bins
+                // Layout (all LE): 18 × u32 + 3 × i64 + 2 × SYNC_HIST_BINS × u16.
+                //   u32: elapsed_us, total_iterations, status, frac_bits, p_shift, acquisition_slot_iter, final_interval_fp, acquisition_iter_count, measurement_iter_count, acq_rising, acq_falling, rising_total, falling_total, rising_neg_overflow, rising_pos_overflow, falling_neg_overflow, falling_pos_overflow, hist_bins
                 //   i64: phase_sum, fall_to_rise_offset_sum, rise_to_fall_offset_sum
                 //   u16[]: rising_hist[hist_bins], falling_hist[hist_bins]
                 let hist_bytes = SYNC_HIST_BINS * 2;
-                let cap = 17 * 4 + 3 * 8 + 2 * hist_bytes;
+                let cap = 18 * 4 + 3 * 8 + 2 * hist_bytes;
                 let mut payload = alloc::vec::Vec::with_capacity(cap);
                 payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
                 payload.extend_from_slice(&s.total_iterations.to_le_bytes());
                 payload.extend_from_slice(&s.status.to_le_bytes());
                 payload.extend_from_slice(&s.frac_bits.to_le_bytes());
+                payload.extend_from_slice(&s.p_shift.to_le_bytes());
                 payload.extend_from_slice(&s.acquisition_slot_iter.to_le_bytes());
                 payload.extend_from_slice(&s.final_interval_fp.to_le_bytes());
                 payload.extend_from_slice(&s.acquisition_iter_count.to_le_bytes());

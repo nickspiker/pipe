@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
             );
             return ExitCode::from(2);
         }
@@ -99,6 +99,7 @@ fn main() -> ExitCode {
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
+        "tune_p" => cmd_tune_p(&port_path, cmd_args),
         "wire_decode" => cmd_wire_decode(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
         "reset" => cmd_action(&port_path, "reset"),
@@ -673,30 +674,53 @@ fn cmd_wire_stats(port_path: &str, args: &[String]) -> Result<(), String> {
 }
 
 /// `wire_sync [MAX_ITER [FRAC_BITS]]` — runs the bridge CDR: same-polarity acquisition (128 rise-to-rise + 128 fall-to-fall, slot = sum >> 9), then a per-polarity bang-bang tracker slews interval_fp by ±1 fp unit per edge (slew = slot/2^FRAC_BITS). Bins per-polarity phase_err. Defaults: MAX_ITER = 2^25 (~6 s), FRAC_BITS = 11.
-fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
-    const SYNC_MAX_ITER: u32 = 1 << 28;
-    let max_iter: u32 = args
-        .first()
-        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
-        .transpose()?
-        .unwrap_or(1 << 25)
-        .clamp(2048, SYNC_MAX_ITER);
-    let frac_bits: u32 = args
-        .get(1)
-        .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
-        .transpose()?
-        .unwrap_or(13)
-        .clamp(2, 19);
-    let settle_iter: u32 = args
-        .get(2)
-        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SETTLE_ITER: {e}")))
-        .transpose()?
-        .unwrap_or(0);
+/// Decoded `wire_sync` response. Mirrors the firmware's `SyncResult` layout (see
+/// pipe-bridge-rp2040/src/main.rs `fast_sync`), one-shot parsed so both cmd_wire_sync
+/// (which pretty-prints a single run) and cmd_tune_p (which sweeps across p_shift)
+/// can use the same byte layout.
+#[allow(dead_code)]
+struct SyncResultParsed {
+    elapsed_us: u64,
+    total_iter: u64,
+    status: u32,
+    frac_bits: u32,
+    p_shift: u32,
+    acquisition_slot_iter: u32,
+    final_interval_fp: u32,
+    acquisition_iter_count: u32,
+    measurement_iter_count: u32,
+    acq_rising: u32,
+    acq_falling: u32,
+    rising_total: u32,
+    falling_total: u32,
+    rising_neg_overflow: u32,
+    rising_pos_overflow: u32,
+    falling_neg_overflow: u32,
+    falling_pos_overflow: u32,
+    hist_bins: usize,
+    hist_half_range: i32,
+    phase_sum: i64,
+    fall_to_rise_offset_sum: i64,
+    rise_to_fall_offset_sum: i64,
+    rising_hist: Vec<u16>,
+    falling_hist: Vec<u16>,
+}
 
-    let mut params = Vec::with_capacity(12);
+/// Run one `wire_sync` round on the bridge with the given parameters, parse the
+/// response blob into a `SyncResultParsed`. Layout matches firmware exactly: 18 × u32
+/// + 3 × i64 + 2 × hist_bins × u16.
+fn run_wire_sync(
+    port_path: &str,
+    max_iter: u32,
+    frac_bits: u32,
+    settle_iter: u32,
+    p_shift: u32,
+) -> Result<SyncResultParsed, String> {
+    let mut params = Vec::with_capacity(16);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
     params.extend_from_slice(&settle_iter.to_le_bytes());
+    params.extend_from_slice(&p_shift.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -717,9 +741,9 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
             _ => None,
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
-    // Scalar header is 17 × u32 + 3 × i64 = 92 bytes; then 2 × hist_bins × u16.
-    if data.len() < 92 {
-        return Err(format!("sync response too short: {} bytes (want >= 92 scalar header)", data.len()));
+    const SCALAR_BYTES: usize = 18 * 4 + 3 * 8; // 96
+    if data.len() < SCALAR_BYTES {
+        return Err(format!("sync response too short: {} bytes (want >= {SCALAR_BYTES} scalar header)", data.len()));
     }
     let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
     let gi64 = |off: usize| i64::from_le_bytes([
@@ -728,29 +752,8 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     ]);
     let g16 = |off: usize| u16::from_le_bytes([data[off], data[off+1]]);
 
-    let elapsed_us = g32(0) as u64;
-    let total_iter = g32(4) as u64;
-    let status = g32(8);
-    let frac_bits = g32(12);
-    let acquisition_slot_iter = g32(16);
-    let final_interval_fp = g32(20);
-    let acquisition_iter_count = g32(24);
-    let measurement_iter_count = g32(28);
-    let acq_rising = g32(32);
-    let acq_falling = g32(36);
-    let rising_total = g32(40);
-    let falling_total = g32(44);
-    let rising_neg_overflow = g32(48);
-    let rising_pos_overflow = g32(52);
-    let falling_neg_overflow = g32(56);
-    let falling_pos_overflow = g32(60);
-    let hist_bins = g32(64) as usize;
-    let hist_half_range = (hist_bins / 2) as i32;
-    let phase_sum = gi64(68);
-    let fall_to_rise_offset_sum = gi64(76);
-    let rise_to_fall_offset_sum = gi64(84);
-
-    let hist_off = 92;
+    let hist_bins = g32(68) as usize;
+    let hist_off = SCALAR_BYTES;
     let hist_bytes = hist_bins * 2;
     if data.len() < hist_off + 2 * hist_bytes {
         return Err(format!(
@@ -760,6 +763,67 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     }
     let rising_hist: Vec<u16> = (0..hist_bins).map(|i| g16(hist_off + i * 2)).collect();
     let falling_hist: Vec<u16> = (0..hist_bins).map(|i| g16(hist_off + hist_bytes + i * 2)).collect();
+    Ok(SyncResultParsed {
+        elapsed_us: g32(0) as u64,
+        total_iter: g32(4) as u64,
+        status: g32(8),
+        frac_bits: g32(12),
+        p_shift: g32(16),
+        acquisition_slot_iter: g32(20),
+        final_interval_fp: g32(24),
+        acquisition_iter_count: g32(28),
+        measurement_iter_count: g32(32),
+        acq_rising: g32(36),
+        acq_falling: g32(40),
+        rising_total: g32(44),
+        falling_total: g32(48),
+        rising_neg_overflow: g32(52),
+        rising_pos_overflow: g32(56),
+        falling_neg_overflow: g32(60),
+        falling_pos_overflow: g32(64),
+        hist_bins,
+        hist_half_range: (hist_bins / 2) as i32,
+        phase_sum: gi64(72),
+        fall_to_rise_offset_sum: gi64(80),
+        rise_to_fall_offset_sum: gi64(88),
+        rising_hist,
+        falling_hist,
+    })
+}
+
+fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
+    const SYNC_MAX_ITER: u32 = 1 << 28;
+    let max_iter: u32 = args
+        .first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(1 << 25)
+        .clamp(2048, SYNC_MAX_ITER);
+    let frac_bits: u32 = args
+        .get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
+        .transpose()?
+        .unwrap_or(13)
+        .clamp(2, 19);
+    let settle_iter: u32 = args
+        .get(2)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SETTLE_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(0);
+    let p_shift: u32 = args
+        .get(3)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad P_SHIFT: {e}")))
+        .transpose()?
+        .unwrap_or(8)
+        .min(24);
+
+    let r = run_wire_sync(port_path, max_iter, frac_bits, settle_iter, p_shift)?;
+    let SyncResultParsed { elapsed_us, total_iter, status, frac_bits, p_shift: _,
+        acquisition_slot_iter, final_interval_fp, acquisition_iter_count, measurement_iter_count,
+        acq_rising, acq_falling, rising_total, falling_total,
+        rising_neg_overflow, rising_pos_overflow, falling_neg_overflow, falling_pos_overflow,
+        hist_half_range, phase_sum, fall_to_rise_offset_sum, rise_to_fall_offset_sum,
+        rising_hist, falling_hist, .. } = r;
 
     let ns_per_iter = if total_iter > 0 {
         (elapsed_us as f64 * 1000.0) / total_iter as f64
@@ -870,6 +934,94 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     println!();
     render_hist("falling", &falling_hist, falling_neg_overflow, falling_pos_overflow);
 
+    Ok(())
+}
+
+/// `tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]` — sweep the proportional tracker
+/// shift across [P_MIN..=P_MAX] (default 4..14) and print a per-shift comparison row
+/// so we can pick the value that locks fastest and holds the tightest. Each row runs
+/// one full wire_sync, so a 10-value sweep takes ~90 seconds with the default budget.
+///
+/// Read the table this way:
+///   `locked?`        — status field (0 = LOCKED, 1 = acquisition incomplete, 2 = no edges)
+///   `final µs`       — final_interval_fp converted to µs; should be wire half-period
+///   `drift ppm`      — how far the integrator slewed from the acquisition seed
+///   `mean phase ns`  — should trend to zero if the lock is good
+///   `lock %`         — fraction of edges that fell in the histogram center 5 bins; high
+///                      means tight, low means the tail / overflow eats most edges
+///   `overflow`       — edges outside the histogram entirely; if this dominates the
+///                      tracker is chasing something that doesn't fit ±HALF iter
+fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
+    let p_min: u32 = args.first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad P_MIN: {e}")))
+        .transpose()?
+        .unwrap_or(4)
+        .min(24);
+    let p_max: u32 = args.get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad P_MAX: {e}")))
+        .transpose()?
+        .unwrap_or(14)
+        .min(24);
+    let max_iter: u32 = args.get(2)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(1 << 24)
+        .clamp(2048, 1 << 28);
+    let frac_bits: u32 = args.get(3)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
+        .transpose()?
+        .unwrap_or(13)
+        .clamp(2, 19);
+    if p_min > p_max {
+        return Err(format!("P_MIN ({p_min}) > P_MAX ({p_max})"));
+    }
+
+    println!(
+        "Sweeping p_shift = {p_min}..={p_max} (gain = 1/2^p_shift); MAX_ITER={max_iter}, FRAC_BITS={frac_bits}, ~{}s per row, ~{}s total",
+        max_iter / 4_000_000,
+        (p_max - p_min + 1) * (max_iter / 4_000_000),
+    );
+    println!();
+    println!("  p_shift | locked? |  final µs  | drift ppm  | mean phase ns | lock %  | overflow");
+    println!("  --------+---------+------------+------------+---------------+---------+---------");
+
+    for p in p_min..=p_max {
+        let r = run_wire_sync(port_path, max_iter, frac_bits, 0, p)?;
+        let ns_per_iter = if r.total_iter > 0 {
+            (r.elapsed_us as f64 * 1000.0) / r.total_iter as f64
+        } else { 0.0 };
+        let status_str = match r.status {
+            0 => "ok",
+            1 => "acq?",
+            2 => "dead",
+            _ => "?",
+        };
+        let fp_scale = (1u64 << r.frac_bits) as f64;
+        let final_iter = r.final_interval_fp as f64 / fp_scale;
+        let final_ns = final_iter * ns_per_iter;
+        let drift_iter = final_iter - r.acquisition_slot_iter as f64;
+        let drift_ppm = if r.acquisition_slot_iter > 0 {
+            drift_iter * 1_000_000.0 / r.acquisition_slot_iter as f64
+        } else { 0.0 };
+        let total_edges = r.rising_total + r.falling_total;
+        let phase_mean_ns = if total_edges > 0 {
+            (r.phase_sum as f64 / total_edges as f64) * ns_per_iter
+        } else { 0.0 };
+        // "lock %" = sum of central 5 bins (-2..+2) / (total_edges + overflow). Tight
+        // lock → most edges fall in those bins. Loose lock or oscillation → spread.
+        let half = r.hist_half_range as usize;
+        let center: u64 = if r.rising_hist.len() > half + 2 {
+            r.rising_hist[half-2..=half+2].iter().chain(r.falling_hist[half-2..=half+2].iter()).map(|&v| v as u64).sum()
+        } else { 0 };
+        let total_ov = r.rising_neg_overflow + r.rising_pos_overflow + r.falling_neg_overflow + r.falling_pos_overflow;
+        let lock_denom = total_edges as u64 + total_ov as u64;
+        let lock_pct = if lock_denom > 0 { 100.0 * center as f64 / lock_denom as f64 } else { 0.0 };
+
+        println!(
+            "  {:>7} | {:>7} | {:>9.3}  | {:>+9.0}  | {:>+12.1}  | {:>5.1}%  | {:>7}",
+            p, status_str, final_ns / 1000.0, drift_ppm, phase_mean_ns, lock_pct, total_ov,
+        );
+    }
     Ok(())
 }
 

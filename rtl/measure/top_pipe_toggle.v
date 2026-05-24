@@ -89,15 +89,13 @@ module top_pipe_toggle (
     // -------------------------------------------------------------------------
     // Toggle counter — divides enclave_clk further so the wire toggle rate
     // lands in the bridge's expected slot band.
-    // enclave_clk ≈ 600 kHz with default RING_STAGES=5, RING_DIV=512.
-    // counter[3] = enclave_clk / 16 ≈ 37 kHz toggle.
-    // counter[4] = enclave_clk / 32 ≈ 19 kHz toggle.
-    // counter[15] = enclave_clk / 65536 ≈ visible LED blink.
+    // At RING_STAGES=5, RING_DIV=256: enclave_clk ≈ 1.2 MHz; counter[2] toggles
+    // at enclave_clk/8 ≈ 170 kHz. 4× the previous 42 kHz baseline.
     // -------------------------------------------------------------------------
     reg [15:0] counter = 0;
     always @(posedge enclave_clk) counter <= counter + 1'b1;
 
-    assign pipe_pad = counter[3];
+    assign pipe_pad = counter[2];
     assign led      = 1'b0;
 
 endmodule
