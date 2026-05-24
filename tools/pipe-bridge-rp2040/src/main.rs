@@ -92,9 +92,9 @@ enum PostAction {
     None,
     BootSel,
     Reset,
-    /// Hot-reload a dev image. handle_frames reads size/id/hash out of the LOAD_DEV_*
-    /// statics that dispatch populated, streams that many raw bytes into SRAM at
-    /// DEV_IMAGE_DEST, BLAKE3-verifies, and either jumps (success) or sends an error.
+    /// Hot-reload a dev image into SRAM. handle_frames reads size/id/hash from the
+    /// LOAD_DEV_* statics, streams `size` raw bytes into SRAM at DEV_IMAGE_DEST,
+    /// then BLAKE3-hashes the SRAM range and verifies before jumping.
     LoadDev,
 }
 
@@ -106,7 +106,7 @@ const DEV_IMAGE_MAX_BYTES: u32 = 176 * 1024;
 const DEV_IMAGE_DEST: u32 = 0x2000_0000;
 
 /// Parameters for the next `load_dev` action — dispatch writes, handle_frames reads.
-/// Single-threaded on core 0 so the ordering is just for compiler sequencing.
+/// Single-threaded on core 0 so atomic ordering is just for compiler sequencing.
 static LOAD_DEV_SIZE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 static LOAD_DEV_ID: AtomicU64 = AtomicU64::new(0);
 static mut LOAD_DEV_HASH: [u8; 32] = [0u8; 32];
@@ -1512,26 +1512,24 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
             PostAction::LoadDev => {
                 let size = LOAD_DEV_SIZE.load(PaOrdering::Relaxed);
                 let id = LOAD_DEV_ID.load(PaOrdering::Relaxed);
-                let hash: [u8; 32] = unsafe { *(&raw const LOAD_DEV_HASH) };
-                // Stream `size` raw bytes from CDC into SRAM at DEV_IMAGE_DEST, hashing
-                // as we go. The host writes back-to-back after our "ready" ack went out
-                // (that ack IS the only handshake). On hash match, hand off to the dev
-                // image (USB disconnect = success). On mismatch, send an error response
-                // and fall back into the main loop so the host can retry.
+                let expected_hash: [u8; 32] = unsafe { *(&raw const LOAD_DEV_HASH) };
+                // Phase A: stream `size` raw bytes from CDC into SRAM at DEV_IMAGE_DEST.
+                // No mid-stream hashing — verify by reading back the final destination
+                // after the write completes, which catches both wire errors and any
+                // hardware glitches between receive and store.
                 USB_STATE.store(STATE_RX, Ordering::Relaxed);
                 WAKE_SIGNAL.signal(());
 
                 let dest = DEV_IMAGE_DEST as *mut u8;
                 let mut received: u32 = 0;
-                let mut hasher = blake3::Hasher::new();
                 let mut chunk = [0u8; MAX_PACKET];
-                let mut load_err: Option<&'static str> = None;
+                let mut stage_err: Option<&'static str> = None;
                 while received < size {
                     let n = match class.read_packet(&mut chunk).await {
                         Ok(0) => continue,
                         Ok(n) => n,
                         Err(_) => {
-                            load_err = Some("disconnect");
+                            stage_err = Some("disconnect");
                             break;
                         }
                     };
@@ -1544,17 +1542,21 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
                                 take,
                             );
                         }
-                        hasher.update(&chunk[..take]);
                         received += take as u32;
                     }
                 }
 
-                let actual = hasher.finalize();
-                if load_err.is_none() && actual.as_bytes() != &hash {
-                    load_err = Some("hash_mismatch");
+                // Phase B: verify SRAM by hashing it back and comparing to `did`.
+                if stage_err.is_none() {
+                    let staged = unsafe {
+                        core::slice::from_raw_parts(DEV_IMAGE_DEST as *const u8, size as usize)
+                    };
+                    if blake3::hash(staged).as_bytes() != &expected_hash {
+                        stage_err = Some("stage_hash_mismatch");
+                    }
                 }
 
-                if let Some(err) = load_err {
+                if let Some(err) = stage_err {
                     let err_fields: alloc::vec::Vec<(alloc::string::String, VsfType)> = vec![
                         ("id".to_string(), VsfType::u(id as usize, false)),
                         ("err".to_string(), VsfType::a(err.to_string())),
@@ -1583,8 +1585,9 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
                     continue;
                 }
 
-                // Hash matched. Let the wire drain any in-flight ack the host is still
-                // reading, then hand off. Never returns.
+                // Phase C: commit. Brief delay so any in-flight USB ack the host is
+                // still reading clears the FIFO, then hand off to the dev image. The
+                // USB disconnect that follows IS the success signal.
                 embassy_time::Timer::after_millis(50).await;
                 jump_to_dev_image();
             }
@@ -2102,12 +2105,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
         }
         "load_dev" => {
-            // Hot-reload: host sends size (via `n`) + BLAKE3 hash (via `did`), gets a
-            // "load_dev_ready" ack, then streams `size` raw bytes which handle_frames
-            // pipes directly into SRAM at DEV_IMAGE_DEST. On hash match, manager jumps
-            // to the dev image (disconnect = success). On mismatch, manager replies
-            // with an error and stays alive. Two failure modes get error responses
-            // here (before streaming): size too big, or hash field missing/wrong type.
+            // Hot-reload a dev image into SRAM. `n` = image size, `did` = BLAKE3.
+            // handle_frames streams `size` raw bytes into SRAM at DEV_IMAGE_DEST,
+            // hashes the staged SRAM, verifies against `did`, and jumps on match.
+            // Reject here on bad size or wrong hash length so the host never enters
+            // the streaming phase for a doomed transfer.
             let size_u64 = n_arg;
             let hash_bytes = cmd
                 .get("did")

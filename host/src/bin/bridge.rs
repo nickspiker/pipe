@@ -1124,7 +1124,13 @@ fn cmd_action(port_path: &str, op: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `load_dev <path-to-elf-or-bin>` — hot-loads a dev image into the bridge's SRAM via the running manager firmware (no PICOBOOT, no chip reset, no boot ROM dance). Flow: objcopy the ELF to flat binary if needed; BLAKE3-hash it; send a `load_dev` VSF cmd carrying size+hash; on `load_dev_ready` ack, stream the raw bytes back-to-back over the same CDC link; the manager verifies the hash, jumps to vector_table[1] with SP from vector_table[0]. The USB disconnect that follows IS the success signal — re-enumeration brings up the dev image, which we then ping to confirm.
+/// `load_dev <path-to-elf-or-bin>` — hot-load a dev image into bridge SRAM via the
+/// running manager firmware (no PICOBOOT, no chip reset, no boot ROM dance). Flow:
+/// objcopy ELF → flat binary if needed; BLAKE3-hash it; send a `load_dev` VSF cmd
+/// carrying size + hash; on `load_dev_ready` ack, stream raw bytes back-to-back over
+/// the same CDC link; manager reads back SRAM, BLAKE3-verifies, jumps to vector_table[1]
+/// with SP from vector_table[0]. USB disconnect = success — re-enumeration brings up
+/// the dev image, which we then ping (with retries) to confirm.
 fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     let src_path = args.first().ok_or("usage: bridge load_dev <path/to/elf-or-bin>")?;
     let src_path = std::path::Path::new(src_path);
@@ -1175,7 +1181,7 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     );
 
     // Phase 1: hand off the size + hash via a normal VSF cmd. The manager validates
-    // size (≤ 176 KiB) and replies "load_dev_ready" before we stream a single byte.
+    // size (≤ 176 KiB) and replies load_dev_ready before we stream a single byte.
     let extras = vec![
         ("n".to_string(), VsfType::u(image.len(), false)),
         ("did".to_string(), VsfType::hp(hash.as_bytes().to_vec())),
@@ -1187,7 +1193,7 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     }
     let section = parse_resp(&resp)?;
     if let Some(err) = resp_ascii(&section, "err") {
-        return Err(format!("manager rejected load: {err}"));
+        return Err(format!("manager rejected load_dev: {err}"));
     }
     if resp_ascii(&section, "op") != Some("load_dev_ready") {
         return Err("manager did not ack with load_dev_ready".into());
@@ -1209,17 +1215,18 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
         (image.len() as f64 / 1024.0) / (stream_ms / 1000.0),
     );
 
-    // The manager will either jump (USB disconnect = success) or send a final error
-    // response (hash_mismatch / disconnect). Read with a short deadline so we can
-    // tell the two apart: if any bytes come back, parse them; if the port goes away
-    // first, treat that as success.
+    // The manager will either commit (USB disconnect = success) or send a final
+    // error response (hash_mismatch / disconnect / flash_*). Drop the long stream
+    // timeout to 100ms here so the wall-clock deadline-check actually fires —
+    // otherwise each port.read would block the full open_port timeout (150s) and
+    // we'd never get past the drain loop. flash_dev is slow (erase ~440 ms + write
+    // ~700 ms before sys_reset), so the deadline has to cover that whole window
+    // or we'd race the commit and falsely succeed.
+    let _ = port.set_timeout(Duration::from_millis(100));
     let mut err_buf = Vec::with_capacity(128);
     let mut chunk = [0u8; 128];
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if Instant::now() > deadline {
-            break;
-        }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
         match port.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -1228,7 +1235,14 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
                     break;
                 }
             }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::BrokenPipe) => break,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::BrokenPipe) => {
+                // TimedOut just means no bytes in this 100ms window — keep waiting
+                // until the wall-clock deadline. BrokenPipe means disconnect, which
+                // for flash_dev is the expected commit signal.
+                if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -1254,10 +1268,59 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
         "serial device",
     )?;
     println!("(found)");
-    std::thread::sleep(Duration::from_millis(500));
 
+    // After re-enumeration, the host kernel's CDC layer may still be settling — the
+    // first ping can race the DTR/RTS handshake and hang on a stale fd. Each attempt
+    // uses a short port read timeout so a single failed try doesn't burn the full
+    // 150 s open_port budget; the outer loop retries with backoff until either a
+    // pong lands or the wall-clock deadline expires.
     println!("→ verifying with ping");
-    cmd_ping(port_path)?;
+    let ping_deadline = Instant::now() + Duration::from_secs(15);
+    let mut delay_ms = 200u64;
+    loop {
+        if try_ping_short(port_path).is_ok() {
+            break;
+        }
+        if Instant::now() >= ping_deadline {
+            return Err("ping after load_dev: never got pong".into());
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        delay_ms = (delay_ms * 2).min(2000);
+    }
     println!("load_dev: success");
+    Ok(())
+}
+
+/// Short-timeout ping for the post-commit retry loop. Opens the port with a 500ms
+/// read timeout (vs open_port's 150s) so a stuck attempt fails fast and the caller
+/// can back off and retry instead of burning the whole budget on one stale fd.
+fn try_ping_short(port_path: &str) -> Result<(), String> {
+    let mut port = serialport::new(port_path, 115_200)
+        .timeout(Duration::from_millis(500))
+        .open()
+        .map_err(|e| format!("open: {e}"))?;
+    let req = build_cmd_doc("ping", 1, vec![])?;
+    port.write_all(&req).map_err(|e| format!("write: {e}"))?;
+    let mut resp = Vec::with_capacity(256);
+    let mut chunk = [0u8; 128];
+    loop {
+        match port.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&chunk[..n]);
+                if resp.last() == Some(&b']') {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if resp.is_empty() {
+        return Err("no response".into());
+    }
+    let section = parse_resp(&resp)?;
+    if resp_ascii(&section, "op") != Some("pong") {
+        return Err("no pong".into());
+    }
     Ok(())
 }
