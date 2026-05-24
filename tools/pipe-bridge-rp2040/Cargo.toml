@@ -15,7 +15,7 @@ publish = false
 ram-image = []
 
 [dependencies]
-embassy-executor = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "integrated-timers"] }
+embassy-executor = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "integrated-timers", "task-arena-size-8192"] }
 embassy-time     = { version = "0.3" }
 embassy-rp       = { version = "0.2", features = ["time-driver", "critical-section-impl", "rt", "boot2-w25q080", "unstable-pac"] }
 embassy-usb      = { version = "0.3" }

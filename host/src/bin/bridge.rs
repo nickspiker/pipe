@@ -1124,11 +1124,8 @@ fn cmd_action(port_path: &str, op: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `load_dev <path-to-elf-or-bin>` — hot-loads a dev image into the bridge's SRAM via the silicon PICOBOOT interface, then jumps. Flow: send `bootsel` host command so the bridge drops into PICOBOOT mode; objcopy the ELF to flat binary (if it's an ELF, detected by magic); open PICOBOOT over USB; write the binary bytes starting at SRAM 0x20000000 in 256-byte pages; reboot to the ELF's reset handler (vector[1]) with stack pointer from vector[0]. No flash writes, no manual BOOT button presses between iterations.
+/// `load_dev <path-to-elf-or-bin>` — hot-loads a dev image into the bridge's SRAM via the running manager firmware (no PICOBOOT, no chip reset, no boot ROM dance). Flow: objcopy the ELF to flat binary if needed; BLAKE3-hash it; send a `load_dev` VSF cmd carrying size+hash; on `load_dev_ready` ack, stream the raw bytes back-to-back over the same CDC link; the manager verifies the hash, jumps to vector_table[1] with SP from vector_table[0]. The USB disconnect that follows IS the success signal — re-enumeration brings up the dev image, which we then ping to confirm.
 fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
-    use picoboot_rs::{PicobootConnection, PAGE_SIZE, SRAM_START_RP2040};
-    use rusb::{Context, UsbContext};
-
     let src_path = args.first().ok_or("usage: bridge load_dev <path/to/elf-or-bin>")?;
     let src_path = std::path::Path::new(src_path);
     if !src_path.exists() {
@@ -1168,106 +1165,89 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     }
     let initial_sp = u32::from_le_bytes([image[0], image[1], image[2], image[3]]);
     let reset_handler = u32::from_le_bytes([image[4], image[5], image[6], image[7]]);
-    println!("→ image: {} bytes, vector_table[0] SP=0x{:08X}, [1] reset=0x{:08X}", image.len(), initial_sp, reset_handler);
+    let hash = blake3::hash(&image);
+    println!(
+        "→ image: {} bytes, SP=0x{:08X}, reset=0x{:08X}, BLAKE3={}",
+        image.len(),
+        initial_sp,
+        reset_handler,
+        hash.to_hex(),
+    );
 
-    // Drop bridge into PICOBOOT via the existing bootsel software command. The bridge's `reset_to_usb_boot(0,0)` lands at VID:2e8a PID:0003 on RP2040.
-    println!("→ requesting bootsel");
-    let (_, _) = send_cmd(port_path, "bootsel", 9001, vec![])
-        .or_else(|_| Ok::<_, String>((Vec::new(), Duration::default())))?;
-
-    // Wait for the PICOBOOT USB endpoint to appear. libusb sees the device by VID:PID; udev rules with TAG+="uaccess" must be in place for non-root access.
-    print!("→ waiting for PICOBOOT (2e8a:0003) ");
-    let _ = std::io::stdout().flush();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let ctx = loop {
-        let ctx = Context::new().map_err(|e| format!("libusb init: {e}"))?;
-        let found = ctx
-            .devices()
-            .map_err(|e| format!("enumerate USB: {e}"))?
-            .iter()
-            .any(|d| {
-                d.device_descriptor()
-                    .map(|desc| desc.vendor_id() == 0x2e8a && desc.product_id() == 0x0003)
-                    .unwrap_or(false)
-            });
-        if found {
-            break ctx;
-        }
-        if Instant::now() > deadline {
-            return Err("\nPICOBOOT device never appeared".into());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    println!("(found)");
-
-    let mut conn = PicobootConnection::new(ctx, None)
-        .map_err(|e| format!("open PICOBOOT (check udev rules at /etc/udev/rules.d/99-picotool.rules): {e:?}"))?;
-    conn.reset_interface().map_err(|e| format!("reset_interface: {e:?}"))?;
-    conn.access_exclusive_eject().map_err(|e| format!("access_exclusive_eject: {e:?}"))?;
-    conn.exit_xip().map_err(|e| format!("exit_xip: {e:?}"))?;
-
-    // Write the image to SRAM in PAGE_SIZE chunks. PicobootConnection::flash_write requires page-aligned addresses but the underlying PICOBOOT Write cmd works for any memory region — including SRAM at 0x20000000.
-    let pages = image.len().div_ceil(PAGE_SIZE as usize);
-    println!("→ writing {} bytes ({} pages) to SRAM @ 0x{:08X}", image.len(), pages, SRAM_START_RP2040);
-    for (i, chunk) in image.chunks(PAGE_SIZE as usize).enumerate() {
-        let addr = SRAM_START_RP2040 + (i as u32) * PAGE_SIZE;
-        let mut page = chunk.to_vec();
-        page.resize(PAGE_SIZE as usize, 0);
-        conn.flash_write(addr, &page).map_err(|e| format!("write @ 0x{addr:08X}: {e:?}"))?;
-        if i.is_multiple_of(64) || i + 1 == pages {
-            print!("\r  page {}/{}", i + 1, pages);
-            let _ = std::io::stdout().flush();
-        }
-    }
-    println!();
-
-    // Trampoline at 0x2002C000 (start of dev-image's RAM region — overlaps .data VMA which gets copied by the dev image's own startup, so we can clobber it). PICOBOOT REBOOT lands here; the trampoline clears PSM_FRCE_ON/OFF (which embassy_rp's __pre_init would otherwise spin on if PICOBOOT left bits set), then reads the dev image's vector[0]/vector[1] from 0x20000000, sets MSP, and BX's to the reset handler. Hand-assembled Thumb-1 for Cortex-M0+, 32 bytes:
-    //   ldr  r0, [pc, #20]   ; r0 = 0x40010000 (PSM_FRCE_ON)
-    //   movs r1, #0
-    //   str  r1, [r0]        ; PSM_FRCE_ON  = 0
-    //   str  r1, [r0, #4]    ; PSM_FRCE_OFF = 0
-    //   ldr  r0, [pc, #16]   ; r0 = 0x20000000 (main vector table)
-    //   ldr  r1, [r0]        ; r1 = initial SP
-    //   ldr  r2, [r0, #4]    ; r2 = reset handler
-    //   msr  msp, r1
-    //   bx   r2
-    //   .word 0x40010000
-    //   .word 0x20000000
-    const TRAMPOLINE_ADDR: u32 = 0x2002_C000;
-    const TRAMPOLINE: [u8; 32] = [
-        0x05, 0x48, 0x00, 0x21, 0x01, 0x60, 0x41, 0x60,
-        0x04, 0x48, 0x01, 0x68, 0x42, 0x68, 0x81, 0xF3,
-        0x08, 0x88, 0x10, 0x47, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x00, 0x20,
+    // Phase 1: hand off the size + hash via a normal VSF cmd. The manager validates
+    // size (≤ 176 KiB) and replies "load_dev_ready" before we stream a single byte.
+    let extras = vec![
+        ("n".to_string(), VsfType::u(image.len(), false)),
+        ("did".to_string(), VsfType::hp(hash.as_bytes().to_vec())),
     ];
-    let mut tramp_page = TRAMPOLINE.to_vec();
-    tramp_page.resize(PAGE_SIZE as usize, 0);
-    conn.flash_write(TRAMPOLINE_ADDR, &tramp_page)
-        .map_err(|e| format!("write trampoline @ 0x{TRAMPOLINE_ADDR:08X}: {e:?}"))?;
-    println!("→ trampoline written @ 0x{:08X}", TRAMPOLINE_ADDR);
-
-    // Verify the first and last page actually landed in SRAM before jumping. flash_read with a SRAM address goes through the same Read cmd (0x84) which works for both flash and RAM regions on the RP2040 boot ROM.
-    print!("→ verifying SRAM contents ");
-    let _ = std::io::stdout().flush();
-    let first_expected = &image[..PAGE_SIZE.min(image.len() as u32) as usize];
-    let first_actual = conn.flash_read(SRAM_START_RP2040, first_expected.len() as u32)
-        .map_err(|e| format!("read @ 0x{:08X}: {e:?}", SRAM_START_RP2040))?;
-    if first_actual != first_expected {
-        return Err(format!("SRAM verify FAILED at 0x{:08X}: first 16 expected {:02x?} got {:02x?}",
-            SRAM_START_RP2040, &first_expected[..16.min(first_expected.len())], &first_actual[..16.min(first_actual.len())]));
+    println!("→ load_dev cmd (size + hash)");
+    let (resp, _rtt) = send_cmd(port_path, "load_dev", 9001, extras)?;
+    if resp.is_empty() {
+        return Err("no response from load_dev cmd (manager unreachable)".into());
     }
-    println!("(first page OK)");
+    let section = parse_resp(&resp)?;
+    if let Some(err) = resp_ascii(&section, "err") {
+        return Err(format!("manager rejected load: {err}"));
+    }
+    if resp_ascii(&section, "op") != Some("load_dev_ready") {
+        return Err("manager did not ack with load_dev_ready".into());
+    }
 
-    // Reboot to the trampoline (Thumb bit = +1). The trampoline clears PSM then jumps to the dev image's reset handler using SP/PC from its vector table. SP arg here is unused by the trampoline body (it uses BX, no stack writes before the BX) but we hand it the dev image's SP for safety.
-    let trampoline_pc = TRAMPOLINE_ADDR | 1;
-    println!("→ reboot to trampoline @ 0x{:08X} (will jump to dev image PC=0x{:08X})", trampoline_pc, reset_handler);
-    conn.reboot(trampoline_pc, initial_sp, 50).map_err(|e| format!("reboot: {e:?}"))?;
-    drop(conn);
+    // Phase 2: stream the image bytes over the same CDC link. The manager is in a
+    // tight `class.read_packet` loop; we just push the bytes through. open_port
+    // already set a 150s read timeout — the write side has no separate timeout,
+    // and the kernel paces full-speed CDC at ~1 Mbit/s (~1.5 s for 164 KB).
+    println!("→ streaming {} bytes", image.len());
+    let mut port = open_port(port_path)?;
+    let t_stream = Instant::now();
+    port.write_all(&image).map_err(|e| format!("stream write: {e}"))?;
+    port.flush().map_err(|e| format!("stream flush: {e}"))?;
+    let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "  streamed in {:.0} ms ({:.1} kB/s)",
+        stream_ms,
+        (image.len() as f64 / 1024.0) / (stream_ms / 1000.0),
+    );
 
+    // The manager will either jump (USB disconnect = success) or send a final error
+    // response (hash_mismatch / disconnect). Read with a short deadline so we can
+    // tell the two apart: if any bytes come back, parse them; if the port goes away
+    // first, treat that as success.
+    let mut err_buf = Vec::with_capacity(128);
+    let mut chunk = [0u8; 128];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if Instant::now() > deadline {
+            break;
+        }
+        match port.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                err_buf.extend_from_slice(&chunk[..n]);
+                if err_buf.last() == Some(&b']') {
+                    break;
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::BrokenPipe) => break,
+            Err(_) => break,
+        }
+    }
+    drop(port);
+    if !err_buf.is_empty() {
+        if let Ok(s) = parse_resp(&err_buf) {
+            if let Some(err) = resp_ascii(&s, "err") {
+                return Err(format!("manager reported {err} after stream"));
+            }
+        }
+    }
+
+    // Phase 3: wait for the dev image to re-enumerate. The manager calls
+    // `bx reset_handler` after hashing succeeds; embassy_rp::init in the dev image
+    // resets USBCTRL as part of clocks::init, so the host kernel sees a clean
+    // disconnect followed by a new ACM device. Existing wait_for polls every 100ms.
     let port_pb = std::path::PathBuf::from(port_path);
     print!("→ waiting for {} to re-enumerate ", port_pb.display());
     let _ = std::io::stdout().flush();
-    std::thread::sleep(Duration::from_millis(300));
     wait_for(
         Instant::now() + Duration::from_secs(10),
         || if port_pb.exists() { Some(()) } else { None },

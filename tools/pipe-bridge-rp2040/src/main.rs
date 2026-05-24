@@ -83,12 +83,33 @@ const DEVICE_ID_DOMAIN: &str = "ferros bridge rp2040-zero device id v1";
 const FW_VERSION: u64 = 5;
 
 /// Action requested by `dispatch()` that must run *after* the response is on the wire.
+/// Variants stay unit-sized so `dispatch`'s `(usize, PostAction)` return tuple fits in
+/// registers. Earlier we carried `LoadDev { size, hash: [u8;32], id }` inline (~48 bytes)
+/// — that ballooned the return to ~56 bytes, forced stack-return on thumbv6m, and the
+/// rebuild silently broke at boot (no USB enumeration). Lesson: keep variants small.
 #[derive(Clone, Copy)]
 enum PostAction {
     None,
     BootSel,
     Reset,
+    /// Hot-reload a dev image. handle_frames reads size/id/hash out of the LOAD_DEV_*
+    /// statics that dispatch populated, streams that many raw bytes into SRAM at
+    /// DEV_IMAGE_DEST, BLAKE3-verifies, and either jumps (success) or sends an error.
+    LoadDev,
 }
+
+/// Max dev-image size that fits in the SRAM region reserved for it (0x20000000..0x2002C000).
+/// Matches the `FLASH` LENGTH in `memory-ram.x` (176 KiB = 180224). Anything larger would
+/// either trample manager RAM during the stream or overflow the dev linker layout.
+const DEV_IMAGE_MAX_BYTES: u32 = 176 * 1024;
+/// SRAM destination for the dev image. Must match the `FLASH` ORIGIN in `memory-ram.x`.
+const DEV_IMAGE_DEST: u32 = 0x2000_0000;
+
+/// Parameters for the next `load_dev` action — dispatch writes, handle_frames reads.
+/// Single-threaded on core 0 so the ordering is just for compiler sequencing.
+static LOAD_DEV_SIZE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static LOAD_DEV_ID: AtomicU64 = AtomicU64::new(0);
+static mut LOAD_DEV_HASH: [u8; 32] = [0u8; 32];
 
 // Shared LED-state flag between core 0 (USB task) and core 1 (geiger task).
 //   STATE_IDLE → geiger runs normally (no USB activity right now)
@@ -1277,16 +1298,11 @@ async fn geiger_task(mut heartbeat: Output<'static>) {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // ram-image variant: clean up state PICOBOOT's REBOOT cmd leaves behind. (1) VTOR points at 0x10000000 (flash) but our vector table is at 0x20000000 — set it so IRQ handlers come from the right place. (2) PSM_FRCE_ON / PSM_FRCE_OFF retain whatever state PICOBOOT was running with; embassy_rp::init's reset sequence reads back PSM_FRCE_ON and spins until it exactly matches the bit it just wrote (0x8000 = PROC0), so any stale PROC1/SIO/etc. force-on bit → infinite hang at the very first bl in the reset handler (LED dark, no enumeration). Clear both before init.
+    // ram-image variant: point VTOR at our vector table in SRAM. cortex-m-rt doesn't touch VTOR, and the boot ROM leaves it pointing at the default (boot ROM at 0x00000000), not our 0x20000000 table.
     #[cfg(feature = "ram-image")]
     unsafe {
         let scb = &*cortex_m::peripheral::SCB::PTR;
         scb.vtor.write(0x2000_0000);
-
-        let psm_frce_on:  *mut u32 = 0x4001_0000 as *mut u32;
-        let psm_frce_off: *mut u32 = 0x4001_0004 as *mut u32;
-        psm_frce_on.write_volatile(0);
-        psm_frce_off.write_volatile(0);
     }
 
     // Heap must come up before anything that allocates (VsfBuilder, etc).
@@ -1493,7 +1509,116 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
             PostAction::Reset => {
                 cortex_m::peripheral::SCB::sys_reset();
             }
+            PostAction::LoadDev => {
+                let size = LOAD_DEV_SIZE.load(PaOrdering::Relaxed);
+                let id = LOAD_DEV_ID.load(PaOrdering::Relaxed);
+                let hash: [u8; 32] = unsafe { *(&raw const LOAD_DEV_HASH) };
+                // Stream `size` raw bytes from CDC into SRAM at DEV_IMAGE_DEST, hashing
+                // as we go. The host writes back-to-back after our "ready" ack went out
+                // (that ack IS the only handshake). On hash match, hand off to the dev
+                // image (USB disconnect = success). On mismatch, send an error response
+                // and fall back into the main loop so the host can retry.
+                USB_STATE.store(STATE_RX, Ordering::Relaxed);
+                WAKE_SIGNAL.signal(());
+
+                let dest = DEV_IMAGE_DEST as *mut u8;
+                let mut received: u32 = 0;
+                let mut hasher = blake3::Hasher::new();
+                let mut chunk = [0u8; MAX_PACKET];
+                let mut load_err: Option<&'static str> = None;
+                while received < size {
+                    let n = match class.read_packet(&mut chunk).await {
+                        Ok(0) => continue,
+                        Ok(n) => n,
+                        Err(_) => {
+                            load_err = Some("disconnect");
+                            break;
+                        }
+                    };
+                    let take = (n as u32).min(size - received) as usize;
+                    if take > 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                chunk.as_ptr(),
+                                dest.add(received as usize),
+                                take,
+                            );
+                        }
+                        hasher.update(&chunk[..take]);
+                        received += take as u32;
+                    }
+                }
+
+                let actual = hasher.finalize();
+                if load_err.is_none() && actual.as_bytes() != &hash {
+                    load_err = Some("hash_mismatch");
+                }
+
+                if let Some(err) = load_err {
+                    let err_fields: alloc::vec::Vec<(alloc::string::String, VsfType)> = vec![
+                        ("id".to_string(), VsfType::u(id as usize, false)),
+                        ("err".to_string(), VsfType::a(err.to_string())),
+                    ];
+                    let mut b = VsfBuilder::new().version(7, 7).provenance_only();
+                    if let Some(et) = next_eagle_time() {
+                        b = b.creation_time_oscillations(et as i64);
+                    }
+                    if let Ok(doc) = b.add_section("pipe_message", err_fields).build() {
+                        USB_STATE.store(STATE_TX, Ordering::Relaxed);
+                        WAKE_SIGNAL.signal(());
+                        let mut sent = 0;
+                        while sent < doc.len() {
+                            let end = (sent + MAX_PACKET).min(doc.len());
+                            if class.write_packet(&doc[sent..end]).await.is_err() {
+                                break;
+                            }
+                            sent = end;
+                        }
+                        if doc.len().is_multiple_of(MAX_PACKET) {
+                            let _ = class.write_packet(&[]).await;
+                        }
+                    }
+                    USB_STATE.store(STATE_IDLE, Ordering::Relaxed);
+                    WAKE_SIGNAL.signal(());
+                    continue;
+                }
+
+                // Hash matched. Let the wire drain any in-flight ack the host is still
+                // reading, then hand off. Never returns.
+                embassy_time::Timer::after_millis(50).await;
+                jump_to_dev_image();
+            }
         }
+    }
+}
+
+/// Hand off to a dev image already written to SRAM at DEV_IMAGE_DEST. Reads SP from
+/// vector_table[0] and reset_handler from vector_table[1], disables interrupts, points
+/// VTOR at the dev image's vector table, then sets MSP and `bx`-es to the reset handler.
+/// The dev image's cortex-m-rt reset code takes over from there.
+///
+/// We do NOT reset the USB controller here. embassy_rp::init in the dev image performs
+/// reset + unreset on USBCTRL as part of clocks::init, so the host sees a clean disconnect
+/// followed by re-enumeration with the dev image's descriptors.
+fn jump_to_dev_image() -> ! {
+    unsafe {
+        let sp = core::ptr::read_volatile(DEV_IMAGE_DEST as *const u32);
+        let pc = core::ptr::read_volatile((DEV_IMAGE_DEST + 4) as *const u32);
+        // VTOR before MSP/bx so any IRQ that fires during the brief transition vectors
+        // through the dev image's table (which we just wrote into SRAM) rather than
+        // manager's. Leave PRIMASK alone — cold-boot state is "enabled", and
+        // embassy_executor on cortex-m assumes the same. Disabling here was the bug
+        // that previously left the dev image with IRQs masked, so USBCTRL_IRQ never
+        // fired and host descriptor reads timed out.
+        let scb = &*cortex_m::peripheral::SCB::PTR;
+        scb.vtor.write(DEV_IMAGE_DEST);
+        core::arch::asm!(
+            "msr msp, {sp}",
+            "bx  {pc}",
+            sp = in(reg) sp,
+            pc = in(reg) pc,
+            options(noreturn),
+        );
     }
 }
 
@@ -1669,6 +1794,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
     let mut fields: alloc::vec::Vec<(alloc::string::String, VsfType)> = vec![
         ("id".to_string(), VsfType::u(id as usize, false)),
     ];
+    let mut pending_action = PostAction::None;
     match op_str {
         "ping" => {
             fields.push(("op".to_string(), VsfType::a("pong".to_string())));
@@ -1975,6 +2101,39 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
+        "load_dev" => {
+            // Hot-reload: host sends size (via `n`) + BLAKE3 hash (via `did`), gets a
+            // "load_dev_ready" ack, then streams `size` raw bytes which handle_frames
+            // pipes directly into SRAM at DEV_IMAGE_DEST. On hash match, manager jumps
+            // to the dev image (disconnect = success). On mismatch, manager replies
+            // with an error and stays alive. Two failure modes get error responses
+            // here (before streaming): size too big, or hash field missing/wrong type.
+            let size_u64 = n_arg;
+            let hash_bytes = cmd
+                .get("did")
+                .ok()
+                .and_then(|vs| vs.first().cloned())
+                .and_then(|v| match v {
+                    VsfType::hp(b) => Some(b),
+                    _ => None,
+                });
+            if size_u64 == 0 || size_u64 > DEV_IMAGE_MAX_BYTES as u64 {
+                fields.push(("err".to_string(), VsfType::a("bad_size".to_string())));
+            } else if hash_bytes.as_ref().map(|b| b.len()) != Some(32) {
+                fields.push(("err".to_string(), VsfType::a("bad_hash".to_string())));
+            } else {
+                LOAD_DEV_SIZE.store(size_u64 as u32, PaOrdering::Relaxed);
+                LOAD_DEV_ID.store(id, PaOrdering::Relaxed);
+                unsafe {
+                    (&raw mut LOAD_DEV_HASH).copy_from_nonoverlapping(
+                        hash_bytes.as_ref().unwrap().as_ptr() as *const [u8; 32],
+                        1,
+                    );
+                }
+                pending_action = PostAction::LoadDev;
+                fields.push(("op".to_string(), VsfType::a("load_dev_ready".to_string())));
+            }
+        }
         _ => {
             fields.push(("err".to_string(), VsfType::a("unknown_op".to_string())));
         }
@@ -1994,5 +2153,5 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
         return (0, PostAction::None);
     }
     output[..bytes.len()].copy_from_slice(&bytes);
-    (bytes.len(), PostAction::None)
+    (bytes.len(), pending_action)
 }
