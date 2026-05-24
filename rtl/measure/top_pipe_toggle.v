@@ -32,23 +32,40 @@ module top_pipe_toggle (
 );
 
     // -------------------------------------------------------------------------
-    // Ring osc + mod-N divider — identical to top_pipe_codec.v so the toggle
-    // rate scales the same way under RING_STAGES / RING_DIV defines.
+    // Ring osc + mod-N divider — identical structure to top_pipe_codec.v.
+    //
+    // Placement is pinned via BEL attributes so the ring osc frequency is
+    // consistent build-to-build. Without pinning, nextpnr places the 5 LUTs
+    // wherever it finds room and the inter-LUT routing delays vary by ±tens
+    // of percent across builds, which shifts the osc frequency the same way.
+    // Pinned: all 5 stages in adjacent SLICEs of one tile (X4/Y20) so the
+    // ring is physically tight. PROD-side TRNG rings will use the same
+    // approach but scattered across the die to avoid injection-locking.
     // -------------------------------------------------------------------------
     (* noglobal *) wire [`RING_STAGES-1:0] ring_q;
-    (* keep *) LUT4 #(.INIT(16'h5555)) ring_inv (
+    (* keep, BEL="X4/Y20/SLICEA.K0" *)
+    LUT4 #(.INIT(16'h5555)) ring_inv (
         .A(ring_q[`RING_STAGES-1]), .B(1'b0), .C(1'b0), .D(1'b0),
         .Z(ring_q[0])
     );
-    genvar ri;
-    generate
-        for (ri = 1; ri < `RING_STAGES; ri = ri + 1) begin : ring_buf_stage
-            (* keep *) LUT4 #(.INIT(16'hAAAA)) ring_buf (
-                .A(ring_q[ri - 1]), .B(1'b0), .C(1'b0), .D(1'b0),
-                .Z(ring_q[ri])
-            );
-        end
-    endgenerate
+    // Per-stage BEL strings. Adjacent K0/K1 in each SLICE pack 2 LUTs per
+    // SLICE; ring crosses 3 SLICEs (A.K0/A.K1, B.K0/B.K1, C.K0) of tile X4/Y20.
+    (* keep, BEL="X4/Y20/SLICEA.K1" *)
+    LUT4 #(.INIT(16'hAAAA)) ring_buf_1 (
+        .A(ring_q[0]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(ring_q[1])
+    );
+    (* keep, BEL="X4/Y20/SLICEB.K0" *)
+    LUT4 #(.INIT(16'hAAAA)) ring_buf_2 (
+        .A(ring_q[1]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(ring_q[2])
+    );
+    (* keep, BEL="X4/Y20/SLICEB.K1" *)
+    LUT4 #(.INIT(16'hAAAA)) ring_buf_3 (
+        .A(ring_q[2]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(ring_q[3])
+    );
+    (* keep, BEL="X4/Y20/SLICEC.K0" *)
+    LUT4 #(.INIT(16'hAAAA)) ring_buf_4 (
+        .A(ring_q[3]), .B(1'b0), .C(1'b0), .D(1'b0), .Z(ring_q[4])
+    );
 
     wire ring_raw;
     (* keep *) DCCA dcca_ring_raw (.CLKI(ring_q[0]), .CE(1'b1), .CLKO(ring_raw));
