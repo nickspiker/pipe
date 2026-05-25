@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
             );
             return ExitCode::from(2);
         }
@@ -99,6 +99,7 @@ fn main() -> ExitCode {
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
+        "wire_bits" => cmd_wire_bits(&port_path, cmd_args),
         "tune_p" => cmd_tune_p(&port_path, cmd_args),
         "wire_decode" => cmd_wire_decode(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
@@ -712,6 +713,10 @@ struct SyncResultParsed {
     hist_bins: usize,
     hist_half_range: i32,
     phase_sum: i64,
+    /// RX bit decode appendix (firmware: ferros-bridge fast_sync). Empty/zero on
+    /// firmware that predates the appendix.
+    bits_buffer: u64,
+    bits_decoded: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -775,6 +780,20 @@ fn run_wire_sync(
     }
     let rising_hist: Vec<u16> = (0..hist_bins).map(|i| g16(hist_off + i * 2)).collect();
     let falling_hist: Vec<u16> = (0..hist_bins).map(|i| g16(hist_off + hist_bytes + i * 2)).collect();
+    // RX bit decode appendix: u64 bits_buffer + u32 bits_decoded immediately after the
+    // two histograms. Older firmware doesn't include it; default to 0 in that case.
+    let appendix_off = hist_off + 2 * hist_bytes;
+    let (bits_buffer, bits_decoded) = if data.len() >= appendix_off + 12 {
+        let b = u64::from_le_bytes([
+            data[appendix_off],     data[appendix_off + 1],
+            data[appendix_off + 2], data[appendix_off + 3],
+            data[appendix_off + 4], data[appendix_off + 5],
+            data[appendix_off + 6], data[appendix_off + 7],
+        ]);
+        (b, g32(appendix_off + 8))
+    } else {
+        (0, 0)
+    };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -802,6 +821,8 @@ fn run_wire_sync(
         hist_bins,
         hist_half_range: (hist_bins / 2) as i32,
         phase_sum: gi64(96),
+        bits_buffer,
+        bits_decoded,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1087,6 +1108,86 @@ fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
             rise_max, fall_max,
             lock_flag, lock_at, total_ov,
         );
+    }
+    Ok(())
+}
+
+/// `wire_bits [P_SHIFT [LFSR_SEED_HEX]]` — runs one wire_sync and dumps the last 64
+/// RX-decoded bits. If a 32-bit LFSR seed is provided, simulates the FPGA's wire LFSR
+/// from that seed, slides the 64-bit decoded window across the simulated stream, and
+/// reports the offset (in bits) of the first match — confirming the bridge is recovering
+/// the actual wire bits, not just acquiring lock.
+///
+/// FPGA LFSR is the Fibonacci form embedded in top_pipe_random_oled.v:
+///   wire_lfsr <= {wire_lfsr[30:0], wire_lfsr[31] ^ wire_lfsr[21] ^ wire_lfsr[1] ^ wire_lfsr[0]};
+///   if (wire_lfsr[0]) wire_out <= ~wire_out;   // bit driving slot N's flip = lfsr[0] BEFORE step
+/// Default seed = 0xDEADBEEF (matches the bitstream).
+fn cmd_wire_bits(port_path: &str, args: &[String]) -> Result<(), String> {
+    let p_shift: u32 = args.first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad P_SHIFT: {e}")))
+        .transpose()?
+        .unwrap_or(8)
+        .min(24);
+    let seed: u32 = args.get(1)
+        .map(|s| u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("G#"), 16)
+            .map_err(|e| format!("bad LFSR_SEED_HEX: {e}")))
+        .transpose()?
+        .unwrap_or(0xDEAD_BEEF);
+    let max_iter: u32 = 1 << 24;
+    let frac_bits: u32 = 13;
+    let settle_iter: u32 = 0;
+
+    let r = run_wire_sync(port_path, max_iter, frac_bits, settle_iter, p_shift)?;
+    println!("p_shift={p_shift} locked={} bits_decoded={} edges_to_lock={}",
+        r.locked, r.bits_decoded, r.edges_to_lock);
+    if r.bits_decoded == 0 {
+        return Err("no bits decoded — acquisition failed".to_string());
+    }
+
+    let valid_bits = (r.bits_decoded as u32).min(64) as u32;
+    let display_mask = 1u64.checked_shl(valid_bits).unwrap_or(0).wrapping_sub(1);
+    println!("last {valid_bits} bits (newest=right): {:0width$b}",
+        r.bits_buffer & display_mask,
+        width = valid_bits as usize);
+    println!("                            hex: G#{:016X}", r.bits_buffer);
+
+    // Diagnostic: simulate the FPGA's first N slot bits from the seed, so we can
+    // eyeball whether the LFSR formula is right.
+    let mut sim_lfsr = seed;
+    let mut sim_first_64: u64 = 0;
+    for _ in 0..64 {
+        let bit = (sim_lfsr & 1) as u64;
+        sim_first_64 = (sim_first_64 << 1) | bit;
+        let new_bit = ((sim_lfsr >> 31) ^ (sim_lfsr >> 21) ^ (sim_lfsr >> 1) ^ (sim_lfsr >> 0)) & 1;
+        sim_lfsr = (sim_lfsr << 1) | new_bit;
+    }
+    println!("LFSR sim first 64 bits from seed G#{seed:08X}: G#{sim_first_64:016X}");
+
+    // Search the full LFSR period (2^32 - 1) forward for our decoded window.
+    let mut lfsr = seed;
+    const SIM_SLOTS: u64 = (1u64 << 32) - 1;
+    let mut window: u64 = 0;
+    let mut filled: u64 = 0;
+    let target = r.bits_buffer;
+    let mask = if valid_bits == 64 { u64::MAX } else { (1u64 << valid_bits) - 1 };
+    let mut found_at: Option<u64> = None;
+    for slot_idx in 0..SIM_SLOTS {
+        let bit = (lfsr & 1) as u64;
+        window = (window << 1) | bit;
+        filled += 1;
+        let new_bit = ((lfsr >> 31) ^ (lfsr >> 21) ^ (lfsr >> 1) ^ (lfsr >> 0)) & 1;
+        lfsr = (lfsr << 1) | new_bit;
+        if filled >= valid_bits as u64 && (window & mask) == (target & mask) {
+            found_at = Some(slot_idx + 1 - valid_bits as u64);
+            break;
+        }
+    }
+    match found_at {
+        Some(off) => println!("LFSR match: decoded window appears at slot offset {off} in stream from seed G#{seed:08X}"),
+        None => {
+            println!("LFSR match: NO match within full period ({SIM_SLOTS} slots) from seed G#{seed:08X}");
+            println!("            either the host LFSR formula differs from the FPGA, or the bridge bit decoder has a bug.");
+        }
     }
     Ok(())
 }

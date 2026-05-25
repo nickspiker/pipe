@@ -318,6 +318,12 @@ struct SyncResult {
     /// Per-polarity signed phase_err histogram. Bin i = phase_err = i - SYNC_HIST_HALF_RANGE iter.
     rising_hist: [u16; SYNC_HIST_BINS],
     falling_hist: [u16; SYNC_HIST_BINS],
+    /// RX bit decoder. Each tracked edge contributes n_slots bits (n_slots-1 zeros
+    /// from quiet slots since the previous transition, then 1 for this transition's
+    /// own slot). bits_buffer holds the most recent 64 bits — LSB = newest,
+    /// MSB = oldest. bits_decoded is cumulative since acquisition completed.
+    bits_buffer: u64,
+    bits_decoded: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -349,6 +355,8 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     rise_to_fall_offset_sum: 0,
     rising_hist: [0; SYNC_HIST_BINS],
     falling_hist: [0; SYNC_HIST_BINS],
+    bits_buffer: 0,
+    bits_decoded: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -945,6 +953,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
     let mut rise_to_fall_offset_sum: i64 = 0;
     let mut rising_hist = [0u16; SYNC_HIST_BINS];
     let mut falling_hist = [0u16; SYNC_HIST_BINS];
+    let mut bits_buffer: u64 = 0;
+    let mut bits_decoded: u32 = 0;
 
     // Lock detector: per-polarity counters of consecutive in-threshold edges. The
     // overall `locked` flag goes true when BOTH polarities have crossed the
@@ -1079,6 +1089,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
             interval_fp_high = new_fp;
         }
 
+        // RX bit decode. Each edge with n_slots gap = (n_slots - 1) quiet slots
+        // (bit 0) followed by this transition slot (bit 1). Shift the buffer left
+        // by n_slots and OR the trailing 1 — the n_slots-1 leading zeros come for
+        // free because shifting in clears the new low bits.
+        bits_buffer = bits_buffer.wrapping_shl(n_slots as u32) | 1;
+        bits_decoded = bits_decoded.saturating_add(n_slots as u32);
+
         edges_seen += 1;
         let in_threshold = phase_err.abs() <= SYNC_LOCK_THRESHOLD_CYC;
         if rising {
@@ -1179,6 +1196,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
         rise_to_fall_offset_sum,
         rising_hist,
         falling_hist,
+        bits_buffer,
+        bits_decoded,
     }
 }
 
@@ -2364,7 +2383,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // All slot/interval_fp fields are CYCLES (SYSTICK @ 125 MHz = 8 ns/cyc).
                 // The historical *_iter suffix was kept where the byte name didn't change.
                 let hist_bytes = SYNC_HIST_BINS * 2;
-                let cap = 24 * 4 + 3 * 8 + 2 * hist_bytes;
+                let cap = 24 * 4 + 3 * 8 + 2 * hist_bytes + 8 + 4;  // +12 for RX bits appendix
                 let mut payload = alloc::vec::Vec::with_capacity(cap);
                 payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
                 payload.extend_from_slice(&s.total_iterations.to_le_bytes());
@@ -2399,6 +2418,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 for v in &s.falling_hist {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
+                // RX bit decoder appendix — backward compatible (old parsers stop after
+                // the two histograms). bits_buffer (u64) holds the last 64 decoded
+                // wire bits (LSB = newest), bits_decoded counts total bits since lock.
+                payload.extend_from_slice(&s.bits_buffer.to_le_bytes());
+                payload.extend_from_slice(&s.bits_decoded.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
