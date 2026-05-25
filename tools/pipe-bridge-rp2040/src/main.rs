@@ -235,9 +235,9 @@ const STATS_MAX_SAMPLES: u32 = 1 << 22;
 //
 // LOOP DISCIPLINE: inner loop body must stay constant-time per iter; lives inside interrupt::free.
 // ---------------------------------------------------------------------------
-/// Same-polarity intervals per polarity during acquisition. Total = 2 × N intervals each scaled by 2 × slot; sum = 4N × slot. slot = sum >> SHIFT where SHIFT = log2(4N) = log2(512) = 9.
-const SYNC_ACQ_PER_POLARITY: u32 = 128;
-const SYNC_ACQ_SHIFT: u32 = 9;
+/// Same-polarity intervals per polarity during acquisition. Total = 2 × N intervals each scaled by 2 × slot; sum = 4N × slot. slot = sum >> SHIFT where SHIFT = log2(4N) = log2(1024) = 10.
+const SYNC_ACQ_PER_POLARITY: u32 = 256;
+const SYNC_ACQ_SHIFT: u32 = 10;
 /// Default fractional bits in interval_fp if the host doesn't override. ±1 slew per edge = slot/2^FRAC adjustment.
 ///
 /// Picked 13 (slew = slot/8192) from the empirical sweep on the current FPGA wire. Aggressive values (FRAC ≤ 9) converged interval_fp to the centroid of the wire's multimodal edge clusters — which drove mean phase_err to zero but smeared the per-polarity histogram, making the wire's actual cluster structure unreadable. Slow values (FRAC ≥ 13) kept the lock anchored near the acquisition seed, the histogram resolved the wire's discrete clusters cleanly, and slow drift (~hundreds of ppm/sec from chip self-heating) still got tracked correctly over multi-second runs. 13 balances drift-tracking responsiveness against histogram clarity; bumping to 14-15 makes the lock even quieter but slower to follow real drift.
@@ -715,60 +715,187 @@ fn fast_stats(samples: u32) -> WireStats {
     }
 }
 
-/// CDR sync loop. Caller MUST run inside `cortex_m::interrupt::free` — the per-iteration↔wall-time mapping requires no IRQ preemption. `max_iter` caps wall time even if the wire is silent.
-/// Read SYSTICK current value (24-bit countdown at AHB clock = 125 MHz on RP2040).
-/// One LDR; no conversion. Caller is responsible for setting up the counter once at
-/// the start of an interrupt-free measurement window.
-#[inline(always)]
-fn syst_cvr() -> u32 {
-    // SYST_CVR is at 0xE000E018 on Cortex-M.
-    unsafe { core::ptr::read_volatile(0xE000E018 as *const u32) & 0x00FF_FFFF }
-}
+/// CDR sync loop. Caller MUST run inside `cortex_m::interrupt::free` — the PIO FIFO
+/// reads can't tolerate IRQ-driven backlog beyond the 8-deep RX FIFO depth (~1.3 ms
+/// @ 6 kHz edge rate, plenty of margin but still need IRQs off for safety).
 
-/// Cycle delta accounting for the 24-bit counter wrap. SYSTICK counts DOWN, so a more
-/// recent reading is a smaller value (or larger if wrapped). The wrapping_sub + mask
-/// gives the correct count in both cases.
-#[inline(always)]
-fn syst_delta(prev: u32, cur: u32) -> u32 {
-    prev.wrapping_sub(cur) & 0x00FF_FFFF
-}
+// ============================================================================
+// PIO0 SM0 — cycle-accurate edge timestamping on GP0
+// ============================================================================
+//
+// The polling fast_sync samples GP0 every ~15 sys_clk cycles (~120 ns at 125 MHz),
+// which puts a uniform [0, 15] cyc detection-latency on every edge. Across two
+// edges the difference is triangular [-15, +15] with std ≈ 6 cyc — that quantization
+// noise dominates the per-edge std we measured (8-10 cyc) and the wire-jitter signal
+// (which is ~0.02% × 365 cyc ≈ 0.07 cyc) sits 100× below it.
+//
+// PIO program: a counter (X register) decrements while waiting for the pin's next
+// transition; on transition, X is pushed to the RX FIFO. The CPU pops intervals
+// at edge rate and feeds them directly into the cross-polarity tracker math.
+//
+// Resolution: the wait loop is 2 PIO instructions = 2 sys_clk cycles per decrement,
+// so X measures intervals in 2-cycle units (16 ns at 125 MHz). Predicted per-edge
+// std drops from ~6 cyc to ~0.5 cyc, exposing the wire's actual jitter floor.
+//
+// FIFO encoding: each u32 word is X at capture time. Interval count in 2-cyc units
+// is `0xFFFFFFFF - X = !X`, so cycles = `2 × !X`. Polarity isn't encoded in the
+// word — instead the host alternates starting from the OPPOSITE of the initial
+// pin state captured before SM enable.
+//
+// Hand-encoded per RP2040 datasheet 3.4.2 (no proc-macro dep):
+//   [15:13]=opcode  [12:8]=delay/SS (=0)  [7:0]=operand
+//   jmp pin, addr:   000 _____ 110 aaaaa  → 0x00C0 | addr
+//   jmp x--, addr:   000 _____ 010 aaaaa  → 0x0040 | addr
+//   jmp addr:        000 _____ 000 aaaaa  → 0x0000 | addr
+//   in x, 32:        010 _____ 001 00000  → 0x4020
+//   push (block):    100 _____ 0 0 1 00000 → 0x8020
+//   mov x, !null:    101 _____ 001 01 011  → 0xA02B
+//
+// Program layout (addr / instr):
+//   0  jmp pin, 6         ; if pin starts HIGH, skip into the top_high half
+// .wrap_target = 1
+//   1  mov x, !null       ; (top_low: waiting for pin to go HIGH)
+//   2  jmp pin, 4
+//   3  jmp x--, 2
+//   4  in x, 32           ; (caught_high)
+//   5  push (block)
+//   6  mov x, !null       ; (top_high: waiting for pin to go LOW)
+//   7  jmp pin, 9
+//   8  jmp 10
+//   9  jmp x--, 7
+//  10  in x, 32           ; (caught_low)
+//  11  push (block)
+// .wrap_top = 11 → wraps back to wrap_target = 1
+const PIO_EDGE_PROG: [u16; 12] = [
+    0x00C0 | 6,    //  0  jmp pin, 6
+    0xA02B,        //  1  mov x, !null
+    0x00C0 | 4,    //  2  jmp pin, 4
+    0x0040 | 2,    //  3  jmp x--, 2
+    0x4020,        //  4  in x, 32
+    0x8020,        //  5  push (block)
+    0xA02B,        //  6  mov x, !null
+    0x00C0 | 9,    //  7  jmp pin, 9
+    0x0000 | 10,   //  8  jmp 10
+    0x0040 | 7,    //  9  jmp x--, 7
+    0x4020,        // 10  in x, 32
+    0x8020,        // 11  push (block)
+];
+const PIO_EDGE_SM: usize = 0;
+const PIO_EDGE_GPIO: u8 = 0; // GP0
 
-/// One-shot SYSTICK enable. RVR=max (24 bits), source=core clock (125 MHz),
-/// no interrupt. Idempotent — re-enabling is fine. Caller MUST have IRQs disabled
-/// for the duration of the measurement so SYSTICK is uncontended.
-fn syst_enable_for_measurement() {
-    unsafe {
-        // SYST_RVR = 0xFFFFFF (max 24-bit reload, lets the counter run continuously)
-        core::ptr::write_volatile(0xE000_E014 as *mut u32, 0x00FF_FFFF);
-        // SYST_CVR = 0 (writing any value clears the current value)
-        core::ptr::write_volatile(0xE000_E018 as *mut u32, 0);
-        // SYST_CSR: CLKSOURCE=1 (core clock), TICKINT=0, ENABLE=1
-        core::ptr::write_volatile(0xE000_E010 as *mut u32, 0b101);
+/// One-shot load of the program into PIO0 SM0's instruction memory and register setup.
+/// Safe to call repeatedly — disables the SM first.
+fn pio_edge_init() {
+    use embassy_rp::pac::PIO0;
+    use embassy_rp::pac::pio::regs::{InstrMem, SmClkdiv};
+
+    // Disable SM0 (clear bit 0 of CTRL.sm_enable, preserve other SMs).
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_EDGE_SM));
+    });
+
+    // Load 12 instructions into instr_mem[0..12].
+    for (i, &word) in PIO_EDGE_PROG.iter().enumerate() {
+        PIO0.instr_mem(i).write_value(InstrMem(word as u32));
     }
+
+    // EXECCTRL: wrap_top=11, wrap_bottom=1, jmp_pin=GP0.
+    PIO0.sm(PIO_EDGE_SM).execctrl().write(|w| {
+        w.set_wrap_top(11);
+        w.set_wrap_bottom(1);
+        w.set_jmp_pin(PIO_EDGE_GPIO);
+    });
+
+    // SHIFTCTRL: explicit push (no autopush), join TX into RX for 8-deep RX FIFO.
+    PIO0.sm(PIO_EDGE_SM).shiftctrl().write(|w| {
+        w.set_fjoin_rx(true);
+        w.set_in_shiftdir(true); // right; doesn't matter for full-word in
+        w.set_autopush(false);
+    });
+
+    // CLKDIV = 1.0 (full sys_clk). Format: int<<16 | frac<<8.
+    PIO0.sm(PIO_EDGE_SM).clkdiv().write_value(SmClkdiv(0x0001_0000));
+}
+
+/// Start a capture run. Returns the pin's current logic level so the host knows the
+/// polarity of the FIRST edge (which will be the opposite of this value).
+fn pio_edge_start() -> u32 {
+    use embassy_rp::pac::{PIO0, SIO};
+    use embassy_rp::pac::pio::regs::SmInstr;
+
+    // Read pin state via SIO (independent of PIO funcsel — GPIO inputs are always
+    // mirrored to all peripherals on RP2040).
+    let initial = unsafe { (SIO.gpio_in(0).as_ptr().read_volatile() >> PIO_EDGE_GPIO) & 1 };
+
+    // Drain anything stale in the RX FIFO.
+    while (PIO0.fstat().read().rxempty() & (1 << PIO_EDGE_SM)) == 0 {
+        let _ = PIO0.rxf(PIO_EDGE_SM).read();
+    }
+
+    // SM restart + clkdiv restart. Both are write-1-to-pulse fields in CTRL.
+    PIO0.ctrl().modify(|w| {
+        w.set_sm_restart(1 << PIO_EDGE_SM);
+        w.set_clkdiv_restart(1 << PIO_EDGE_SM);
+    });
+
+    // Force PC = 0 by injecting `jmp 0` into SMx_INSTR.
+    PIO0.sm(PIO_EDGE_SM).instr().write_value(SmInstr(0x0000));
+
+    // Enable SM0.
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur | (1 << PIO_EDGE_SM));
+    });
+
+    initial
+}
+
+fn pio_edge_stop() {
+    use embassy_rp::pac::PIO0;
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_EDGE_SM));
+    });
+}
+
+/// Pop the next FIFO word, bounded by a wall-clock deadline. Returns None on timeout.
+#[inline(always)]
+fn pio_edge_read_until(deadline_us: u64, start: embassy_time::Instant) -> Option<u32> {
+    use embassy_rp::pac::PIO0;
+    while (PIO0.fstat().read().rxempty() & (1 << PIO_EDGE_SM)) != 0 {
+        if start.elapsed().as_micros() > deadline_us {
+            return None;
+        }
+    }
+    Some(PIO0.rxf(PIO_EDGE_SM).read())
 }
 
 fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> SyncResult {
-    let max_iter = max_iter.min(SYNC_MAX_ITERATIONS);
     let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
-    let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
     let start = embassy_time::Instant::now();
 
-    // SYSTICK gives us 8 ns / 125 MHz per tick — direct cycle counts, no µs conversion.
-    // Inter-edge intervals are tens of µs (a few thousand cycles), well inside the
-    // 24-bit (16.8M cycle / 134 ms) wrap window. Iter rate variation in the inner loop
-    // can't bias the slot estimate anymore — the slot is measured in wall time, not
-    // loop iterations. That's the whole point of this refactor.
-    syst_enable_for_measurement();
+    // PIO0 SM0 captures every edge's interval (cycles since previous edge of either
+    // polarity) at 2 sys_clk resolution. The CPU pops words from the RX FIFO and feeds
+    // them straight into the same cross-polarity tracker the polling version uses.
+    // The `iter` counter is now edge-indexed, not poll-indexed.
+    pio_edge_init();
+    let initial = pio_edge_start();
 
-    let mut prev: u32 = unsafe { gpio_in.read_volatile() & 1 };
-    let mut iter: u32 = 1;
+    // Edge cap: convert host-provided poll cap to an edge cap. The polling fast_sync
+    // does ~15 sys_cyc per iter ≈ 8 MHz, so 16M iters ≈ 2 sec. At 6 kHz edges, that's
+    // ~12k edges; round up to 32k for headroom. Hard cap on top of that. Wall-clock
+    // cap (~8 sec) protects against a fully stalled wire.
+    const SYNC_MAX_EDGES_PIO: u32 = 1 << 15;
+    let max_edges = (max_iter >> 9)
+        .min(SYNC_MAX_EDGES_PIO)
+        .max(SYNC_ACQ_PER_POLARITY * 4 + 1);
+    let wall_cap_us: u64 = 8_000_000;
+    let mut iter: u32 = 0; // edge counter (was poll counter)
 
-    // Per-polarity timestamps: the SYSTICK CVR value snapshotted at the last edge of
-    // each polarity. cyc_since_X = syst_delta(cyc_at_last_X, syst_cvr()).
-    let mut cyc_at_last_rise: u32 = syst_cvr();
-    let mut cyc_at_last_fall: u32 = cyc_at_last_rise;
-    let mut rise_anchored: bool = false;
-    let mut fall_anchored: bool = false;
+    // Discard the first FIFO entry — it's "time from SM enable to first edge", which is
+    // a partial phase, not a slot width.
+    let _ = pio_edge_read_until(wall_cap_us, start);
 
     // Dual cross-polarity tracker: HIGH width and LOW width estimated separately.
     //
@@ -778,7 +905,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
     //                   = HIGH width. Updates interval_fp_high.
     //
     // Each acquired interval is ONE slot (not 2 × slot like same-polarity intervals
-    // would be). Sum of N intervals = N × slot → SHIFT = log2(N) = log2(128) = 7.
+    // would be). Sum of N intervals = N × slot → SHIFT = log2(N) = log2(256) = 8.
     // This is the structure that exposes RC asymmetry (HIGH ≠ LOW widths) since each
     // tracker locks to its own polarity's actual duration.
     //
@@ -787,7 +914,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
     //   acquisition_slot_cyc_rise / interval_fp_rise  → tracks LOW width
     //   acquisition_slot_cyc_fall / interval_fp_fall  → tracks HIGH width
     // The host CLI documents this mapping; renaming would churn the parser.
-    const SYNC_ACQ_SHIFT_PER_POLARITY: u32 = 7; // log2(SYNC_ACQ_PER_POLARITY) = log2(128)
+    const SYNC_ACQ_SHIFT_PER_POLARITY: u32 = 8; // log2(SYNC_ACQ_PER_POLARITY) = log2(256)
     let mut acq_sum_low: u64 = 0;   // LOW widths via rising edges
     let mut acq_sum_high: u64 = 0;  // HIGH widths via falling edges
     let mut acq_rising: u32 = 0;
@@ -824,159 +951,128 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
     let mut edges_seen: u32 = 0;
     let mut edges_to_lock: u32 = u32::MAX;
 
-    while iter < max_iter {
-        let cur = unsafe { gpio_in.read_volatile() & 1 };
+    while iter < max_edges {
+        let raw = match pio_edge_read_until(wall_cap_us, start) {
+            Some(r) => r,
+            None => break,
+        };
         iter += 1;
-        if cur != prev {
-            let rising = cur == 1;
-            prev = cur;
-            let cyc_now = syst_cvr();
 
-            if !acquisition_done {
-                // Cross-polarity acquisition. Rising edge ends a LOW interval; falling
-                // edge ends a HIGH interval. Each interval is one slot directly. Skip
-                // contributions when the opposite polarity hasn't been anchored yet
-                // (no prior reference to measure against).
-                if rising {
-                    if !fall_anchored {
-                        // No falling reference yet — can't measure a LOW width.
-                    } else if acq_rising < SYNC_ACQ_PER_POLARITY {
-                        acq_sum_low += syst_delta(cyc_at_last_fall, cyc_now) as u64;
-                        acq_rising += 1;
-                    }
-                    cyc_at_last_rise = cyc_now;
-                    rise_anchored = true;
-                } else {
-                    if !rise_anchored {
-                        // No rising reference yet — can't measure a HIGH width.
-                    } else if acq_falling < SYNC_ACQ_PER_POLARITY {
-                        acq_sum_high += syst_delta(cyc_at_last_rise, cyc_now) as u64;
-                        acq_falling += 1;
-                    }
-                    cyc_at_last_fall = cyc_now;
-                    fall_anchored = true;
-                }
+        // Polarity alternation: edge index N (1-based) is rising iff (N XOR initial)
+        // is odd. With initial=0 (pin started LOW): edge 1 is rising, edge 2 falling.
+        // With initial=1: edge 1 is falling, edge 2 rising. We discarded edge 0 above
+        // so iter=1 is the first usable edge.
+        let rising = ((iter ^ initial) & 1) == 1;
 
-                if acq_rising >= SYNC_ACQ_PER_POLARITY && acq_falling >= SYNC_ACQ_PER_POLARITY {
-                    // Each acquired interval = 1 slot. Sum of N = N × slot. SHIFT = log2(N) = 7.
-                    acquisition_slot_cyc_low = (acq_sum_low >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
-                    acquisition_slot_cyc_high = (acq_sum_high >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
-                    interval_fp_low = acquisition_slot_cyc_low << frac_bits;
-                    interval_fp_high = acquisition_slot_cyc_high << frac_bits;
-                    acquisition_done = true;
-                    acquisition_iter_count = iter;
-                }
-                continue;
-            }
+        // PIO X decrements every 2 sys_clk cycles. Cycle count = 2 * (0xFFFFFFFF - X) = 2 * !X.
+        // (Plus a constant +2 sys_clk for the mov-x-!null init that we drop since it
+        // cancels out of every phase_err calculation.)
+        let own_cyc_u: u32 = (!raw).wrapping_shl(1);
+        let own_cyc: i32 = own_cyc_u as i32;
 
-            // Tracking phase. Cross-polarity: rising edge measures LOW just ended,
-            // updates LOW slot. Falling edge measures HIGH just ended, updates HIGH slot.
-            // Each phase_err is a single-slot residual — no n_slots ambiguity, no
-            // harmonic confusion, no full-period folding.
-            let (interval_fp_self, cyc_at_other) = if rising {
-                // rising ends LOW → measure since last falling → update LOW
-                (interval_fp_low, cyc_at_last_fall)
-            } else {
-                // falling ends HIGH → measure since last rising → update HIGH
-                (interval_fp_high, cyc_at_last_rise)
-            };
-            let slot = (interval_fp_self >> frac_bits) as i32;
-            if slot < 8 {
-                if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
-                continue;
-            }
-
-            let own_cyc = syst_delta(cyc_at_other, cyc_now) as i32;
-            // Each interval is ONE slot. phase_err = measured - expected (= slot).
-            // If the wire drops a half-cycle (extended HIGH or LOW), own_cyc would
-            // be 2*slot or 3*slot — we still fold so n=1 isn't the only option, but
-            // for the clean toggle that's never needed.
-            let half_slot = slot / 2;
-            let mut n_slots = (own_cyc + half_slot) / slot;
-            if n_slots == 0 {
-                n_slots = 1;
-            }
-            let expected = n_slots * slot;
-            let phase_err = own_cyc - expected;
-
-            // Proportional slew on the polarity's own slot estimate.
-            let slew_fp = ((phase_err as i64) << frac_bits) >> p_shift;
-            let new_fp = (interval_fp_self as i64).wrapping_add(slew_fp) as u32;
+        if !acquisition_done {
+            // Cross-polarity acquisition. Every PIO interval is already a clean
+            // single-slot duration since edge N+1 is the opposite polarity from edge N
+            // (after the discarded edge 0). No anchoring needed.
             if rising {
-                interval_fp_low = new_fp;
-            } else {
-                interval_fp_high = new_fp;
-            }
-
-            // Per-polarity lock detector. Overall `locked` requires both polarities
-            // simultaneously in their respective lock windows for SYNC_LOCK_HOLD_EDGES
-            // consecutive edges each — anything less leaves one polarity unlocked and
-            // therefore drifting independently of the other.
-            edges_seen += 1;
-            let in_threshold = phase_err.abs() <= SYNC_LOCK_THRESHOLD_CYC;
-            if rising {
-                if in_threshold {
-                    consec_in_lock_rise = consec_in_lock_rise.saturating_add(1);
-                    if consec_in_lock_rise >= SYNC_LOCK_HOLD_EDGES { rise_locked = true; }
-                } else {
-                    consec_in_lock_rise = 0;
-                    rise_locked = false;
+                if acq_rising < SYNC_ACQ_PER_POLARITY {
+                    acq_sum_low += own_cyc_u as u64;
+                    acq_rising += 1;
                 }
-            } else {
-                if in_threshold {
-                    consec_in_lock_fall = consec_in_lock_fall.saturating_add(1);
-                    if consec_in_lock_fall >= SYNC_LOCK_HOLD_EDGES { fall_locked = true; }
-                } else {
-                    consec_in_lock_fall = 0;
-                    fall_locked = false;
-                }
-            }
-            if !locked && rise_locked && fall_locked {
-                locked = true;
-                edges_to_lock = edges_seen;
-            }
-
-            let in_settle = iter < acquisition_iter_count + settle_iter;
-            if !in_settle {
-                phase_sum += phase_err as i64;
-
-                let bin_signed = phase_err + SYNC_HIST_HALF_RANGE;
-                if bin_signed >= 0 && bin_signed < SYNC_HIST_BINS as i32 {
-                    if rising {
-                        rising_hist[bin_signed as usize] = rising_hist[bin_signed as usize].saturating_add(1);
-                    } else {
-                        falling_hist[bin_signed as usize] = falling_hist[bin_signed as usize].saturating_add(1);
-                    }
-                } else if phase_err < 0 {
-                    if rising { rising_neg_overflow += 1 } else { falling_neg_overflow += 1 };
-                } else {
-                    if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
-                }
-
-                // RC offset signal: the difference between HIGH-slot and LOW-slot is
-                // now directly captured as (interval_fp_high - interval_fp_low) at the
-                // end of the run. These per-edge sums are vestigial from the single-slot
-                // tracker; we keep them as diagnostic but they're redundant info now.
-                // Sum the same single-slot phase_err under the opposite-polarity name
-                // so the host's existing fr/rf display still has data to render.
-                if rising {
-                    fall_to_rise_offset_sum += phase_err as i64;
-                } else {
-                    rise_to_fall_offset_sum += phase_err as i64;
-                }
-            }
-
-            if rising {
                 rising_total += 1;
-                cyc_at_last_rise = cyc_now;
             } else {
+                if acq_falling < SYNC_ACQ_PER_POLARITY {
+                    acq_sum_high += own_cyc_u as u64;
+                    acq_falling += 1;
+                }
                 falling_total += 1;
-                cyc_at_last_fall = cyc_now;
+            }
+
+            if acq_rising >= SYNC_ACQ_PER_POLARITY && acq_falling >= SYNC_ACQ_PER_POLARITY {
+                acquisition_slot_cyc_low = (acq_sum_low >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
+                acquisition_slot_cyc_high = (acq_sum_high >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
+                interval_fp_low = acquisition_slot_cyc_low << frac_bits;
+                interval_fp_high = acquisition_slot_cyc_high << frac_bits;
+                acquisition_done = true;
+                acquisition_iter_count = iter;
+            }
+            continue;
+        }
+
+        // Tracking phase. Same math as the polling version, but own_cyc comes from PIO
+        // directly with 2-cyc resolution (vs ~15-cyc polling quantization).
+        let interval_fp_self = if rising { interval_fp_low } else { interval_fp_high };
+        let slot = (interval_fp_self >> frac_bits) as i32;
+        if slot < 8 {
+            if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
+            if rising { rising_total += 1 } else { falling_total += 1 };
+            continue;
+        }
+
+        let phase_err = own_cyc - slot;
+        let shift = frac_bits as i32 - p_shift as i32;
+        let slew = if shift >= 0 { phase_err << shift } else { phase_err >> -shift };
+        let new_fp = interval_fp_self.wrapping_add_signed(slew);
+        if rising {
+            interval_fp_low = new_fp;
+        } else {
+            interval_fp_high = new_fp;
+        }
+
+        edges_seen += 1;
+        let in_threshold = phase_err.abs() <= SYNC_LOCK_THRESHOLD_CYC;
+        if rising {
+            if in_threshold {
+                consec_in_lock_rise = consec_in_lock_rise.saturating_add(1);
+                if consec_in_lock_rise >= SYNC_LOCK_HOLD_EDGES { rise_locked = true; }
+            } else {
+                consec_in_lock_rise = 0;
+                rise_locked = false;
+            }
+        } else {
+            if in_threshold {
+                consec_in_lock_fall = consec_in_lock_fall.saturating_add(1);
+                if consec_in_lock_fall >= SYNC_LOCK_HOLD_EDGES { fall_locked = true; }
+            } else {
+                consec_in_lock_fall = 0;
+                fall_locked = false;
             }
         }
+        if !locked && rise_locked && fall_locked {
+            locked = true;
+            edges_to_lock = edges_seen;
+        }
+
+        let in_settle = iter < acquisition_iter_count + settle_iter;
+        if !in_settle {
+            phase_sum += phase_err as i64;
+
+            let bin_signed = phase_err + SYNC_HIST_HALF_RANGE;
+            if bin_signed >= 0 && bin_signed < SYNC_HIST_BINS as i32 {
+                if rising {
+                    rising_hist[bin_signed as usize] = rising_hist[bin_signed as usize].saturating_add(1);
+                } else {
+                    falling_hist[bin_signed as usize] = falling_hist[bin_signed as usize].saturating_add(1);
+                }
+            } else if phase_err < 0 {
+                if rising { rising_neg_overflow += 1 } else { falling_neg_overflow += 1 };
+            } else {
+                if rising { rising_pos_overflow += 1 } else { falling_pos_overflow += 1 };
+            }
+
+            if rising {
+                fall_to_rise_offset_sum += phase_err as i64;
+            } else {
+                rise_to_fall_offset_sum += phase_err as i64;
+            }
+        }
+
+        if rising { rising_total += 1 } else { falling_total += 1 };
     }
 
-    let status: u32 = if !rise_anchored && !fall_anchored {
+    pio_edge_stop();
+
+    let status: u32 = if rising_total == 0 && falling_total == 0 {
         2
     } else if !acquisition_done {
         1
