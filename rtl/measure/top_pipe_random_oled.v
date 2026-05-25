@@ -91,31 +91,21 @@ module top_pipe_random_oled #(
     wire [7:0] trng_out = mixed[7:0] ^ mixed[15:8] ^ mixed[23:16] ^ {3'b0, mixed[28:24]};
 
     // -------------------------------------------------------------------------
-    // Geiger-style heartbeat LED. Galois LFSR steps at ~190 Hz (a clkdiv off
-    // the 25 MHz reference); each step has a 1/64 chance of firing a visible
-    // pulse, and pulse duration is itself a geometric draw from the LFSR top
-    // bits — short flashes mostly, long flashes rarely. Mean rate ≈ 3 Hz,
-    // visually irregular, mirrors the bridge's geiger_task.
+    // Geiger-counter LED — canonical pattern from rtl/top_pin_id.v and
+    // rtl/measure/top_dut_bench.v. Markov chain over the active-low LED state,
+    // driven by the 29-ring TRNG output above. Sample rate ≈ 763 Hz
+    // (25 MHz / 32768). When the LED is ON (led=0, active-low), small chance
+    // to flip OFF; when OFF (led=1), larger chance to flip back ON. Asymmetry
+    // gives the visual of mostly-OFF with brief ON flashes — the geiger look.
     // -------------------------------------------------------------------------
-    reg [31:0] led_lfsr     = 32'hC0FFEE42;
-    reg [16:0] led_clkdiv   = 0;
-    reg [19:0] led_on_left  = 0;
+    reg [14:0] geiger_cnt = 0;
     always @(posedge clk) begin
-        led_clkdiv <= led_clkdiv + 1;
-        if (&led_clkdiv) begin
-            led_lfsr <= {led_lfsr[30:0],
-                         led_lfsr[31] ^ led_lfsr[21] ^ led_lfsr[1] ^ led_lfsr[0]};
-            if (led_lfsr[5:0] == 6'd0 && led_on_left == 0) begin
-                // ~1/64 chance per step → ~3 Hz pulse rate. Duration scaled by
-                // the LFSR's upper bits → 1×, 2×, 4×, ... × base_on (geometric).
-                led_on_left <= (20'd25_000 << led_lfsr[15:13]);
-            end
-        end
-        if (led_on_left != 0) begin
-            led_on_left <= led_on_left - 1;
-            led <= 1'b1;
-        end else begin
-            led <= 1'b0;
+        geiger_cnt <= geiger_cnt + 1;
+        if (&geiger_cnt) begin
+            if (led && trng_out < 8'd8)            // OFF→ON: ~3% per sample
+                led <= 1'b0;
+            else if (!led && trng_out < 8'd100)    // ON→OFF: ~39% per sample
+                led <= 1'b1;
         end
     end
 
