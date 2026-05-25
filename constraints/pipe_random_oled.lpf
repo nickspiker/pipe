@@ -1,0 +1,26 @@
+# =============================================================================
+# pipe_toggle_oled.lpf — combined wire toggle + OLED diagnostic
+# =============================================================================
+# Pins are the union of pipe_test.lpf (pipe_pad, led) and pipe_oled.lpf
+# (clk, oled_scl, oled_sda, led). Same dev-board layout.
+#
+# Reference: pin_id scan identified columns 14 and 19 as the two stuck
+# (shorted) columns on the OLED ruler. From fpga/constraints/pin_id.lpf:
+#   p14 = E16   p19 = F15
+# E16 is what the 400Ω wire series resistor reaches; F15 floats.
+# =============================================================================
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "pipe_pad" SITE "E16";
+IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=DOWN;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;

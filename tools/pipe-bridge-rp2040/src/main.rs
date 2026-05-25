@@ -925,6 +925,14 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
     let mut interval_fp_low: u32 = 0;
     let mut interval_fp_high: u32 = 0;
     let mut acquisition_iter_count: u32 = 0;
+    // Min-tracking bootstrap for random-bit-data acquisition (1-slot threshold).
+    // `_skipped_*` are kept as side effects only — surfacing them through SyncResult
+    // would extend the wire format; the test we care about is "does lock hold?", not
+    // "exactly how many edges got rejected." Wire through if a future debug session
+    // needs them.
+    let mut min_interval_u: u32 = u32::MAX;
+    let mut _multi_slot_skipped_acq: u32 = 0;
+    let mut _multi_slot_skipped_track: u32 = 0;
 
     let mut rising_total: u32 = 0;
     let mut falling_total: u32 = 0;
@@ -971,21 +979,44 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
         let own_cyc: i32 = own_cyc_u as i32;
 
         if !acquisition_done {
-            // Cross-polarity acquisition. Every PIO interval is already a clean
-            // single-slot duration since edge N+1 is the opposite polarity from edge N
-            // (after the discarded edge 0). No anchoring needed.
-            if rising {
-                if acq_rising < SYNC_ACQ_PER_POLARITY {
-                    acq_sum_low += own_cyc_u as u64;
-                    acq_rising += 1;
+            // With random-bit data the wire skips slot transitions at ~50% probability,
+            // so inter-edge intervals come at 1, 2, 3, ... × slot. Acquisition needs to
+            // pick out the 1-slot ones. Track a running minimum: 1-slot intervals are
+            // the smallest cluster, so once we've seen one, `min_interval_u` locks onto
+            // ~1 slot and the 1.5×-threshold rejects multi-slot intervals.
+            //
+            // Bootstrap: the very first intervals run with min = u32::MAX so they all
+            // pass the threshold. If any of those were multi-slot, they corrupted the
+            // accumulators — when min drops by >2× (a 1-slot interval finally landed),
+            // we reset the sums and start fresh.
+            if own_cyc_u < min_interval_u {
+                if own_cyc_u * 2 < min_interval_u {
+                    // Big drop. Previous accumulations were on the wrong slot; restart.
+                    acq_sum_low = 0;
+                    acq_sum_high = 0;
+                    acq_rising = 0;
+                    acq_falling = 0;
                 }
-                rising_total += 1;
+                min_interval_u = own_cyc_u;
+            }
+            let threshold_u = min_interval_u.saturating_add(min_interval_u / 2);
+
+            if own_cyc_u <= threshold_u {
+                if rising {
+                    if acq_rising < SYNC_ACQ_PER_POLARITY {
+                        acq_sum_low += own_cyc_u as u64;
+                        acq_rising += 1;
+                    }
+                    rising_total += 1;
+                } else {
+                    if acq_falling < SYNC_ACQ_PER_POLARITY {
+                        acq_sum_high += own_cyc_u as u64;
+                        acq_falling += 1;
+                    }
+                    falling_total += 1;
+                }
             } else {
-                if acq_falling < SYNC_ACQ_PER_POLARITY {
-                    acq_sum_high += own_cyc_u as u64;
-                    acq_falling += 1;
-                }
-                falling_total += 1;
+                _multi_slot_skipped_acq += 1;
             }
 
             if acq_rising >= SYNC_ACQ_PER_POLARITY && acq_falling >= SYNC_ACQ_PER_POLARITY {
@@ -999,8 +1030,10 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
             continue;
         }
 
-        // Tracking phase. Same math as the polling version, but own_cyc comes from PIO
-        // directly with 2-cyc resolution (vs ~15-cyc polling quantization).
+        // Tracking phase. Comparison cascade picks n_slots ∈ {1, 2, 3, 4}: the wire's
+        // mirror-XOR-encoded data can leave 1+ slot boundaries without a transition, so
+        // own_cyc may be N × slot rather than always 1 × slot. We compute phase_err on
+        // the single-slot residual: phase_err = own_cyc - n_slots × slot.
         let interval_fp_self = if rising { interval_fp_low } else { interval_fp_high };
         let slot = (interval_fp_self >> frac_bits) as i32;
         if slot < 8 {
@@ -1008,8 +1041,22 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
             if rising { rising_total += 1 } else { falling_total += 1 };
             continue;
         }
-
-        let phase_err = own_cyc - slot;
+        let half_slot = slot / 2;
+        let n_slots: i32 = if own_cyc < slot + half_slot { 1 }
+                           else if own_cyc < 2 * slot + half_slot { 2 }
+                           else if own_cyc < 3 * slot + half_slot { 3 }
+                           else if own_cyc < 4 * slot + half_slot { 4 }
+                           else {
+                               // Interval too long to fold into n ≤ 4 — could be a
+                               // glitch, a stalled wire, or noise on the line. Skip
+                               // updating the P controller but still count it for
+                               // diagnostics.
+                               _multi_slot_skipped_track += 1;
+                               if rising { rising_total += 1 } else { falling_total += 1 };
+                               continue;
+                           };
+        let expected = n_slots * slot;
+        let phase_err = own_cyc - expected;
         let shift = frac_bits as i32 - p_shift as i32;
         let slew = if shift >= 0 { phase_err << shift } else { phase_err >> -shift };
         let new_fp = interval_fp_self.wrapping_add_signed(slew);
