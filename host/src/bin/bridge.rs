@@ -1015,8 +1015,8 @@ fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
         (p_max - p_min + 1) * (max_iter / 4_000_000),
     );
     println!();
-    println!("  p | rise µs / drift ppm | fall µs / drift ppm | Δrc ns | rise std | fall std | LOCKED  | →lock @ | ovfl");
-    println!("  --+---------------------+---------------------+--------+----------+----------+---------+---------+------");
+    println!("  p | rise µs / drift ppm | fall µs / drift ppm | Δrc ns | std r/f cyc | smoothed cyc | 2^N r/f | max r/f | LOCKED  | →lock @ | ovfl");
+    println!("  --+---------------------+---------------------+--------+-------------+--------------+---------+---------+---------+---------+------");
 
     const NS_PER_CYC: f64 = 8.0; // SYSTICK @ 125 MHz
     for p in p_min..=p_max {
@@ -1032,38 +1032,60 @@ fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
         } else { 0.0 };
         let asym_ns = (final_fall_cyc - final_rise_cyc) * NS_PER_CYC;
 
-        // Per-polarity phase_err std from each polarity's histogram. Each is centered
-        // on that polarity's own lock, so the std reflects only its own noise — no
-        // bleed from the other polarity (the whole point of the dual tracker).
-        let stat_polarity = |hist: &[u16]| -> f64 {
+        // Per-polarity phase_err stats from each polarity's histogram (centered on that
+        // polarity's own lock — std reflects only its own noise, no cross-polarity
+        // bleed). Also extract the worst-case |phase_err| observed.
+        let stat_polarity = |hist: &[u16]| -> (f64, i32) {
             let mut count: f64 = 0.0;
             let mut sum: f64 = 0.0;
             let mut sumsq: f64 = 0.0;
+            let mut max_abs: i32 = 0;
             for (i, &c) in hist.iter().enumerate() {
-                let bin = (i as i32 - r.hist_half_range) as f64;
+                if c == 0 { continue; }
+                let bin = i as i32 - r.hist_half_range;
                 let cf = c as f64;
+                let bf = bin as f64;
                 count += cf;
-                sum += cf * bin;
-                sumsq += cf * bin * bin;
+                sum += cf * bf;
+                sumsq += cf * bf * bf;
+                if bin.abs() > max_abs { max_abs = bin.abs(); }
             }
-            if count > 0.0 {
+            let std = if count > 0.0 {
                 let m = sum / count;
                 ((sumsq / count) - m * m).max(0.0).sqrt()
-            } else { 0.0 }
+            } else { 0.0 };
+            (std, max_abs)
         };
-        let rise_std = stat_polarity(&r.rising_hist);
-        let fall_std = stat_polarity(&r.falling_hist);
+        let (rise_std, rise_max) = stat_polarity(&r.rising_hist);
+        let (fall_std, fall_max) = stat_polarity(&r.falling_hist);
+
+        // Smoothed std after the P controller's effective averaging (~2^p_shift edges).
+        // Per-edge measurement noise reduces by √(2^p_shift) when integrated through the
+        // single-pole filter the proportional gain creates. The steady-state precision
+        // is slot / smoothed_std → 2^N stability per slot.
+        let avg_window = (1u64 << p) as f64;
+        let smooth_rise = rise_std / avg_window.sqrt();
+        let smooth_fall = fall_std / avg_window.sqrt();
+        let slot_rise = final_rise_cyc.max(1.0);
+        let slot_fall = final_fall_cyc.max(1.0);
+        let n_rise = if smooth_rise > 0.0 { (slot_rise / smooth_rise).log2() } else { 0.0 };
+        let n_fall = if smooth_fall > 0.0 { (slot_fall / smooth_fall).log2() } else { 0.0 };
 
         let total_ov = r.rising_neg_overflow + r.rising_pos_overflow + r.falling_neg_overflow + r.falling_pos_overflow;
         let lock_flag = if r.locked { "  yes  " } else { "  no   " };
         let lock_at: String = if r.locked { format!("{}", r.edges_to_lock) } else { "—".to_string() };
 
         println!(
-            "  {:>2} | {:>6.3} / {:>+8.0} | {:>6.3} / {:>+8.0} | {:>+5.0} | {:>7.2}  | {:>7.2}  | {} | {:>7} | {:>5}",
+            "  {:>2} | {:>6.3} / {:>+8.0} | {:>6.3} / {:>+8.0} | {:>+5.0} | {:>4.2}/{:>4.2}   | {:>5.2}/{:>5.2}  | {:>4.1}/{:>4.1} | {:>3}/{:>3} | {} | {:>7} | {:>5}",
             p,
             final_rise_cyc * NS_PER_CYC / 1000.0, drift_rise_ppm,
             final_fall_cyc * NS_PER_CYC / 1000.0, drift_fall_ppm,
-            asym_ns, rise_std, fall_std, lock_flag, lock_at, total_ov,
+            asym_ns,
+            rise_std, fall_std,
+            smooth_rise, smooth_fall,
+            n_rise, n_fall,
+            rise_max, fall_max,
+            lock_flag, lock_at, total_ov,
         );
     }
     Ok(())

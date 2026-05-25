@@ -33,6 +33,8 @@ For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 
 **Key lesson from D:** any ring oscillator output that drives more than a handful of FFs needs an explicit DCCA buffer between the ring loop and the synchronous logic. The `(* noglobal *)` attribute on the loop wires keeps the oscillator fast, but downstream distribution requires DCCA — without it, fabric routing skew causes setup/hold violations far below silicon Fmax. See `rtl/ring_osc.v` header.
 
+**Host CDR precision target.** The bridge ([`tools/pipe-bridge-rp2040`](tools/pipe-bridge-rp2040)) recovers slot timing via PIO0 SM0 edge timestamping at 2 sys_clk resolution; per-edge measurement std is ~1 cyc (16 ns) and the proportional tracker reaches 2^12 stability per slot at `p_shift=8` (verified via `bridge tune_p`). A 256-bit exchange only needs 2^8 (1 slot drift over 256 slots). 2^12 over 2^8 is **2^4 = 16× margin** — within an order of magnitude either side of the requirement, which is the right place to stop: tighter (1-cycle PIO loop, a dedicated counter SM) buys nothing because the ring oscillator's own thermal jitter takes over below that floor.
+
 ## Build
 
 **Production build** (will not work until module skeletons are filled in):
