@@ -33,7 +33,14 @@ For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 
 **Key lesson from D:** any ring oscillator output that drives more than a handful of FFs needs an explicit DCCA buffer between the ring loop and the synchronous logic. The `(* noglobal *)` attribute on the loop wires keeps the oscillator fast, but downstream distribution requires DCCA — without it, fabric routing skew causes setup/hold violations far below silicon Fmax. See `rtl/ring_osc.v` header.
 
-**Host CDR precision target.** The bridge ([`tools/pipe-bridge-rp2040`](tools/pipe-bridge-rp2040)) recovers slot timing via PIO0 SM0 edge timestamping at 2 sys_clk resolution; per-edge measurement std is ~1 cyc (16 ns) and the proportional tracker reaches 2^12 stability per slot at `p_shift=8` (verified via `bridge tune_p`). A 256-bit exchange only needs 2^8 (1 slot drift over 256 slots). 2^12 over 2^8 is **2^4 = 16× margin** — within an order of magnitude either side of the requirement, which is the right place to stop: tighter (1-cycle PIO loop, a dedicated counter SM) buys nothing because the ring oscillator's own thermal jitter takes over below that floor.
+**Host CDR precision target.** The bridge ([`tools/pipe-bridge-rp2040`](tools/pipe-bridge-rp2040)) recovers slot timing via PIO0 SM0 edge timestamping at 2 sys_clk resolution; per-edge measurement std is ~1 cyc (16 ns) and the proportional tracker reaches 2^12 stability per slot at `p_shift=8` (verified via `bridge tune_p`). A 256-bit exchange only needs 2^8 (1 slot drift over 256 slots). 2^12 over 2^8 is **2^4 = 16× margin** over the requirement.
+
+**Where the floors actually sit.** Three noise sources stacked:
+1. PIO 2-cyc quantization — ~1 cyc/edge std. The current measurement floor.
+2. Ring-osc cycle-to-cycle jitter — ~0.07 cyc/edge (200 ppm × 365-cyc slot, from OLED freq variance). ~14× below the PIO floor.
+3. Thermal drift — ~700 ppm/sec. Negligible at exchange scale (740 µs), dominant past ~140 edges of averaging.
+
+Theoretical exchange-scale floor with measurement noise removed: **~2^16** at `p_shift=8`, ring-osc jitter as the wall. Thermal drift then caps any longer averaging window in the same ballpark. We deliberately stopped at 2^12 — going to 2^16 would mean a 1-cycle PIO loop or a dedicated counter SM, and we already have 2^4 margin over the protocol minimum. The 4 bits we left on the table buy a simpler, more reviewable PIO program; quantum/electronic floors (kT/C, supply noise, fabric coupling) sit further down at ~2^28+ but you can't get there from FPGA fabric.
 
 ## Build
 
