@@ -1057,6 +1057,19 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
                            };
         let expected = n_slots * slot;
         let phase_err = own_cyc - expected;
+
+        // No gap compensation. The "naive" per-edge slew of `phase_err << shift` is
+        // actually gain-matched in continuous time: a multi-slot interval gives N×
+        // phase_err per observation, but observations come once per N slots, so the
+        // per-slot tracking rate is constant regardless of N. Dividing by N (whether
+        // exactly or via nearest-power-of-2) reduces multi-slot contribution to
+        // per-slot rate and the slot estimate lags more. Empirically: std on random
+        // data jumped 40% and lock window shut. The naive slew is correct.
+        //
+        // TODO: TX gating. Once the bridge drives the wire too, edges caused by our own
+        // TX should NOT feed the P controller (they're zero-information about FPGA slot
+        // timing, and risk positive-feedback drift). Filter at this point — accept the
+        // edge only if it doesn't coincide with a known own-TX transition.
         let shift = frac_bits as i32 - p_shift as i32;
         let slew = if shift >= 0 { phase_err << shift } else { phase_err >> -shift };
         let new_fp = interval_fp_self.wrapping_add_signed(slew);
