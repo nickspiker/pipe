@@ -1,19 +1,22 @@
 // =============================================================================
-// top_pipe_mirror_xor.v — full Claim 12 mirror-XOR line code on the FPGA side
+// top_pipe_mirror_xor.v — full Claim 12 mirror-XOR + Claim 7b handshake
 // =============================================================================
-// FIRST end-to-end implementation of Claim 12's mirror-XOR encoding rule on the
-// FPGA side of the PIPE bidirectional wire. Predecessor top_pipe_slotted_oled.v
-// was a STUB (slot-ownership timing only, always drove HIGH during enclave
-// regardless of data — no Claim 12 participation). This bitstream implements
-// the full Claim 12 encoding:
+// Implements Claim 12's mirror-XOR encoding rule with a Claim 7b handshake
+// gate on top: the FPGA stays in IDLE (sends own_data = 0) until it sees the
+// bridge drive its first 1 bit on the wire, then transitions to DATA mode and
+// begins shifting TX_PATTERN per slot. This decouples acquisition (bridge's
+// CDR locks on clean idle toggle, no data interference) from data exchange
+// (both sides shift their TX patterns once handshake fires).
 //
+// Mirror-XOR encoding rule (both sides):
 //     wire_value = OWN_IDLE XOR own_data XOR other_last_decoded_data
 //
-// With enclave_idle = 1 (Claim 12), own_data = next bit of TX_PATTERN, and
+// With enclave_idle = 1 (Claim 12), own_data = effective_fpga_tx_bit, and
 // other_last_decoded_data = wire value sampled at mid-host-slot.
 //
 // FPGA encode (enclave slot drive value):
-//     wire_out = 1'b1 ^ fpga_tx_bit ^ bridge_last_decoded
+//     wire_out = 1'b1 ^ effective_fpga_tx_bit ^ bridge_last_decoded
+//     effective_fpga_tx_bit = data_mode ? fpga_tx_reg[0] : 1'b0
 //   → 1 = drive HIGH; 0 = release (pulldown wins, wire goes LOW)
 //   → drive_en = (slot_owner == 0). During host slots, drive_en = 0 (tristate).
 //
@@ -23,19 +26,40 @@
 //   safely past bridge's drive settling. Becomes other_last_decoded_data for
 //   the next enclave slot's encode.
 //
+// Handshake detection (Claim 7b):
+//   At the same sample point, if wire_in is 1 and data_mode is 0, set
+//   data_mode <= 1 permanently (until power-on reset). Bridge initiates by
+//   driving its first non-idle bit; the wire transition is what we detect.
+//   data_mode latches to 1 forever once seen — no clear, no timeout. Power
+//   cycle to return to IDLE for fresh acquisition.
+//
 // TX bit advance: fpga_tx_reg rotates right by 1 on every host→enclave
 // transition (slot_owner 1→0), so each enclave slot encodes the next LSB-first
-// bit of TX_PATTERN. Pattern repeats every 32 cycles.
+// bit of TX_PATTERN. Pattern repeats every 32 cycles. Rotation happens
+// regardless of data_mode so the pattern position stays aligned with elapsed
+// time; data_mode just gates whether the bit is XORed in or not.
 //
-// Idle pattern (both sides sending 0): wire_out = 1^0^0 = 1 (HIGH) during
-// enclave, bridge LOW during host → clean alternating toggle = 100% transition
-// density per Claim 12's idle guarantee.
+// LED state indicator:
+//   data_mode == 0: TRNG-modulated geiger-counter blink (random flicker, see
+//                   geiger_cnt block) → "wire is alive, idle".
+//   data_mode == 1: solid ON → "handshake detected, data flowing".
 //
-// Bridge-side first-pass test: `wire_sync` (bridge silent observer) against
-// FPGA TX = AAAAAAAA (alternating bits, max-gap-2 between transition-cycles).
-// Wire shows transitions in cycles where fpga_tx_bit = 0; silent cycles where
-// fpga_tx_bit = 1. cascade=1 unfolds the n=2 gaps. Bridge's bit_decoder
-// records the pattern → inverted should reproduce TX_PATTERN's LSB-first bits.
+// Idle pattern (data_mode=0, bridge silent): wire_out = 1^0^0 = 1 (HIGH)
+// during enclave, bridge LOW during host → clean alternating toggle = 100%
+// transition density per Claim 12's idle guarantee. CDR's natural acquisition
+// target.
+//
+// Post-handshake pattern (data_mode=1, both sides shifting AAAAAAAA):
+//   Wire = L H H H L H H H ... (25% LOW, 75% HIGH, 50% transition density).
+//   Bridge CDR may lose lock here — that's expected for this MVP slice; full
+//   data-mode-aware CDR is a follow-up (Phase 2c). What matters here is the
+//   handshake transition itself is observable from the bridge side as a step
+//   change in wire stats (edge density, period).
+//
+// Default TX_PATTERN = AAAAAAAA so the visual post-handshake change is
+// distinct from idle. wire_sync test against TX_PATTERN=AAAAAAAA still passes:
+// bridge silent means bridge_last_decoded stays 0, handshake never fires, FPGA
+// stays in IDLE driving 0 (TX_PATTERN never gets used).
 //
 // Slot rate / OLED / pin map / ring osc layout: unchanged from
 // top_pipe_slotted_oled.v (slot ~23 µs ≈ 44 kHz toggle, RING_DIV=2048).
@@ -48,7 +72,7 @@ module top_pipe_mirror_xor #(
     parameter integer CLK_DIV     = 7,            // 25 MHz / 7 → ~3.5 MHz CE → ~28 kHz SCL
     parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench)
     parameter integer RING_DIV    = 2048,         // mod-N divider on the ring → enclave_clk (matches slotted_oled 8× slowdown)
-    parameter [31:0]  TX_PATTERN  = 32'h00000000  // FPGA TX bits, LSB-first. Default = all zeros (the Claim 12 idle case): every cycle has fpga_tx_bit=0 → enclave drives HIGH iff bridge_last=0, which is true in idle → wire = clean alternating HIGH/LOW per slot = 100% transition density per Claim 12. Bridge wire_sync acquires normally from this idle pattern. Non-zero TX patterns introduce non-uniform inter-edge timing that bridge acquisition's min-interval-filter rejects — those need the handshake protocol (Phase 2b) for the bridge to know when to expect data-driven gaps. AAAAAAAA / DEADBEEF for Phase 2b once handshake is in place.
+    parameter [31:0]  TX_PATTERN  = 32'hAAAAAAAA  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Default = AAAAAAAA so post-handshake the wire pattern visibly differs from idle (50% transition density vs idle's 100%), making the handshake transition observable from bridge wire stats. IDLE mode (pre-handshake) always sends 0 regardless of this parameter, preserving wire_sync's clean-toggle acquisition target. For full bidirectional data exchange demo, set this to whatever payload the FPGA should transmit; bridge decodes it from its slot-aware position once it tracks data-mode wire pattern (Phase 2c).
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
     output wire oled_scl,
@@ -106,7 +130,10 @@ module top_pipe_mirror_xor #(
     reg [14:0] geiger_cnt = 0;
     always @(posedge clk) begin
         geiger_cnt <= geiger_cnt + 1;
-        if (&geiger_cnt) begin
+        if (data_mode_q) begin
+            // DATA mode (post-handshake): solid ON. Overrides geiger pattern.
+            led <= 1'b1;
+        end else if (&geiger_cnt) begin
             if (led && trng_out < 8'd8)            // OFF→ON: ~3% per sample
                 led <= 1'b0;
             else if (!led && trng_out < 8'd100)    // ON→OFF: ~39% per sample
@@ -197,25 +224,44 @@ module top_pipe_mirror_xor #(
     // = a 4-slot-periodic edge pattern. cascade=1 (n=2 unfold) locks naturally.
     // -------------------------------------------------------------------------
     reg [31:0] fpga_tx_reg = TX_PATTERN;
-    wire       fpga_tx_bit = fpga_tx_reg[0];      // current LSB → this enclave slot's data bit
+    reg        data_mode = 1'b0;                  // Claim 7b: 0 = IDLE (force own_data=0), 1 = DATA (use fpga_tx_reg[0])
+    wire       effective_fpga_tx_bit = data_mode ? fpga_tx_reg[0] : 1'b0;
     reg        bridge_last_decoded = 1'b0;        // sampled mid-host-slot; idle host = 0
     reg        prev_slot_owner = 1'b0;
 
     wire wire_in_sync;                            // wire_in from wire_io's 2-FF synchroniser
-    wire enclave_drive_value = 1'b1 ^ fpga_tx_bit ^ bridge_last_decoded;
+    wire enclave_drive_value = 1'b1 ^ effective_fpga_tx_bit ^ bridge_last_decoded;
     wire wire_drive_en = ~slot_owner;
 
     always @(posedge enclave_clk) begin
         prev_slot_owner <= slot_owner;
         // host slot mid-sample → latch bridge's drive value as our decoded bit
+        // AND check Claim 7b handshake: bridge driving 1 in idle = data-mode kick-off
         if (slot_owner == 1'b1 && slot_phase == 2'd2) begin
             bridge_last_decoded <= wire_in_sync;
+            if (wire_in_sync == 1'b1 && data_mode == 1'b0) begin
+                data_mode <= 1'b1;
+            end
         end
-        // host→enclave transition → consume next TX bit (rotate right)
+        // host→enclave transition → consume next TX bit (rotate right). Rotation
+        // happens regardless of data_mode so pattern phase stays time-anchored;
+        // effective_fpga_tx_bit gating decides whether the rotated bit reaches
+        // the wire or gets masked to 0 (idle).
         if (prev_slot_owner == 1'b1 && slot_owner == 1'b0) begin
             fpga_tx_reg <= {fpga_tx_reg[0], fpga_tx_reg[31:1]};
         end
     end
+
+    // -------------------------------------------------------------------------
+    // data_mode → clk-domain LED override. data_mode lives on enclave_clk; the
+    // LED FSM (geiger_cnt block) lives on the 25 MHz clk domain. Cross with a
+    // 3-stage synchroniser, then override the LED to solid ON when data_mode_q
+    // is high. The geiger-pattern blink in IDLE mode → solid ON in DATA mode
+    // is the visual confirmation that handshake fired.
+    // -------------------------------------------------------------------------
+    reg [2:0] data_mode_sync = 3'b0;
+    always @(posedge clk) data_mode_sync <= {data_mode_sync[1:0], data_mode};
+    wire data_mode_q = data_mode_sync[2];
 
     wire_io u_wire (
         .clk(enclave_clk),
