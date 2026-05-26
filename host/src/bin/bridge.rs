@@ -1255,11 +1255,12 @@ fn cmd_wire_loopback(port_path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `wire_tx_diag` — fires PIO TX with pattern G#AAAAAAAA and polls GP0 directly via
-/// SIO (not PIO RX) to count actual pad transitions. Used to diagnose why
-/// wire_loopback isn't capturing edges: if transitions==0, the pin isn't physically
-/// toggling and the problem is in PIO TX config / pad enable. If transitions>0 but
-/// wire_loopback fails, the issue is in PIO RX or the loopback handler.
+/// `wire_tx_diag` — two-phase pad drive comparison. Phase A: PIO TX SM1 with
+/// G#AAAAAAAA, count transitions via SIO read. Phase B: SIO direct toggle (CPU
+/// writes the GPIO XOR register), count transitions via SIO read. If SIO transitions
+/// > 0 and PIO transitions == 0, PIO TX is broken (algorithmic bug). If both == 0,
+/// pad can't drive (contention with FPGA or pad config). Includes register dumps
+/// for each phase.
 fn cmd_wire_tx_diag(port_path: &str) -> Result<(), String> {
     let (resp, _rtt) = send_cmd(port_path, "wire_tx_diag", 42, vec![])?;
     let section = parse_resp(&resp)?;
@@ -1268,33 +1269,49 @@ fn cmd_wire_tx_diag(port_path: &str) -> Result<(), String> {
             VsfType::v(b'b', bytes) => Some(bytes.clone()),
             _ => None,
         }).ok_or_else(|| "data field not binary".to_string())?;
-    if data.len() < 28 {
-        return Err(format!("response too short: {} bytes (want >=28)", data.len()));
+    if data.len() < 16 * 4 {
+        return Err(format!("response too short: {} bytes (want >=64)", data.len()));
     }
     let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-    let samples = g32(0);
-    let transitions = g32(4);
-    let first_state = g32(8);
-    let last_state = g32(12);
+    let pio_samples = g32(0);
+    let pio_trans = g32(4);
+    let pio_first = g32(8);
+    let pio_last = g32(12);
     let ctrl_before = g32(16);
-    let ctrl_after = g32(20);
-    let pads_after = g32(24);
-    println!("wire_tx_diag results (pattern G#AAAAAAAA, {samples} SIO samples):");
-    println!("  transitions: {transitions}");
-    println!("  first/last pad state: {first_state} → {last_state}");
-    println!("  IO_BANK0.gpio(0).ctrl before TX: G#{ctrl_before:08X}");
-    println!("                          after:  G#{ctrl_after:08X}");
-    println!("    funcsel = G#{:X} (5=SIO, 6=PIO0)", ctrl_after & 0x1F);
-    println!("    outover = G#{:X}  oeover = G#{:X}", (ctrl_after >> 8) & 0x3, (ctrl_after >> 12) & 0x3);
-    println!("  PADS_BANK0.gpio(0) after TX: G#{pads_after:08X}");
-    println!("    IE = {}  OD = {}  (IE bit 6, OD bit 7)",
-        (pads_after >> 6) & 1, (pads_after >> 7) & 1);
-    if transitions == 0 {
-        println!("  → no transitions: pin not driven. Check funcsel/oeover/OD above.");
-    } else if transitions < 10 {
-        println!("  → very few transitions: TX might be stalled (FIFO underrun?) or clkdiv wrong.");
-    } else {
-        println!("  → TX driving pin. wire_loopback's RX path is what's failing.");
+    let ctrl_pio = g32(20);
+    let pads_pio = g32(24);
+    let pio_sm_addr = g32(28);
+    let pio_sm_execctrl = g32(32);
+    let pio_fstat = g32(36);
+    let sio_toggles = g32(40);
+    let sio_trans = g32(44);
+    let sio_first = g32(48);
+    let sio_last = g32(52);
+    let ctrl_sio = g32(56);
+    let pads_sio = g32(60);
+    println!("=== Phase A: PIO TX (pattern G#AAAAAAAA, {pio_samples} SIO samples) ===");
+    println!("  transitions: {pio_trans}    first→last pad: {pio_first} → {pio_last}");
+    println!("  PIO SM1 addr (current PC): {pio_sm_addr}    execctrl: G#{pio_sm_execctrl:08X}");
+    println!("  PIO0.fstat: G#{pio_fstat:08X}    (bits: txfull[19:16] txempty[27:24] rxfull[3:0] rxempty[11:8])");
+    println!("  IO_BANK0.gpio(0).ctrl: before G#{ctrl_before:08X}  pio G#{ctrl_pio:08X}");
+    println!("    funcsel=G#{:X} outover=G#{:X} oeover=G#{:X}",
+        ctrl_pio & 0x1F, (ctrl_pio >> 8) & 0x3, (ctrl_pio >> 12) & 0x3);
+    println!("  PADS_BANK0.gpio(0): G#{pads_pio:08X}  IE={} OD={}",
+        (pads_pio >> 6) & 1, (pads_pio >> 7) & 1);
+    println!();
+    println!("=== Phase B: SIO direct toggle ({sio_toggles} XOR writes) ===");
+    println!("  transitions: {sio_trans}    first→last pad: {sio_first} → {sio_last}");
+    println!("  IO_BANK0.gpio(0).ctrl: G#{ctrl_sio:08X}");
+    println!("    funcsel=G#{:X} outover=G#{:X} oeover=G#{:X}",
+        ctrl_sio & 0x1F, (ctrl_sio >> 8) & 0x3, (ctrl_sio >> 12) & 0x3);
+    println!("  PADS_BANK0.gpio(0): G#{pads_sio:08X}  IE={} OD={}",
+        (pads_sio >> 6) & 1, (pads_sio >> 7) & 1);
+    println!();
+    match (pio_trans, sio_trans) {
+        (0, 0) => println!("→ verdict: pad can't drive at all. Contention (yank FPGA / tristate it) or pad config bug."),
+        (0, n) if n > 0 => println!("→ verdict: SIO drives ({n} transitions), PIO doesn't. Bug is in PIO TX setup."),
+        (p, 0) if p > 0 => println!("→ verdict: PIO drives ({p}), SIO doesn't?? Unexpected. SIO test broken."),
+        (p, s) => println!("→ verdict: both drive (PIO {p}, SIO {s}). wire_loopback RX/decode is what's failing."),
     }
     Ok(())
 }

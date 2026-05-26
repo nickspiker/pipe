@@ -993,11 +993,18 @@ fn pio_tx_start() {
         w.set_oeover(Oeover::ENABLE);
     });
 
-    // Restart + enable SM1.
+    // Restart + enable SM1. sm_restart clears X/Y/scratch/shifters but NOT the PC
+    // (RP2040 datasheet §3.4.6.1) — so we need to force PC to our TX program at
+    // addr PIO_TX_PROG_ADDR via a `jmp PROG_ADDR` injection. Otherwise the SM runs
+    // whatever happens to be at instr_mem[0..], which is the RX program (loaded
+    // by pio_edge_init) — and the pin never sees the TX output.
     PIO0.ctrl().modify(|w| {
         w.set_sm_restart(1 << PIO_TX_SM);
         w.set_clkdiv_restart(1 << PIO_TX_SM);
     });
+    // jmp PIO_TX_PROG_ADDR: opcode=000, cond=000 (always), addr=PIO_TX_PROG_ADDR
+    let jmp_to_tx = (PIO_TX_PROG_ADDR as u32) & 0x1F;
+    PIO0.sm(PIO_TX_SM).instr().write_value(embassy_rp::pac::pio::regs::SmInstr(jmp_to_tx));
     PIO0.ctrl().modify(|w| {
         let cur = w.sm_enable();
         w.set_sm_enable(cur | (1 << PIO_TX_SM));
@@ -2608,56 +2615,105 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
         }
         "wire_tx_diag" => {
-            // PIO TX diagnostic. Enables PIO TX with pattern G#AAAAAAAA, then samples
-            // GP0 via direct SIO read 4096 times in a tight loop (so we see the actual
-            // pad state independent of PIO RX SM). Returns:
-            //   - samples_taken (u32)
-            //   - transitions (u32) — count of pad state changes across the sample run
-            //   - first_state, last_state (u32 each) — initial and final pad reading
-            //   - ctrl_before, ctrl_after (u32 each) — IO_BANK0.gpio(0).ctrl values
-            //   - pads_after (u32) — PADS_BANK0.gpio(0) value after enable
-            // If TX is working, transitions should be in the hundreds-to-thousands range
-            // (4096 samples × <1 µs/sample ÷ 2.87 µs/transition ≈ ~1400). Zero means TX
-            // isn't actually driving the pin.
+            // Two-phase TX diagnostic. Phase A: PIO TX. Phase B: SIO direct toggle.
+            // Run them back-to-back from the same context, count GP0 transitions in
+            // each. SIO can definitively drive the pin from the CPU register set,
+            // bypassing PIO entirely — so if SIO transitions > 0 and PIO transitions
+            // == 0, the bug is in our PIO TX setup, not the pad/contention.
+            //
+            // Wire format (all LE u32):
+            //   pio_samples, pio_transitions, pio_first, pio_last,
+            //   ctrl_before, ctrl_pio, pads_pio,
+            //   pio_sm_addr, pio_sm_execctrl, pio_fstat,
+            //   sio_samples, sio_transitions, sio_first, sio_last,
+            //   ctrl_sio, pads_sio
             cortex_m::interrupt::free(|_| {
+                use embassy_rp::pac::{IO_BANK0, PADS_BANK0, PIO0, SIO};
+                use embassy_rp::pac::io::vals::{Oeover, Outover};
+
+                let ctrl_before = IO_BANK0.gpio(0).ctrl().read().0;
+                let gpio_in: *const u32 = SIO.gpio_in(0).as_ptr();
+
+                // ============================ Phase A: PIO TX ============================
                 pio_tx_init();
-                let ctrl_before = embassy_rp::pac::IO_BANK0.gpio(0).ctrl().read().0;
                 pio_tx_start();
                 for _ in 0..4 { pio_tx_push_word(0xAAAA_AAAA); }
-                let ctrl_after = embassy_rp::pac::IO_BANK0.gpio(0).ctrl().read().0;
-                let pads_after = embassy_rp::pac::PADS_BANK0.gpio(0).read().0;
-
-                // Brief settle (let TX get going).
+                let ctrl_pio = IO_BANK0.gpio(0).ctrl().read().0;
+                let pads_pio = PADS_BANK0.gpio(0).read().0;
                 for _ in 0..1000 { cortex_m::asm::nop(); }
 
-                let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
-                let first_state = unsafe { gpio_in.read_volatile() & 1 };
-                let mut last_seen = first_state;
-                let mut transitions: u32 = 0;
+                let pio_first = unsafe { gpio_in.read_volatile() & 1 };
+                let mut last_seen = pio_first;
+                let mut pio_transitions: u32 = 0;
                 const SAMPLES: u32 = 4096;
                 for _ in 0..SAMPLES {
                     let cur = unsafe { gpio_in.read_volatile() & 1 };
-                    if cur != last_seen {
-                        transitions += 1;
-                        last_seen = cur;
-                    }
-                    // Refill TX FIFO if room.
-                    if (embassy_rp::pac::PIO0.fstat().read().txfull() & (1 << PIO_TX_SM)) == 0 {
-                        embassy_rp::pac::PIO0.txf(PIO_TX_SM).write_value(0xAAAA_AAAA);
+                    if cur != last_seen { pio_transitions += 1; last_seen = cur; }
+                    if (PIO0.fstat().read().txfull() & (1 << PIO_TX_SM)) == 0 {
+                        PIO0.txf(PIO_TX_SM).write_value(0xAAAA_AAAA);
                     }
                 }
-                let last_state = last_seen;
-
+                let pio_last = last_seen;
+                let pio_sm_addr = PIO0.sm(PIO_TX_SM).addr().read().0;
+                let pio_sm_execctrl = PIO0.sm(PIO_TX_SM).execctrl().read().0;
+                let pio_fstat = PIO0.fstat().read().0;
                 pio_tx_stop();
 
-                let mut payload = alloc::vec::Vec::with_capacity(28);
+                // ============================ Phase B: SIO toggle ============================
+                // Take ownership of GP0 via SIO. Force IO_BANK0 to SIO funcsel + ENABLE OE.
+                // Make sure PAD output is enabled. Toggle GP0 1024 times via the
+                // gpio_out_xor register (cheapest way: single store flips the bit), and
+                // sample after each toggle.
+                IO_BANK0.gpio(0).ctrl().write(|w| {
+                    w.set_funcsel(5); // SIO
+                    w.set_outover(Outover::NORMAL);
+                    w.set_oeover(Oeover::ENABLE);
+                });
+                PADS_BANK0.gpio(0).modify(|w| {
+                    w.set_od(false);
+                    w.set_ie(true);
+                });
+                // SIO OE for GP0: enable output
+                SIO.gpio_oe(0).value_set().write_value(1);
+                SIO.gpio_out(0).value_clr().write_value(1); // start LOW
+
+                let ctrl_sio = IO_BANK0.gpio(0).ctrl().read().0;
+                let pads_sio = PADS_BANK0.gpio(0).read().0;
+
+                let sio_first = unsafe { gpio_in.read_volatile() & 1 };
+                let mut last_seen = sio_first;
+                let mut sio_transitions: u32 = 0;
+                const SIO_TOGGLES: u32 = 1024;
+                for i in 0..SIO_TOGGLES {
+                    // Toggle GP0 via XOR register (atomic single-cycle flip).
+                    SIO.gpio_out(0).value_xor().write_value(1);
+                    // Small delay so the synchronizer can see it.
+                    if (i & 0x3) == 0 { for _ in 0..16 { cortex_m::asm::nop(); } }
+                    let cur = unsafe { gpio_in.read_volatile() & 1 };
+                    if cur != last_seen { sio_transitions += 1; last_seen = cur; }
+                }
+                let sio_last = last_seen;
+
+                // Hand pin back to input (disable SIO OE).
+                SIO.gpio_oe(0).value_clr().write_value(1);
+
+                let mut payload = alloc::vec::Vec::with_capacity(16 * 4);
                 payload.extend_from_slice(&SAMPLES.to_le_bytes());
-                payload.extend_from_slice(&transitions.to_le_bytes());
-                payload.extend_from_slice(&first_state.to_le_bytes());
-                payload.extend_from_slice(&last_state.to_le_bytes());
+                payload.extend_from_slice(&pio_transitions.to_le_bytes());
+                payload.extend_from_slice(&pio_first.to_le_bytes());
+                payload.extend_from_slice(&pio_last.to_le_bytes());
                 payload.extend_from_slice(&ctrl_before.to_le_bytes());
-                payload.extend_from_slice(&ctrl_after.to_le_bytes());
-                payload.extend_from_slice(&pads_after.to_le_bytes());
+                payload.extend_from_slice(&ctrl_pio.to_le_bytes());
+                payload.extend_from_slice(&pads_pio.to_le_bytes());
+                payload.extend_from_slice(&pio_sm_addr.to_le_bytes());
+                payload.extend_from_slice(&pio_sm_execctrl.to_le_bytes());
+                payload.extend_from_slice(&pio_fstat.to_le_bytes());
+                payload.extend_from_slice(&SIO_TOGGLES.to_le_bytes());
+                payload.extend_from_slice(&sio_transitions.to_le_bytes());
+                payload.extend_from_slice(&sio_first.to_le_bytes());
+                payload.extend_from_slice(&sio_last.to_le_bytes());
+                payload.extend_from_slice(&ctrl_sio.to_le_bytes());
+                payload.extend_from_slice(&pads_sio.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             });
         }
