@@ -1,0 +1,23 @@
+# =============================================================================
+# pipe_mirror_xor.lpf — full Claim 12 mirror-XOR (FPGA-side encoding)
+# =============================================================================
+# Same pin layout as pipe_slotted_oled.lpf. pipe_pad is bidirectional in the
+# Verilog (BB primitive from wire_io.v); IOBUF here remains LVCMOS33 with the
+# weak pulldown. PULLMODE=DOWN gives a known idle state during host slots when
+# the bridge isn't driving and FPGA's enclave encode evaluates to 0 (release).
+# =============================================================================
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "pipe_pad" SITE "E16";
+IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=DOWN;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
