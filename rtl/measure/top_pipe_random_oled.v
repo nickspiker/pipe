@@ -39,7 +39,7 @@
 module top_pipe_random_oled #(
     parameter integer CLK_DIV     = 7,            // 25 MHz / 7 → ~3.5 MHz CE → ~28 kHz SCL
     parameter integer RING_STAGES = 5,            // ring-osc stages (production matches the DUT bench)
-    parameter integer RING_DIV    = 256           // mod-N divider on the ring → enclave_clk (256 for the 170 kHz toggle target)
+    parameter integer RING_DIV    = 2048          // mod-N divider on the ring → enclave_clk (2048 = 8× slower, slot ~23 µs ≈ 44 kHz: matches top_pipe_slotted_oled, keeps bridge host loop inside its ~7.5 µs/iter ceiling so FIFO never fills)
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
     output wire oled_scl,
