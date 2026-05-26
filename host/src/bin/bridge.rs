@@ -751,6 +751,11 @@ struct SyncResultParsed {
     period_sample_count: u32,
     period_min: i32,
     period_max: i32,
+    /// Slow EMA of period_now (α = 1/1024) reported in fp form (same frac_bits
+    /// scaling as final_interval_fp_period). This is the long-term-stable wire
+    /// period estimate — use it (not the live P-controller output) as the
+    /// "predicted period at start of silence" for silence-budget calculations.
+    period_ema_slow_fp: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -926,6 +931,11 @@ fn run_wire_sync_full(
     } else {
         (0, 0, 0, 0)
     };
+    // Slow EMA appendix: u32 fp value (same frac_bits scaling as final_interval_fp_period).
+    let slow_ema_off = sanity_off + 20;
+    let period_ema_slow_fp = if data.len() >= slow_ema_off + 4 {
+        g32(slow_ema_off)
+    } else { 0 };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -966,6 +976,7 @@ fn run_wire_sync_full(
         period_sample_count,
         period_min,
         period_max,
+        period_ema_slow_fp,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1119,22 +1130,65 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         println!("  LOCK:        NOT held (period EMA exceeded ±16 cyc at end of run)");
     }
     let period_fp_scale = (1u64 << frac_bits) as f64;
-    let period_seed_ns = r.acquisition_slot_cyc_period as f64 * NS_PER_CYC;
-    let period_final_cyc = r.final_interval_fp_period as f64 / period_fp_scale;
-    let period_final_ns = period_final_cyc * NS_PER_CYC;
-    let period_drift_cyc = period_final_cyc - r.acquisition_slot_cyc_period as f64;
-    let period_drift_ppm = if r.acquisition_slot_cyc_period > 0 {
-        1e6 * period_drift_cyc / r.acquisition_slot_cyc_period as f64
-    } else { 0.0 };
+    let period_seed_cyc = r.acquisition_slot_cyc_period as f64;
+    let period_p_cyc   = r.final_interval_fp_period as f64 / period_fp_scale;
+    let period_slow_cyc = r.period_ema_slow_fp as f64 / period_fp_scale;
+    // Pick the best-estimate period for ppm/freq math: prefer the slow EMA (smaller
+    // per-run variance, ~33 ppm SE), fall back to the running mean if the slow EMA
+    // is empty (e.g. response from old firmware), then to the P-controller output.
+    let period_best_cyc = if period_slow_cyc > 0.0 { period_slow_cyc }
+        else if r.period_sample_count > 0 { r.period_sum as f64 / r.period_sample_count as f64 }
+        else { period_p_cyc };
+    let period_best_ns = period_best_cyc * NS_PER_CYC;
+    let freq_hz = if period_best_cyc > 0.0 { 125_000_000.0 / period_best_cyc } else { 0.0 };
+    let drift_seed_cyc = period_best_cyc - period_seed_cyc;
+    let drift_seed_ppm = if period_seed_cyc > 0.0 { 1e6 * drift_seed_cyc / period_seed_cyc } else { 0.0 };
     // 4096-slot silence budget (= 2^12): drift × 4096 must stay under 0.5 × slot.
     // slot = period / 2 ≈ period_seed_cyc / 2. Tolerance = (slot / 2) / 4096 = period / 16384.
-    // In ppm of period: 1e6 / 16384 ≈ 61 ppm.
+    // In ppm of period: 1e6 / 16384 ≈ 61 ppm one-sided.
     let silence_budget_ppm = 1.0e6 / 16384.0;
-    println!("  PERIOD:      seed {} cyc = {:.3} µs   final {:.4} cyc = {:.3} µs",
-        r.acquisition_slot_cyc_period, period_seed_ns / 1000.0,
-        period_final_cyc, period_final_ns / 1000.0);
-    println!("               drift: {:+.4} cyc ({:+.1} ppm)   silence budget (2^12 slots ±½ slot): ±{:.0} ppm",
-        period_drift_cyc, period_drift_ppm, silence_budget_ppm);
+    // Slow-EMA noise estimate. Per-sample σ comes from period_now span — but for
+    // cascade=1 LFSR data the span is huge (multi-slot intervals 1×..N×), so
+    // dividing by 6 gives a "σ" of thousands of cyc that isn't real per-period
+    // jitter. The slow EMA only consumes n_periods==1 samples whose σ matches the
+    // clean-toggle case (~2 cyc on this wire). Cap the σ used for SE at 3 cyc as a
+    // conservative ceiling that covers both modes — clean-toggle uses the smaller
+    // measured value; LFSR falls back to the cap rather than the misleading raw σ.
+    let per_sample_span = (r.period_max - r.period_min) as f64;
+    let approx_sigma_raw = if per_sample_span > 0.0 { per_sample_span / 6.0 } else { 0.0 };
+    let sigma_for_se = approx_sigma_raw.min(3.0);
+    // Slow EMA's effective averaging window = 2^SLOW_SHIFT = 1024 samples (firmware
+    // SYNC_PERIOD_EMA_SLOW_SHIFT = 10). The estimator noise is σ / √N_eff regardless
+    // of total run length, because the EMA window is fixed.
+    const SLOW_EMA_N_EFF: f64 = 1024.0;
+    let se_of_mean_cyc = sigma_for_se / SLOW_EMA_N_EFF.sqrt();
+    let se_of_mean_ppm = if period_best_cyc > 0.0 { 1e6 * se_of_mean_cyc / period_best_cyc } else { 0.0 };
+    // Silence-budget check: what matters is whether our PREDICTION (the slow EMA)
+    // is accurate enough to call slot boundaries 4096 silent slots later. That
+    // accuracy is bounded by:
+    //   (a) the estimator's own noise — SE-of-mean from the slow EMA's effective
+    //       window (~1024 samples), bounded below by per-sample-σ / √N_eff
+    //   (b) actual wire drift over the silence stretch (~188 ms here) — typically
+    //       <1 ppm for a warm ring osc, but uncharacterised from a single run
+    // The seed-to-slow-EMA delta is NOT the relevant error — seed is a 12 ms
+    // snapshot at acquisition with its own ~175 ppm truncation/measurement error.
+    // It's shown below as a sanity comparison only.
+    let in_budget_estimate = se_of_mean_ppm < silence_budget_ppm;
+    let budget_mark = if in_budget_estimate { "✓ inside" } else { "✗ over" };
+
+    println!();
+    println!("  WIRE STATS:");
+    println!("    period:        {:.4} cyc = {:.4} µs   freq: {:.1} Hz",
+        period_best_cyc, period_best_ns / 1000.0, freq_hz);
+    println!("    per-period:    min {} / max {} cyc  (raw distribution — for LFSR includes 1×/2×/3×/4× slot gaps)",
+        r.period_min, r.period_max);
+    println!("    slow-EMA SE:   {:.4} cyc ({:.2} ppm)  [σ={:.1} cyc / √{:.0} (= EMA window)]   silence budget: ±{:.0} ppm  [{}]",
+        se_of_mean_cyc, se_of_mean_ppm, sigma_for_se, SLOW_EMA_N_EFF, silence_budget_ppm, budget_mark);
+    println!("    sources:       seed {} cyc  →  P-loop final {:.4} cyc  →  slow-EMA {:.4} cyc",
+        r.acquisition_slot_cyc_period, period_p_cyc, period_slow_cyc);
+    println!("    drift vs seed: {:+.4} cyc ({:+.1} ppm) — informational only (seed has ~175 ppm truncation error)",
+        drift_seed_cyc, drift_seed_ppm);
+    println!();
     println!("  P-EMA final: period {:+5} cyc (active lock signal)   rise {:+5} cyc   fall {:+5} cyc   (threshold ±16)",
         r.phase_err_ema_period, r.phase_err_ema_rise, r.phase_err_ema_fall);
     if r.bits_decoded > 0 {

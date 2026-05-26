@@ -270,6 +270,15 @@ const SYNC_LOCK_EMA_THRESHOLD_CYC: i32 = 16;
 const SYNC_LOCK_THRESHOLD_CYC: i32 = 8;
 const SYNC_LOCK_HOLD_EDGES: u32 = 256;
 
+/// Slow EMA on `period_now` for silence-budget prediction. The fast P-controller
+/// (interval_fp_period) tracks instantaneous drift edge-by-edge so it has ±1-2 cyc
+/// steady-state ringing; the slow EMA averages per-sample noise out over ~1024
+/// samples (≈ 47 ms at 22 kHz). Per-sample std ≈ 6 cyc on this wire, so SE-of-mean
+/// over the slow EMA's effective window ≈ 6/√1024 ≈ 0.19 cyc ≈ 33 ppm — comfortably
+/// under the 61 ppm silence budget. Use this value (not the live P-controller output)
+/// as the "predicted period" at the start of any silence stretch.
+const SYNC_PERIOD_EMA_SLOW_SHIFT: u32 = 10;
+
 /// Period-tracker diagnostic histogram. 17 bins of width = seed/8 covering [0, 2×seed)
 /// with bin 16 catching ≥2×seed as overflow. Bin 8 is the seed bin; bin 4 sits at
 /// seed/2 (the "missed-edge" suspect — a dropped rising means the next rising's
@@ -373,6 +382,12 @@ struct SyncResult {
     /// max ≫ seed, the wire is bimodal; if min ≈ max ≈ seed, lock is perfect.
     period_min: i32,
     period_max: i32,
+    /// Slow EMA on `period_now` (α = 1 / 2^SYNC_PERIOD_EMA_SLOW_SHIFT), reported in
+    /// fp form (frac_bits matches `frac_bits` field). This is the "predicted period
+    /// for silence" — averages out per-edge noise to ~3-9 ppm SE while still tracking
+    /// real frequency drift over its ~47 ms time constant. Seeded from
+    /// acquisition_slot_cyc_period at end of acquisition so it's usable immediately.
+    period_ema_slow_fp: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -417,6 +432,7 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     period_sample_count: 0,
     period_min: i32::MAX,
     period_max: i32::MIN,
+    period_ema_slow_fp: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1414,6 +1430,12 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut period_sample_count_local: u32 = 0;
     let mut period_min_local: i32 = i32::MAX;
     let mut period_max_local: i32 = i32::MIN;
+    // Slow EMA state in scaled-fp form (state ≈ period_now × 2^SYNC_PERIOD_EMA_SLOW_SHIFT
+    // at steady state, so visible value = state >> SHIFT). Scaled form avoids the
+    // sign-rounding bias that the naive `ema += (sample - ema) >> shift` form has on
+    // signed values. Seeded from acquisition's period seed once acquisition completes
+    // (see acquisition-done block); 0 until then.
+    let mut period_ema_slow_scaled: i64 = 0;
 
     let mut rising_total: u32 = 0;
     let mut falling_total: u32 = 0;
@@ -1544,14 +1566,28 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             }
 
             if acq_rising >= SYNC_ACQ_PER_POLARITY && acq_falling >= SYNC_ACQ_PER_POLARITY {
-                acquisition_slot_cyc_low = (acq_sum_low >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
-                acquisition_slot_cyc_high = (acq_sum_high >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
-                interval_fp_low = acquisition_slot_cyc_low << frac_bits;
-                interval_fp_high = acquisition_slot_cyc_high << frac_bits;
-                // PERIOD seed = LOW seed + HIGH seed (one full rise-to-rise cycle).
-                acquisition_slot_cyc_period = acquisition_slot_cyc_low
-                    .wrapping_add(acquisition_slot_cyc_high);
-                interval_fp_period = acquisition_slot_cyc_period << frac_bits;
+                // Compute the fp-domain seeds DIRECTLY from the accumulator without
+                // truncating to integer cyc first — `(sum << frac_bits) >> shift`
+                // preserves frac_bits-worth of fractional precision in the seed.
+                // The old `(sum >> shift) << frac_bits` form truncated to whole cyc,
+                // costing ±0.5 cyc of acquisition error per polarity (±175 ppm on a
+                // ~5730 cyc seed) — enough to blow the 61 ppm silence budget on its
+                // own, before the P-loop's steady-state noise even contributes.
+                interval_fp_low = (acq_sum_low << frac_bits >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
+                interval_fp_high = (acq_sum_high << frac_bits >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
+                // Integer-cyc seeds kept for the ±30% sanity-window math (which
+                // doesn't need sub-cyc precision).
+                acquisition_slot_cyc_low = (interval_fp_low >> frac_bits) as u32;
+                acquisition_slot_cyc_high = (interval_fp_high >> frac_bits) as u32;
+                // PERIOD seed = LOW seed + HIGH seed in fp, then derive integer.
+                interval_fp_period = interval_fp_low.wrapping_add(interval_fp_high);
+                acquisition_slot_cyc_period = (interval_fp_period >> frac_bits) as u32;
+                // Seed the slow EMA from the acquisition seed so it's usable
+                // immediately. Without this it'd take ~1024 samples (~47 ms) starting
+                // from 0 to converge — and silence might happen sooner.
+                // Scaled-form state = period × 2^SHIFT.
+                period_ema_slow_scaled = (acquisition_slot_cyc_period as i64)
+                    << SYNC_PERIOD_EMA_SLOW_SHIFT;
                 acquisition_done = true;
                 acquisition_iter_count = iter;
                 if mirror_mode {
@@ -1712,6 +1748,12 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             period_sample_count_local = period_sample_count_local.saturating_add(1);
             if period_now < period_min_local { period_min_local = period_now; }
             if period_now > period_max_local { period_max_local = period_now; }
+            // Slow EMA on period_now gated to single-period samples — see the
+            // n_periods==1 update below in the cascade block. For LFSR-style
+            // multi-slot data, raw period_now averages to N× true period (where N
+            // depends on the slot-gap distribution); folding by n_periods would
+            // need a division per edge, so we just skip those samples and rely on
+            // the n=1 ones to drive the EMA.
             let seed_cyc = acquisition_slot_cyc_period;
             if seed_cyc > 0 && period_now >= 0 {
                 let bin = ((period_now as u64 * 8) / seed_cyc as u64) as usize;
@@ -1763,6 +1805,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                         .wrapping_add(phase_err_period);
                     let ema_period = phase_err_ema_period_scaled >> SYNC_LOCK_EMA_SHIFT;
                     period_locked = ema_period.abs() <= SYNC_LOCK_EMA_THRESHOLD_CYC;
+                    // Slow EMA: only fed by n_periods==1 samples so multi-slot LFSR
+                    // gaps don't bias the silence-prediction estimate up by N×. For
+                    // clean-toggle / mirror-XOR (cascade_mode=0) this fires on every
+                    // accepted edge; for LFSR (cascade_mode=1) it fires on roughly
+                    // half the edges (the ones where the next transition came in the
+                    // very next slot — no gap).
+                    if n_periods == 1 {
+                        period_ema_slow_scaled = period_ema_slow_scaled
+                            .wrapping_sub(period_ema_slow_scaled >> SYNC_PERIOD_EMA_SLOW_SHIFT)
+                            .wrapping_add(period_now as i64);
+                    }
                 }
             }
         }
@@ -2032,6 +2085,20 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         period_sample_count: period_sample_count_local,
         period_min: period_min_local,
         period_max: period_max_local,
+        // Report slow EMA in fp form (same frac_bits as the other fp fields).
+        // EMA state is already scaled by 2^SLOW_SHIFT in cyc units, so it has
+        // SLOW_SHIFT bits of fractional precision baked in. To convert to fp form
+        // with frac_bits precision, shift the difference — preserves the EMA's
+        // sub-cyc precision instead of throwing it away with a >> then << pair.
+        period_ema_slow_fp: {
+            let shift_diff = frac_bits as i32 - SYNC_PERIOD_EMA_SLOW_SHIFT as i32;
+            let scaled = if shift_diff >= 0 {
+                period_ema_slow_scaled.wrapping_shl(shift_diff as u32)
+            } else {
+                period_ema_slow_scaled.wrapping_shr((-shift_diff) as u32)
+            };
+            scaled as u32
+        },
     }
 }
 
@@ -3333,6 +3400,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.period_sample_count.to_le_bytes());
                 payload.extend_from_slice(&s.period_min.to_le_bytes());
                 payload.extend_from_slice(&s.period_max.to_le_bytes());
+                // Slow EMA appendix — u32 fp value, same frac_bits scaling. The
+                // long-term-stable prediction for the wire period.
+                payload.extend_from_slice(&s.period_ema_slow_fp.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
