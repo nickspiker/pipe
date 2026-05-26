@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|wire_loopback [TX_PATTERN_HEX [P_SHIFT]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
             );
             return ExitCode::from(2);
         }
@@ -100,6 +100,7 @@ fn main() -> ExitCode {
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
         "wire_bits" => cmd_wire_bits(&port_path, cmd_args),
+        "wire_loopback" => cmd_wire_loopback(&port_path, cmd_args),
         "tune_p" => cmd_tune_p(&port_path, cmd_args),
         "wire_decode" => cmd_wire_decode(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
@@ -733,11 +734,29 @@ fn run_wire_sync(
     settle_iter: u32,
     p_shift: u32,
 ) -> Result<SyncResultParsed, String> {
-    let mut params = Vec::with_capacity(16);
+    run_wire_sync_with_tx(port_path, max_iter, frac_bits, settle_iter, p_shift, 0)
+}
+
+/// Same as run_wire_sync but appends a 32-bit TX pattern that the bridge drives onto
+/// GP0 via PIO TX during the capture. tx_pattern=0 disables TX (identical to
+/// run_wire_sync). Used by cmd_wire_loopback to validate the TX path with the
+/// bridge's own PIO RX as the verification end.
+fn run_wire_sync_with_tx(
+    port_path: &str,
+    max_iter: u32,
+    frac_bits: u32,
+    settle_iter: u32,
+    p_shift: u32,
+    tx_pattern: u32,
+) -> Result<SyncResultParsed, String> {
+    let mut params = Vec::with_capacity(20);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
     params.extend_from_slice(&settle_iter.to_le_bytes());
     params.extend_from_slice(&p_shift.to_le_bytes());
+    if tx_pattern != 0 {
+        params.extend_from_slice(&tx_pattern.to_le_bytes());
+    }
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -1189,6 +1208,49 @@ fn cmd_wire_bits(port_path: &str, args: &[String]) -> Result<(), String> {
             println!("            either the host LFSR formula differs from the FPGA, or the bridge bit decoder has a bug.");
         }
     }
+    Ok(())
+}
+
+/// `wire_loopback [TX_PATTERN_HEX [P_SHIFT]]` — bridge drives a known 32-bit pattern
+/// onto GP0 via PIO TX SM1 while the existing PIO RX SM0 captures the wire. Same
+/// fast_sync + bit decoder as wire_bits; the only difference is TX is on. Validates
+/// the TX path end-to-end with no FPGA dependency: program a SILENT FPGA bitstream
+/// (e.g. top_pipe_silent_oled, pipe_pad tied LOW) and the only edges on the wire are
+/// from the bridge's own drive. Recommended pattern: G#AAAAAAAA (LSB-first alternating
+/// bits → wire transitions every slot, CDR locks, bit decoder sees all 1s).
+fn cmd_wire_loopback(port_path: &str, args: &[String]) -> Result<(), String> {
+    let tx_pattern: u32 = args.first()
+        .map(|s| u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("G#"), 16)
+            .map_err(|e| format!("bad TX_PATTERN_HEX: {e}")))
+        .transpose()?
+        .unwrap_or(0xAAAA_AAAA);
+    let p_shift: u32 = args.get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad P_SHIFT: {e}")))
+        .transpose()?
+        .unwrap_or(8)
+        .min(24);
+    if tx_pattern == 0 {
+        return Err("TX_PATTERN must be nonzero — pattern G#00000000 disables TX".to_string());
+    }
+
+    println!("wire_loopback: TX pattern G#{tx_pattern:08X}, p_shift={p_shift}");
+    let r = run_wire_sync_with_tx(port_path, 1 << 24, 13, 0, p_shift, tx_pattern)?;
+    println!("  locked={} edges_to_lock={} bits_decoded={}",
+        r.locked, r.edges_to_lock, r.bits_decoded);
+    if !r.locked {
+        println!("  NOT locked — bridge couldn't acquire on its own TX. Possible: TX not actually");
+        println!("  driving the wire (funcsel issue), FPGA still driving (load silent bitstream),");
+        println!("  or pattern produces no transitions (e.g. G#FFFFFFFF or G#00000000).");
+        return Ok(());
+    }
+    let valid_bits = (r.bits_decoded as u32).min(64);
+    let display_mask = 1u64.checked_shl(valid_bits).unwrap_or(0).wrapping_sub(1);
+    println!("  last {valid_bits} bits (newest=right): {:0width$b}",
+        r.bits_buffer & display_mask,
+        width = valid_bits as usize);
+    println!("  hex: G#{:016X}", r.bits_buffer);
+    let slot_us = r.final_interval_fp as f64 / (1u64 << r.frac_bits) as f64 * 8.0 / 1000.0;
+    println!("  locked slot ≈ {:.3} µs (target: ~2.872 µs for slot rate 348 kHz at PIO clkdiv=359)", slot_us);
     Ok(())
 }
 

@@ -868,15 +868,162 @@ fn pio_edge_stop() {
 }
 
 /// Pop the next FIFO word, bounded by a wall-clock deadline. Returns None on timeout.
+/// In loopback mode (TX_LOOPBACK_PATTERN nonzero), tops up the TX FIFO with the
+/// pattern word while waiting for RX. This lets the dispatch handler turn TX on
+/// before triggering fast_sync and have the TX stream stay continuous through the
+/// whole capture window without needing a separate refill task.
 #[inline(always)]
 fn pio_edge_read_until(deadline_us: u64, start: embassy_time::Instant) -> Option<u32> {
     use embassy_rp::pac::PIO0;
+    let tx_pattern = TX_LOOPBACK_PATTERN.load(PaOrdering::Relaxed);
     while (PIO0.fstat().read().rxempty() & (1 << PIO_EDGE_SM)) != 0 {
+        if tx_pattern != 0 && (PIO0.fstat().read().txfull() & (1 << PIO_TX_SM)) == 0 {
+            PIO0.txf(PIO_TX_SM).write_value(tx_pattern);
+        }
         if start.elapsed().as_micros() > deadline_us {
             return None;
         }
     }
     Some(PIO0.rxf(PIO_EDGE_SM).read())
+}
+
+/// When nonzero, fast_sync's PIO RX read loop refills PIO TX FIFO with this 32-bit
+/// pattern. Dispatch handler sets this before triggering fast_sync (and clears
+/// after) for the wire_loopback test. Zero = no TX, normal RX-only path.
+static TX_LOOPBACK_PATTERN: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+// ============================================================================
+// PIO0 SM1 — TX state machine, drives GP0 at slot rate
+// ============================================================================
+//
+// Single-instruction loop: `out pins, 1` shifts the LSB of the OSR onto GP0 every
+// PIO cycle, with autopull refilling the OSR from the TX FIFO every 32 bits. SM
+// clock is divided to one tick per wire slot, so each bit out of the FIFO occupies
+// exactly one slot. CPU pushes 32-bit chunks; PIO drives them out at slot rate.
+//
+// Sharing the PIO with the RX SM: GP0 funcsel switches to PIO0 when TX is enabled
+// (so PIO can drive). The RX SM (jmp pin / in pins reads) doesn't care about
+// funcsel — GPIO inputs are always available to PIO regardless. Both SMs run
+// concurrently; bridge can transmit and receive at the same time.
+//
+// Slot rate target ~348 kHz (matches the FPGA's 4-cycle slot at ~1.39 MHz
+// enclave_clk). At 125 MHz sys_clk: divider = 125e6 / 348e3 ≈ 359.20. Using
+// int=359, frac=51 (0.2 × 256) for a clean slot match.
+//
+// out pins, 1: opcode=011, dest=000 (PINS), bits=00001 → 0x6001
+// set pindirs, 1: opcode=111, dest=100 (PINDIRS), data=00001 → 0xE081
+const PIO_TX_PROG_ADDR: usize = 16; // RX uses 0-11; leave room and put TX at 16
+const PIO_TX_INSTR: u16 = 0x6001;   // out pins, 1
+const PIO_TX_SETDIR_INSTR: u16 = 0xE081; // set pindirs, 1
+const PIO_TX_SM: usize = 1;
+const PIO_FUNCSEL_PIO0: u8 = 6;
+const PIO_FUNCSEL_SIO: u8 = 5;
+
+fn pio_tx_init() {
+    use embassy_rp::pac::PIO0;
+    use embassy_rp::pac::pio::regs::{InstrMem, SmClkdiv, SmInstr};
+
+    // Disable SM1 first.
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_TX_SM));
+    });
+
+    // Load OUT instruction at slot 16.
+    PIO0.instr_mem(PIO_TX_PROG_ADDR).write_value(InstrMem(PIO_TX_INSTR as u32));
+
+    // Single-instruction loop: wrap_top = wrap_bottom = 16.
+    PIO0.sm(PIO_TX_SM).execctrl().write(|w| {
+        w.set_wrap_top(PIO_TX_PROG_ADDR as u8);
+        w.set_wrap_bottom(PIO_TX_PROG_ADDR as u8);
+        w.set_jmp_pin(PIO_EDGE_GPIO); // unused but keep consistent
+    });
+
+    // Autopull every 32 bits; right-shift OSR (LSB first onto pin); join TX FIFO
+    // (8-deep for headroom). Threshold = 0 means 32 in PIO encoding.
+    PIO0.sm(PIO_TX_SM).shiftctrl().write(|w| {
+        w.set_autopull(true);
+        w.set_pull_thresh(0);
+        w.set_out_shiftdir(true);
+        w.set_fjoin_tx(true);
+    });
+
+    // Pinctrl: drive GP0 only.
+    PIO0.sm(PIO_TX_SM).pinctrl().write(|w| {
+        w.set_out_base(PIO_EDGE_GPIO);
+        w.set_out_count(1);
+        w.set_set_base(PIO_EDGE_GPIO);
+        w.set_set_count(1);
+    });
+
+    // Slot-rate divider: int=359, frac=51 → 348.0 kHz exactly at 125 MHz.
+    PIO0.sm(PIO_TX_SM).clkdiv().write(|w| {
+        w.set_int(359);
+        w.set_frac(51);
+    });
+
+    // Inject `set pindirs, 1` to make GP0 an output (one-shot, doesn't touch the
+    // wrap loop since we're not enabled yet).
+    PIO0.sm(PIO_TX_SM).instr().write_value(SmInstr(PIO_TX_SETDIR_INSTR as u32));
+}
+
+/// Take ownership of GP0 (switch funcsel to PIO0) and enable the TX SM. Caller is
+/// responsible for pumping the FIFO (via pio_tx_push_word) and stopping when done.
+fn pio_tx_start() {
+    use embassy_rp::pac::{IO_BANK0, PADS_BANK0, PIO0};
+
+    // Clear PAD output-disable so PIO can actually drive the pin. Flex::set_as_input
+    // leaves PADS_BANK0.gpio[N].od at its boot default (which is typically 1 = output
+    // disabled) — PAD.OD has priority over peripheral OE per RP2040 datasheet 2.19,
+    // so without this the SM runs but the pin stays floating.
+    PADS_BANK0.gpio(PIO_EDGE_GPIO as usize).modify(|w| {
+        w.set_od(false);   // enable output driver
+        w.set_ie(true);    // keep input enabled so PIO RX can still read the pad
+    });
+
+    // Switch GP0 to PIO0 funcsel so the PIO drives the pin.
+    IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().modify(|w| w.set_funcsel(PIO_FUNCSEL_PIO0));
+
+    // Restart + enable SM1.
+    PIO0.ctrl().modify(|w| {
+        w.set_sm_restart(1 << PIO_TX_SM);
+        w.set_clkdiv_restart(1 << PIO_TX_SM);
+    });
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur | (1 << PIO_TX_SM));
+    });
+}
+
+fn pio_tx_stop() {
+    use embassy_rp::pac::{IO_BANK0, PIO0};
+
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_TX_SM));
+    });
+
+    // Hand GP0 back to SIO and put it in input mode (so the FPGA isn't fighting us).
+    IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().modify(|w| w.set_funcsel(PIO_FUNCSEL_SIO));
+    // SIO is now driving — clear OE so we don't drive.
+    embassy_rp::pac::SIO.gpio_oe(0).value_clr().write_value(1 << PIO_EDGE_GPIO);
+}
+
+/// Push one 32-bit word into the TX FIFO. Blocks if the FIFO is full (waits for PIO
+/// to drain a slot worth of bits, ~92 µs at 348 kHz slot rate per slot).
+fn pio_tx_push_word(word: u32) {
+    use embassy_rp::pac::PIO0;
+    while (PIO0.fstat().read().txfull() & (1 << PIO_TX_SM)) != 0 {}
+    PIO0.txf(PIO_TX_SM).write_value(word);
+}
+
+/// Block until the TX FIFO + OSR have fully drained (all bits clocked out).
+fn pio_tx_drain() {
+    use embassy_rp::pac::PIO0;
+    while (PIO0.fstat().read().txempty() & (1 << PIO_TX_SM)) == 0 {}
+    // FIFO is empty but OSR may still hold up to 32 bits being shifted out.
+    // 32 bits at 348 kHz = ~92 µs; give it ample slack.
+    embassy_time::block_for(embassy_time::Duration::from_micros(200));
 }
 
 fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> SyncResult {
@@ -2340,6 +2487,17 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 8 // default proportional gain 1/256 — converges in ~one 256-bit exchange
             };
+            // Optional loopback TX pattern (bytes 16..20). Nonzero enables PIO TX on SM1
+            // for the duration of the fast_sync run: the bridge drives this 32-bit pattern
+            // continuously onto GP0 at slot rate, and the same PIO RX SM captures the
+            // wire — letting us prove TX produces real transitions without needing
+            // FPGA-side verification. Backward compat: missing/zero → no TX (the old
+            // wire_sync behavior).
+            let tx_pattern = if data_in.len() >= 20 {
+                u32::from_le_bytes([data_in[16], data_in[17], data_in[18], data_in[19]])
+            } else {
+                0
+            };
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
             let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
             let settle_iter = settle_iter.min(max_iter / 2);
@@ -2347,6 +2505,15 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             // edge (aggressive, risks oscillation). Upper bound 24 = effective no-op
             // (slew << small for any reasonable phase_err).
             let p_shift = p_shift.min(24);
+
+            // Bring TX up BEFORE fast_sync triggers — the read loop in fast_sync (on
+            // core 1) will keep the TX FIFO topped up via TX_LOOPBACK_PATTERN.
+            if tx_pattern != 0 {
+                pio_tx_init();
+                pio_tx_start();
+                for _ in 0..4 { pio_tx_push_word(tx_pattern); }
+                TX_LOOPBACK_PATTERN.store(tx_pattern, PaOrdering::Release);
+            }
 
             SYNC_RESPONSE.store(0, PaOrdering::Relaxed);
             SYNC_FRAC_REQUEST.store(frac_bits, PaOrdering::Relaxed);
@@ -2361,6 +2528,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                     break;
                 }
                 cortex_m::asm::nop();
+            }
+
+            if tx_pattern != 0 {
+                TX_LOOPBACK_PATTERN.store(0, PaOrdering::Release);
+                pio_tx_stop();
             }
             let iters = SYNC_RESPONSE.load(PaOrdering::Relaxed);
             if iters == 0 {
