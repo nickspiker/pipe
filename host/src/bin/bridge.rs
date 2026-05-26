@@ -734,6 +734,11 @@ struct SyncResultParsed {
     /// (= SYNC_LOCK_EMA_THRESHOLD_CYC) means locked.
     phase_err_ema_rise: i32,
     phase_err_ema_fall: i32,
+    /// PERIOD tracker (rise-to-rise = HIGH + LOW). Drift-stable frequency reference.
+    /// The actual lock signal — locked = (|phase_err_ema_period|.abs() <= 16 cyc).
+    acquisition_slot_cyc_period: u32,
+    final_interval_fp_period: u32,
+    phase_err_ema_period: i32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -876,6 +881,19 @@ fn run_wire_sync_full(
     } else {
         (0, 0)
     };
+    // PERIOD appendix: u32 seed, u32 fp value, i32 EMA, after the per-polarity EMAs.
+    let (acquisition_slot_cyc_period, final_interval_fp_period, phase_err_ema_period) =
+        if data.len() >= appendix_off + 36 {
+            let seed = g32(appendix_off + 24);
+            let fp = g32(appendix_off + 28);
+            let ema = i32::from_le_bytes([
+                data[appendix_off + 32], data[appendix_off + 33],
+                data[appendix_off + 34], data[appendix_off + 35],
+            ]);
+            (seed, fp, ema)
+        } else {
+            (0, 0, 0)
+        };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -908,6 +926,9 @@ fn run_wire_sync_full(
         tx_words_consumed,
         phase_err_ema_rise,
         phase_err_ema_fall,
+        acquisition_slot_cyc_period,
+        final_interval_fp_period,
+        phase_err_ema_period,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1019,12 +1040,29 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     );
 
     if locked {
-        println!("  LOCK:        held at end of run (P-EMA within ±16 cyc on both polarities; first achieved at edge {})", edges_to_lock);
+        println!("  LOCK:        held at end of run (period EMA within ±16 cyc; first achieved at edge {})", edges_to_lock);
     } else {
-        println!("  LOCK:        NOT held (P-EMA exceeded ±16 cyc on at least one polarity at end of run)");
+        println!("  LOCK:        NOT held (period EMA exceeded ±16 cyc at end of run)");
     }
-    println!("  P-EMA final: rise {:+5} cyc   fall {:+5} cyc   (threshold ±16, |EMA|≤16 = locked)",
-        r.phase_err_ema_rise, r.phase_err_ema_fall);
+    let period_fp_scale = (1u64 << frac_bits) as f64;
+    let period_seed_ns = r.acquisition_slot_cyc_period as f64 * NS_PER_CYC;
+    let period_final_cyc = r.final_interval_fp_period as f64 / period_fp_scale;
+    let period_final_ns = period_final_cyc * NS_PER_CYC;
+    let period_drift_cyc = period_final_cyc - r.acquisition_slot_cyc_period as f64;
+    let period_drift_ppm = if r.acquisition_slot_cyc_period > 0 {
+        1e6 * period_drift_cyc / r.acquisition_slot_cyc_period as f64
+    } else { 0.0 };
+    // 4096-slot silence budget (= 2^12): drift × 4096 must stay under 0.5 × slot.
+    // slot = period / 2 ≈ period_seed_cyc / 2. Tolerance = (slot / 2) / 4096 = period / 16384.
+    // In ppm of period: 1e6 / 16384 ≈ 61 ppm.
+    let silence_budget_ppm = 1.0e6 / 16384.0;
+    println!("  PERIOD:      seed {} cyc = {:.3} µs   final {:.4} cyc = {:.3} µs",
+        r.acquisition_slot_cyc_period, period_seed_ns / 1000.0,
+        period_final_cyc, period_final_ns / 1000.0);
+    println!("               drift: {:+.4} cyc ({:+.1} ppm)   silence budget (2^12 slots ±½ slot): ±{:.0} ppm",
+        period_drift_cyc, period_drift_ppm, silence_budget_ppm);
+    println!("  P-EMA final: period {:+5} cyc (active lock signal)   rise {:+5} cyc   fall {:+5} cyc   (threshold ±16)",
+        r.phase_err_ema_period, r.phase_err_ema_rise, r.phase_err_ema_fall);
 
     if total_edges == 0 {
         println!("  no tracking edges — increase MAX_ITER or check wire");

@@ -342,6 +342,13 @@ struct SyncResult {
     /// solidly inside/outside.
     phase_err_ema_rise: i32,
     phase_err_ema_fall: i32,
+    /// PERIOD tracker (rise-to-rise = HIGH + LOW). The drift-stable frequency
+    /// reference. SM1 clkdiv (mirror mode) = period / 2. Lock detector uses
+    /// phase_err_ema_period (below). Per-polarity rise/fall are still computed for
+    /// diagnostic / RC asymmetry reporting but aren't on the lock decision path.
+    acquisition_slot_cyc_period: u32,
+    final_interval_fp_period: u32,
+    phase_err_ema_period: i32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -378,6 +385,9 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     tx_words_consumed: 0,
     phase_err_ema_rise: 0,
     phase_err_ema_fall: 0,
+    acquisition_slot_cyc_period: 0,
+    final_interval_fp_period: 0,
+    phase_err_ema_period: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1350,6 +1360,24 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut _multi_slot_skipped_acq: u32 = 0;
     let mut _multi_slot_skipped_track: u32 = 0;
 
+    // PERIOD tracker — the actual frequency reference. interval_fp_period stores the
+    // full rise-to-rise cycle (HIGH + LOW width sum) in fixed-point. It's updated
+    // only on rising edges, using period = own_cyc + prev_own_cyc (last falling edge's
+    // interval). The per-polarity interval_fp_low/_high are still computed for
+    // diagnostic / RC asymmetry reporting, but the SM1 clkdiv and lock detector both
+    // use interval_fp_period — because it's the right thing to hold during long
+    // silence runs. RC asymmetry shows up as noise on per-polarity own_cyc values
+    // but cancels in the sum, so period is a much cleaner frequency reference.
+    //
+    // For 2^12 = 4096-slot silence resilience within ±50% of one slot, the period
+    // estimate must be accurate to ≈122 ppm. Per-polarity tracking had ~150,000 ppm
+    // drift in practice because RC-noise pulled HIGH and LOW trackers in opposite
+    // directions; period tracking eliminates that mode entirely.
+    let mut prev_own_cyc: i32 = 0;
+    let mut interval_fp_period: u32 = 0;
+    let mut acquisition_slot_cyc_period: u32 = 0;
+    let mut have_prev_own_cyc: bool = false;
+
     let mut rising_total: u32 = 0;
     let mut falling_total: u32 = 0;
     let mut rising_neg_overflow: u32 = 0;
@@ -1374,18 +1402,24 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut consec_in_lock_fall: u32 = 0;
     let mut consec_out_lock_rise: u32 = 0;
     let mut consec_out_lock_fall: u32 = 0;
-    // P-based lock detector — per-polarity EMA of phase_err in SCALED fixed-point.
-    // Stored as ema_value × 2^SYNC_LOCK_EMA_SHIFT so the per-edge update never has
-    // to divide phase_err. Update: state = state - (state >> shift) + phase_err.
-    // Equivalent to y[n] = (1-α)y[n-1] + αx[n] with α = 1/2^shift, but unbiased —
-    // a naive `(phase_err - ema) >> shift` update has asymmetric rounding (-∞ for
-    // negatives, 0 for positives) that pulls the EMA toward -∞ even with mean
-    // phase_err near zero. The scaled form has no input shift so no input bias.
-    // Visible EMA at any time = ema_scaled >> SYNC_LOCK_EMA_SHIFT.
+    // P-based lock detector — PERIOD EMA of phase_err in SCALED fixed-point. Updated
+    // only on rising edges (one period sample per cycle). Stored as ema × 2^shift so
+    // the per-edge update never has to divide phase_err. Update: state = state -
+    // (state >> shift) + phase_err. Equivalent to y[n] = (1-α)y[n-1] + αx[n] with
+    // α = 1/2^shift, but unbiased — a naive `(phase_err - ema) >> shift` update has
+    // asymmetric rounding (-∞ for negatives, 0 for positives) that pulls the EMA
+    // toward -∞ even with mean phase_err near zero. Visible EMA = scaled >> shift.
+    let mut phase_err_ema_period_scaled: i32 = 0;
+    // (Legacy per-polarity EMAs kept for diagnostic reporting only — see
+    // phase_err_ema_rise/_fall in SyncResult. Not on the lock decision path.)
     let mut phase_err_ema_rise_scaled: i32 = 0;
     let mut phase_err_ema_fall_scaled: i32 = 0;
     let mut rise_locked: bool = false;
     let mut fall_locked: bool = false;
+    // PERIOD lock: |period EMA| <= SYNC_LOCK_EMA_THRESHOLD_CYC. The actual lock
+    // decision uses this single flag instead of the per-polarity AND, since period
+    // is the frequency reference we care about for slot timing.
+    let mut period_locked: bool = false;
     let mut locked: bool = false;
     let mut edges_seen: u32 = 0;
     let mut edges_to_lock: u32 = u32::MAX;
@@ -1477,6 +1511,10 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                 acquisition_slot_cyc_high = (acq_sum_high >> SYNC_ACQ_SHIFT_PER_POLARITY) as u32;
                 interval_fp_low = acquisition_slot_cyc_low << frac_bits;
                 interval_fp_high = acquisition_slot_cyc_high << frac_bits;
+                // PERIOD seed = LOW seed + HIGH seed (one full rise-to-rise cycle).
+                acquisition_slot_cyc_period = acquisition_slot_cyc_low
+                    .wrapping_add(acquisition_slot_cyc_high);
+                interval_fp_period = acquisition_slot_cyc_period << frac_bits;
                 acquisition_done = true;
                 acquisition_iter_count = iter;
                 if mirror_mode {
@@ -1495,8 +1533,12 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // symmetric midpoint of the RC-asymmetric FPGA slot pair — minimizes drift
         // either direction before the per-edge correction loop has time to apply.
         if mirror_armed && !mirror_started && rising {
-            let interval_fp_avg = ((interval_fp_low as u64 + interval_fp_high as u64) / 2) as u32;
-            let (ci, cf) = interval_fp_to_clkdiv(interval_fp_avg, frac_bits);
+            // SM1 has 2 instructions per FPGA cycle (nop + out pins), so one PIO
+            // instruction = one wire slot = period / 2 sys_clk. Drive clkdiv from the
+            // PERIOD tracker (rise-to-rise, drift-stable) rather than per-polarity
+            // (RC-asymmetry-noisy). Initial SM1 enable uses the period seed.
+            let interval_fp_slot = interval_fp_period >> 1;
+            let (ci, cf) = interval_fp_to_clkdiv(interval_fp_slot, frac_bits);
             pio_tx_mirror_start(ci, cf);
             // Pre-fill FIFO with up to 8 copies of the TX pattern (fjoin_tx=true gives
             // 8-deep FIFO). Bridge SM1 consumes 1 OSR bit per host slot via autopull at
@@ -1542,11 +1584,11 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         if mirror_started {
             cumulative_cyc_since_anchor =
                 cumulative_cyc_since_anchor.wrapping_add(own_cyc_u as u64);
-            // Average slot duration in sys_clk cycles. Use the slot-phase-aware tracking
-            // duration — interval_fp_low covers LOW (host) slots, interval_fp_high covers
-            // HIGH (enclave) slots. Use their average so the slot counter ticks at the
-            // FPGA's nominal slot rate regardless of which slot type we're in.
-            let slot_cyc = ((interval_fp_low as u64 + interval_fp_high as u64) / 2) >> frac_bits;
+            // Slot duration in sys_clk cycles. Use the PERIOD tracker (rise-to-rise =
+            // HIGH + LOW) divided by 2 — the single drift-stable frequency reference.
+            // RC asymmetry (HIGH ≠ LOW) is folded into the average and doesn't bias
+            // the slot-phase counter.
+            let slot_cyc = (interval_fp_period as u64 >> 1) >> frac_bits;
             if slot_cyc < 8 {
                 accept_for_cdr = false;
             } else {
@@ -1614,6 +1656,64 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             if rising { rising_total += 1 } else { falling_total += 1 };
             continue;
         }
+
+        // PERIOD tracker (rising-to-rising). own_cyc is the cross-polarity interval
+        // since previous edge. The PREVIOUS edge before THIS rising was a falling, and
+        // before THAT falling was the previous rising. So period = own_cyc (this rising)
+        // + prev_own_cyc (the falling between). Falling edges don't update the period
+        // tracker — they just record their own_cyc for the next rising to consume.
+        if rising && have_prev_own_cyc {
+            let period_now = own_cyc.wrapping_add(prev_own_cyc);
+            let period_slot = (interval_fp_period >> frac_bits) as i32;
+            if period_slot >= 16 {
+                let half_period = period_slot / 2;
+                // cascade_mode=0 (single-period data): symmetric window, drop "in space".
+                // cascade_mode=1 (multi-period data, LFSR with long runs): allow n=1..4.
+                let n_periods: i32 = if cascade_mode == 0 {
+                    if period_now >= period_slot - half_period
+                        && period_now < period_slot + half_period
+                    {
+                        1
+                    } else {
+                        _multi_slot_skipped_track += 1;
+                        // Fall through to per-polarity logic below — that path still
+                        // runs and reports diagnostics. The period tracker just doesn't
+                        // update on this glitchy period sample.
+                        0
+                    }
+                } else if period_now < period_slot + half_period { 1 }
+                  else if period_now < 2 * period_slot + half_period { 2 }
+                  else if period_now < 3 * period_slot + half_period { 3 }
+                  else if period_now < 4 * period_slot + half_period { 4 }
+                  else { _multi_slot_skipped_track += 1; 0 };
+                if n_periods >= 1 {
+                    let expected = n_periods * period_slot;
+                    let phase_err_period = period_now - expected;
+                    let shift = frac_bits as i32 - p_shift as i32;
+                    let slew = if shift >= 0 {
+                        phase_err_period << shift
+                    } else {
+                        phase_err_period >> -shift
+                    };
+                    let new_fp = interval_fp_period.wrapping_add_signed(slew);
+                    // Sanity window: keep period within ±30% of acquisition seed.
+                    let seed_fp = (acquisition_slot_cyc_period as u64) << frac_bits;
+                    let min_fp = ((seed_fp * 7 / 10) as u32).max(1u32 << frac_bits);
+                    let max_fp = (seed_fp * 13 / 10).min(u32::MAX as u64) as u32;
+                    if new_fp >= min_fp && new_fp <= max_fp {
+                        interval_fp_period = new_fp;
+                    }
+                    // PERIOD P-EMA lock detector — scaled fixed-point form.
+                    phase_err_ema_period_scaled = phase_err_ema_period_scaled
+                        .wrapping_sub(phase_err_ema_period_scaled >> SYNC_LOCK_EMA_SHIFT)
+                        .wrapping_add(phase_err_period);
+                    let ema_period = phase_err_ema_period_scaled >> SYNC_LOCK_EMA_SHIFT;
+                    period_locked = ema_period.abs() <= SYNC_LOCK_EMA_THRESHOLD_CYC;
+                }
+            }
+        }
+        prev_own_cyc = own_cyc;
+        have_prev_own_cyc = true;
 
         // Tracking phase. Comparison cascade picks n_slots ∈ {1, 2, 3, 4}: the wire's
         // mirror-XOR-encoded data can leave 1+ slot boundaries without a transition, so
@@ -1712,8 +1812,11 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // filter ACCEPTED this edge (interval_fp moved as a real measurement). Reject
         // events shouldn't move SM1's rate.
         if mirror_started && accept_for_cdr {
-            let interval_fp_avg = ((interval_fp_low as u64 + interval_fp_high as u64) / 2) as u32;
-            let (ci, cf) = interval_fp_to_clkdiv(interval_fp_avg, frac_bits);
+            // Per-edge SM1 clkdiv refresh from the PERIOD tracker (see initial
+            // pio_tx_mirror_start for rationale). clkdiv = period / 2 (slot in
+            // sys_clk). Period is updated on every accepted rising edge above.
+            let interval_fp_slot = interval_fp_period >> 1;
+            let (ci, cf) = interval_fp_to_clkdiv(interval_fp_slot, frac_bits);
             embassy_rp::pac::PIO0.sm(PIO_TX_SM).clkdiv().write(|w| {
                 w.set_int(ci);
                 w.set_frac(cf);
@@ -1763,13 +1866,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             let ema_fall = phase_err_ema_fall_scaled >> SYNC_LOCK_EMA_SHIFT;
             fall_locked = ema_fall.abs() <= SYNC_LOCK_EMA_THRESHOLD_CYC;
         }
-        // Global locked is the AND of per-polarity locks at this very edge —
-        // current-state semantics so PIPE_COMMS_LOCKED reflects whether comms is
-        // held NOW, not "ever was held". edges_to_lock records the moment of first
-        // SET only (latched at u32::MAX otherwise) for "how many edges did it take
-        // to achieve first lock" tuning.
+        // Global `locked` = period EMA lock. Period is the actual frequency reference
+        // (rise-to-rise = full cycle), and it's what SM1 clkdiv and the 2^12-silence
+        // resilience budget hinge on. Per-polarity rise/fall_locked still update for
+        // diagnostic surfaces but aren't on the decision path. Current-state semantics
+        // — flips back to false the instant period EMA drifts past threshold.
         let was_locked = locked;
-        locked = rise_locked && fall_locked;
+        locked = period_locked;
         if locked && !was_locked && edges_to_lock == u32::MAX {
             edges_to_lock = edges_seen;
         }
@@ -1867,6 +1970,9 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // internal storage form.
         phase_err_ema_rise: phase_err_ema_rise_scaled >> SYNC_LOCK_EMA_SHIFT,
         phase_err_ema_fall: phase_err_ema_fall_scaled >> SYNC_LOCK_EMA_SHIFT,
+        acquisition_slot_cyc_period,
+        final_interval_fp_period: interval_fp_period,
+        phase_err_ema_period: phase_err_ema_period_scaled >> SYNC_LOCK_EMA_SHIFT,
     }
 }
 
@@ -3150,6 +3256,14 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // means locked. Backward compatible (old parsers stop earlier).
                 payload.extend_from_slice(&s.phase_err_ema_rise.to_le_bytes());
                 payload.extend_from_slice(&s.phase_err_ema_fall.to_le_bytes());
+                // PERIOD tracker appendix — the drift-stable frequency reference and
+                // the active lock signal. acquisition_slot_cyc_period (u32 seed),
+                // final_interval_fp_period (u32 fp value at end), phase_err_ema_period
+                // (i32 EMA value, |EMA|<=16 = locked). Backward compatible (old parsers
+                // stop at the per-polarity EMA fields).
+                payload.extend_from_slice(&s.acquisition_slot_cyc_period.to_le_bytes());
+                payload.extend_from_slice(&s.final_interval_fp_period.to_le_bytes());
+                payload.extend_from_slice(&s.phase_err_ema_period.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3272,6 +3386,14 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // means locked. Backward compatible (old parsers stop earlier).
                 payload.extend_from_slice(&s.phase_err_ema_rise.to_le_bytes());
                 payload.extend_from_slice(&s.phase_err_ema_fall.to_le_bytes());
+                // PERIOD tracker appendix — the drift-stable frequency reference and
+                // the active lock signal. acquisition_slot_cyc_period (u32 seed),
+                // final_interval_fp_period (u32 fp value at end), phase_err_ema_period
+                // (i32 EMA value, |EMA|<=16 = locked). Backward compatible (old parsers
+                // stop at the per-polarity EMA fields).
+                payload.extend_from_slice(&s.acquisition_slot_cyc_period.to_le_bytes());
+                payload.extend_from_slice(&s.final_interval_fp_period.to_le_bytes());
+                payload.extend_from_slice(&s.phase_err_ema_period.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
