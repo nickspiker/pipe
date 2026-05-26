@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|wire_loopback [TX_PATTERN_HEX [P_SHIFT]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|wire_loopback [TX_PATTERN_HEX [P_SHIFT]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|wire_mirror [MAX_EDGES [FRAC_BITS [P_SHIFT [TX_PATTERN_HEX]]]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
             );
             return ExitCode::from(2);
         }
@@ -104,6 +104,7 @@ fn main() -> ExitCode {
         "wire_tx_diag" => cmd_wire_tx_diag(&port_path),
         "tune_p" => cmd_tune_p(&port_path, cmd_args),
         "wire_decode" => cmd_wire_decode(&port_path, cmd_args),
+        "wire_mirror" => cmd_wire_mirror(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
         "reset" => cmd_action(&port_path, "reset"),
         "flash" => cmd_flash(&port_path, cmd_args),
@@ -719,6 +720,9 @@ struct SyncResultParsed {
     /// firmware that predates the appendix.
     bits_buffer: u64,
     bits_decoded: u32,
+    /// Mirror-mode appendix: count of 32-bit TX words pushed to SM1 FIFO during
+    /// the run (32 host slots per word). 0 outside mirror mode or on older firmware.
+    tx_words_consumed: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -814,6 +818,13 @@ fn run_wire_sync_with_tx(
     } else {
         (0, 0)
     };
+    // Mirror-mode appendix: u32 tx_words_consumed immediately after bits_decoded.
+    // Backward compatible — older firmware or non-mirror runs default to 0.
+    let tx_words_consumed = if data.len() >= appendix_off + 16 {
+        g32(appendix_off + 12)
+    } else {
+        0
+    };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -843,6 +854,7 @@ fn run_wire_sync_with_tx(
         phase_sum: gi64(96),
         bits_buffer,
         bits_decoded,
+        tx_words_consumed,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1472,6 +1484,141 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
         if to_show < 256 && (255 - i) >= to_show { break; }
     }
     println!("    {}", bitstr);
+
+    Ok(())
+}
+
+/// `wire_mirror [MAX_EDGES [FRAC_BITS [P_SHIFT [TX_PATTERN_HEX]]]]` — PIO-driven
+/// mirror-XOR slot-aware drive. The bridge runs fast_sync (same CDR as wire_sync)
+/// but in mirror mode: after acquisition, SM1 (2-instruction PIO program with
+/// side-set on PINDIRS) is started on the next rising edge, anchored to the start
+/// of an FPGA enclave slot. SM1 then cycles `nop side 0` (tristate during enclave
+/// slot) and `out pins, 1 side 1` (drive one TX bit during host slot). SM1's
+/// CLKDIV is continuously updated from interval_fp_low so it stays phase-locked
+/// to the FPGA's actual slot rate.
+///
+/// TX_PATTERN_HEX is a 32-bit pattern, LSB-first. Default `AAAAAAAA` = alternating
+/// bits = bridge drives HI on every other host slot, maintaining edge density for
+/// the CDR to keep tracking.
+fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
+    const SYNC_MAX_ITER: u32 = 1 << 28;
+    let max_iter: u32 = args
+        .first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad MAX_ITER: {e}")))
+        .transpose()?
+        .unwrap_or(1 << 25)
+        .clamp(2048, SYNC_MAX_ITER);
+    let frac_bits: u32 = args
+        .get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad FRAC_BITS: {e}")))
+        .transpose()?
+        .unwrap_or(13)
+        .clamp(2, 19);
+    let p_shift: u32 = args
+        .get(2)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad P_SHIFT: {e}")))
+        .transpose()?
+        .unwrap_or(8)
+        .min(24);
+    let tx_pattern: u32 = args
+        .get(3)
+        .map(|s| u32::from_str_radix(s.trim_start_matches("G#"), 16)
+            .map_err(|e| format!("bad TX_PATTERN_HEX: {e}")))
+        .transpose()?
+        .unwrap_or(0xAAAA_AAAA);
+
+    let mut params = Vec::with_capacity(16);
+    params.extend_from_slice(&max_iter.to_le_bytes());
+    params.extend_from_slice(&frac_bits.to_le_bytes());
+    params.extend_from_slice(&p_shift.to_le_bytes());
+    params.extend_from_slice(&tx_pattern.to_le_bytes());
+
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_mirror",
+        43,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+
+    const SCALAR_BYTES: usize = 24 * 4 + 3 * 8;
+    if data.len() < SCALAR_BYTES {
+        return Err(format!("mirror response too short: {} bytes", data.len()));
+    }
+    let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+
+    let elapsed_us = g32(0) as u64;
+    let total_iter = g32(4) as u64;
+    let status = g32(8);
+    let locked = g32(20) != 0;
+    let edges_to_lock = g32(24);
+    let acquisition_slot_cyc_rise = g32(36);
+    let acquisition_slot_cyc_fall = g32(40);
+    let final_interval_fp_rise = g32(44);
+    let final_interval_fp_fall = g32(48);
+    let frac_bits_back = g32(12);
+    let p_shift_back = g32(16);
+    let rising_total = g32(68);
+    let falling_total = g32(72);
+    let hist_bins = g32(92) as usize;
+    let appendix_off = SCALAR_BYTES + 4 * hist_bins;
+    let tx_words_consumed = if data.len() >= appendix_off + 16 {
+        g32(appendix_off + 12)
+    } else {
+        0
+    };
+
+    const NS_PER_CYC: f64 = 8.0;
+    let status_str = match status {
+        0 => "LOCKED",
+        1 => "acquisition incomplete",
+        2 => "no edges — wire dead?",
+        _ => "unknown",
+    };
+    let fp_scale = (1u64 << frac_bits_back) as f64;
+    let final_rise_cyc = final_interval_fp_rise as f64 / fp_scale;
+    let final_fall_cyc = final_interval_fp_fall as f64 / fp_scale;
+    let final_rise_ns = final_rise_cyc * NS_PER_CYC;
+    let final_fall_ns = final_fall_cyc * NS_PER_CYC;
+    let drift_rise = final_rise_cyc - acquisition_slot_cyc_rise as f64;
+    let drift_fall = final_fall_cyc - acquisition_slot_cyc_fall as f64;
+
+    println!(
+        "PIPE wire mirror ({} edges, {:.3} ms wall time): {}",
+        total_iter, elapsed_us as f64 / 1000.0, status_str,
+    );
+    println!("  frac_bits={}, p_shift={}, locked={}, edges_to_lock={}",
+        frac_bits_back, p_shift_back, locked,
+        if edges_to_lock == u32::MAX { "never".into() } else { format!("{}", edges_to_lock) });
+    println!();
+    println!("  rise seed: {} cyc = {:.3} µs   fall seed: {} cyc = {:.3} µs",
+        acquisition_slot_cyc_rise, acquisition_slot_cyc_rise as f64 * NS_PER_CYC / 1000.0,
+        acquisition_slot_cyc_fall, acquisition_slot_cyc_fall as f64 * NS_PER_CYC / 1000.0);
+    println!("  final RISING slot: {:.4} cyc = {:.3} µs   drift: {:+.4} cyc",
+        final_rise_cyc, final_rise_ns / 1000.0, drift_rise);
+    println!("  final FALLING slot: {:.4} cyc = {:.3} µs   drift: {:+.4} cyc",
+        final_fall_cyc, final_fall_ns / 1000.0, drift_fall);
+    println!();
+    println!("  rising edges:  {}   falling edges: {}", rising_total, falling_total);
+    println!("  TX pattern: G#{:08X}", tx_pattern);
+    println!("  TX words pushed: {}  ({} host slots driven)",
+        tx_words_consumed, tx_words_consumed * 32);
+    if rising_total > 0 {
+        let words_per_k_edge = tx_words_consumed as f64 / (rising_total as f64 / 1000.0);
+        println!("  TX words / 1000 rising edges: {:.2}  (~1000 expected — one push per rising edge in mirror mode, only when FIFO not full)", words_per_k_edge);
+    }
 
     Ok(())
 }

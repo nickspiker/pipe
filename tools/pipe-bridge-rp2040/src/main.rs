@@ -324,6 +324,9 @@ struct SyncResult {
     /// MSB = oldest. bits_decoded is cumulative since acquisition completed.
     bits_buffer: u64,
     bits_decoded: u32,
+    /// Mirror mode only: count of 32-bit TX words pushed into SM1 FIFO during
+    /// this run. Each word = 32 host slots = 32 driven bits. 0 outside mirror mode.
+    tx_words_consumed: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -357,6 +360,7 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     falling_hist: [0; SYNC_HIST_BINS],
     bits_buffer: 0,
     bits_decoded: 0,
+    tx_words_consumed: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -374,6 +378,14 @@ static SYNC_SETTLE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::Atomic
 /// shifts (10-12) are gentler / more averaging-friendly.
 static SYNC_P_SHIFT_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(8);
 static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Mirror-XOR mode flag. 0 = normal wire_sync (no SM1 drive). 1 = wire_mirror
+/// (after CDR lock, enable SM1 on next rising edge with TX_MIRROR_PATTERN as
+/// the bit source). Set BEFORE SYNC_REQUEST goes non-zero.
+static SYNC_MIRROR_MODE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// 32-bit TX pattern fed into SM1's FIFO in mirror mode. LSB-first as `out
+/// pins, 1` shifts the OSR right (set_out_shiftdir(true)). Pushed once per
+/// FIFO-not-full check inside fast_sync's edge loop.
+static TX_MIRROR_PATTERN: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // Wire decode — slot-aligned continuous decode, runs after wire_sync acquisition.
@@ -919,6 +931,32 @@ const PIO_TX_SM: usize = 1;
 const PIO_FUNCSEL_PIO0: u8 = 6;
 const PIO_FUNCSEL_SIO: u8 = 5;
 
+// Mirror-XOR slot-aware TX program (2 instructions, side-set on PINDIRS).
+// Loaded at addresses 14 and 15 — distinct from PIO_TX_PROG_ADDR=16 so the
+// existing single-instruction `wire_loopback` path keeps working.
+//
+//   addr 14: `nop side 0`              = mov y,y with side-set 0 → PINDIRS = 0
+//   addr 15: `out pins, 1 side 1`      → PINDIRS = 1, shift 1 OSR bit to GP0
+//
+// With side_set_count=1 + side_pindir=true, bit [12] of each instruction is
+// the side-set output, routed to PINDIRS (NOT pin values). When PINDIRS=0
+// the pin tristates; when PINDIRS=1 the pin drives whatever OUT/SET asserted.
+//
+// The SM cycles addr 14 → 15 → 14 → 15 ... at clkdiv rate. With clkdiv set
+// per FPGA slot (one instruction = one slot), this maps directly:
+//   enclave slot: nop side 0          → PINDIRS=0, FPGA owns the wire
+//   host slot:    out pins, 1 side 1  → PINDIRS=1, bridge drives one TX bit
+//
+// Encodings (PIO bit fields: opcode[15:13] | sideset/delay[12:8] | operand[7:0]):
+//   nop = mov y,y = 0xA042 (opcode=101 MOV, dest=010 Y, op=000, src=010 Y)
+//   side 0 with side_set_count=1: bit [12] cleared → 0xA042 unchanged
+//   out pins, 1 = 0x6001 (opcode=011 OUT, dest=000 PINS, data=00001)
+//   side 1 with side_set_count=1: bit [12] set → 0x6001 | (1<<12) = 0x7001
+const PIO_TX_MIRROR_ADDR: usize = 14;
+const PIO_TX_MIRROR_NOP_SIDE0: u16 = 0xA042;    // nop side 0  (PINDIRS=0, tristate)
+const PIO_TX_MIRROR_OUT_SIDE1: u16 = 0x7001;    // out pins,1 side 1 (PINDIRS=1, drive)
+const PIO_TX_MIRROR_CLRDIR_INSTR: u16 = 0xE080; // set pindirs, 0 (one-shot pre-enable)
+
 fn pio_tx_init() {
     use embassy_rp::pac::PIO0;
     use embassy_rp::pac::pio::regs::{InstrMem, SmClkdiv, SmInstr};
@@ -1042,7 +1080,143 @@ fn pio_tx_drain() {
     embassy_time::block_for(embassy_time::Duration::from_micros(200));
 }
 
-fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> SyncResult {
+/// Configure SM1 for mirror-XOR slot-aware drive. Loads the 2-instruction TX
+/// program at addr 14-15, sets up side-set on PINDIRS via PINCTRL+EXECCTRL,
+/// matches autopull/shift config from pio_tx_init. Caller follows with
+/// pio_tx_mirror_start(clkdiv) once the CDR has a slot estimate.
+fn pio_tx_mirror_init() {
+    use embassy_rp::pac::PIO0;
+    use embassy_rp::pac::pio::regs::InstrMem;
+
+    // Disable SM1 first.
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_TX_SM));
+    });
+
+    // Load the 2-instruction program.
+    PIO0.instr_mem(PIO_TX_MIRROR_ADDR).write_value(InstrMem(PIO_TX_MIRROR_NOP_SIDE0 as u32));
+    PIO0.instr_mem(PIO_TX_MIRROR_ADDR + 1).write_value(InstrMem(PIO_TX_MIRROR_OUT_SIDE1 as u32));
+
+    // Wrap addr 14 → 15 → 14 → 15. wrap_bottom is where the SM jumps BACK to after executing wrap_top.
+    PIO0.sm(PIO_TX_SM).execctrl().write(|w| {
+        w.set_wrap_bottom(PIO_TX_MIRROR_ADDR as u8);
+        w.set_wrap_top((PIO_TX_MIRROR_ADDR + 1) as u8);
+        w.set_jmp_pin(PIO_EDGE_GPIO);
+        w.set_side_pindir(true); // side-set bits go to PINDIRS, NOT pin values
+    });
+
+    PIO0.sm(PIO_TX_SM).shiftctrl().write(|w| {
+        w.set_autopull(true);
+        w.set_pull_thresh(0); // 0 means 32 in PIO encoding
+        w.set_out_shiftdir(true);
+        w.set_fjoin_tx(true);
+    });
+
+    // PINCTRL: out/set/sideset all target GP0. sideset_count=1 places the side-set bit at [12].
+    PIO0.sm(PIO_TX_SM).pinctrl().write(|w| {
+        w.set_out_base(PIO_EDGE_GPIO);
+        w.set_out_count(1);
+        w.set_set_base(PIO_EDGE_GPIO);
+        w.set_set_count(1);
+        w.set_sideset_base(PIO_EDGE_GPIO);
+        w.set_sideset_count(1);
+    });
+
+    // CLKDIV is set per-run by pio_tx_mirror_start (seeded from acquisition).
+}
+
+/// Start SM1 in mirror-XOR mode aligned to the rising edge that just happened
+/// (start of FPGA enclave slot). Sets CLKDIV, takes GP0 funcsel, pre-clears
+/// PINDIRS to 0 (tristate), injects `jmp PIO_TX_MIRROR_ADDR`, enables SM.
+///
+/// Unlike pio_tx_start which uses Oeover::ENABLE (forces drive always),
+/// mirror mode uses Oeover::NORMAL so PIO PINDIRS controls OE — required for
+/// the side-set tristate-during-enclave-slot behaviour to actually take effect
+/// at the pad.
+fn pio_tx_mirror_start(clkdiv_int: u16, clkdiv_frac: u8) {
+    use embassy_rp::pac::{IO_BANK0, PADS_BANK0, PIO0};
+    use embassy_rp::pac::io::vals::{Oeover, Outover};
+    use embassy_rp::pac::pio::regs::SmInstr;
+
+    // Set the slot-rate clkdiv from acquisition.
+    PIO0.sm(PIO_TX_SM).clkdiv().write(|w| {
+        w.set_int(clkdiv_int);
+        w.set_frac(clkdiv_frac);
+    });
+
+    // PAD: enable driver (od=0), keep input enabled (ie=1) so PIO RX can still sample GP0.
+    PADS_BANK0.gpio(PIO_EDGE_GPIO as usize).modify(|w| {
+        w.set_od(false);
+        w.set_ie(true);
+    });
+
+    // GP0 → PIO0 funcsel. CRITICAL: Oeover::NORMAL (not ENABLE) so PINDIRS controls OE.
+    IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().write(|w| {
+        w.set_funcsel(PIO_FUNCSEL_PIO0);
+        w.set_outover(Outover::NORMAL);
+        w.set_oeover(Oeover::NORMAL);
+    });
+
+    // Pre-clear PINDIRS so the pad is tristated until the first instruction's
+    // side-set fires. Without this, PINDIRS retains whatever the prior
+    // pio_tx_init injection set (=1), and the pad would briefly drive at sm_enable.
+    PIO0.ctrl().modify(|w| {
+        w.set_sm_restart(1 << PIO_TX_SM);
+        w.set_clkdiv_restart(1 << PIO_TX_SM);
+    });
+    PIO0.sm(PIO_TX_SM).instr().write_value(SmInstr(PIO_TX_MIRROR_CLRDIR_INSTR as u32));
+
+    // Force PC to PIO_TX_MIRROR_ADDR (nop side 0 — enclave slot). sm_restart leaves
+    // PC stale per RP2040 datasheet §3.4.6.1, so without this the SM would run
+    // from instr_mem[0..] (which is the RX program).
+    let jmp_to_mirror = (PIO_TX_MIRROR_ADDR as u32) & 0x1F;
+    PIO0.sm(PIO_TX_SM).instr().write_value(SmInstr(jmp_to_mirror));
+
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur | (1 << PIO_TX_SM));
+    });
+}
+
+/// Stop mirror-mode SM1 and hand GP0 back to SIO input (so the FPGA isn't fought).
+fn pio_tx_mirror_stop() {
+    use embassy_rp::pac::{IO_BANK0, PIO0};
+
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_TX_SM));
+    });
+
+    IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().modify(|w| w.set_funcsel(PIO_FUNCSEL_SIO));
+    embassy_rp::pac::SIO.gpio_oe(0).value_clr().write_value(1 << PIO_EDGE_GPIO);
+}
+
+/// Try to push a 32-bit word into SM1's TX FIFO. Returns true if pushed.
+/// Non-blocking — lets the per-edge loop top up the FIFO without stalling.
+fn pio_tx_try_push(word: u32) -> bool {
+    use embassy_rp::pac::PIO0;
+    if (PIO0.fstat().read().txfull() & (1 << PIO_TX_SM)) != 0 {
+        return false;
+    }
+    PIO0.txf(PIO_TX_SM).write_value(word);
+    true
+}
+
+/// Convert an interval_fp value (slot in sys_clk × 2^frac_bits) into the SM1
+/// CLKDIV (int + 8-bit frac) format. With SM1's 2-instruction program running
+/// one instruction per FPGA slot, clkdiv per instruction in sys_clk = slot.
+fn interval_fp_to_clkdiv(interval_fp: u32, frac_bits: u32) -> (u16, u8) {
+    let clkdiv_int = (interval_fp >> frac_bits).min(u16::MAX as u32) as u16;
+    let clkdiv_frac = if frac_bits >= 8 {
+        ((interval_fp >> (frac_bits - 8)) & 0xFF) as u8
+    } else {
+        ((interval_fp & ((1u32 << frac_bits) - 1)) << (8 - frac_bits)) as u8
+    };
+    (clkdiv_int, clkdiv_frac)
+}
+
+fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirror_mode: bool, tx_pattern: u32) -> SyncResult {
     let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
     let start = embassy_time::Instant::now();
 
@@ -1052,6 +1226,37 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
     // The `iter` counter is now edge-indexed, not poll-indexed.
     pio_edge_init();
     let initial = pio_edge_start();
+
+    // Mirror-XOR slot-aware drive: pre-configure SM1 with the 2-instruction program
+    // and side-set on PINDIRS. The SM isn't enabled here — pio_tx_mirror_start fires
+    // on the first rising edge after acquisition, anchoring SM1 to the start of an
+    // FPGA enclave slot. tx_words_consumed tracks FIFO pushes for diagnostic.
+    let mut mirror_armed = false;
+    let mut mirror_started = false;
+    let mut tx_words_consumed: u32 = 0;
+    if mirror_mode {
+        pio_tx_mirror_init();
+        TX_MIRROR_PATTERN.store(tx_pattern, PaOrdering::Relaxed);
+    }
+
+    // Mirror-mode slot-phase + TX-bit-aware edge filter. After SM1 anchors on a rising
+    // edge (start of FPGA enclave slot), the bridge tracks cumulative cycles since
+    // anchor. slot_phase toggles per slot boundary; tx_shift_reg mirrors SM1's OSR
+    // consumption (one bit per host slot, LSB-first). Each observed wire edge is
+    // checked against the predicted wire state — only edges that match what the FPGA
+    // and our own TX should produce are fed into the CDR. Spurious edges from SM1
+    // tristate-glitches or contention get rejected, breaking the positive-feedback
+    // loop that drove interval_fp_low to runaway shrinkage in the un-filtered version.
+    let mut cumulative_cyc_since_anchor: u64 = 0;
+    let mut slots_since_anchor: u64 = 0;
+    let mut slot_phase: u32 = 0;     // 0 = enclave (FPGA owns), 1 = host (bridge owns)
+    let mut tx_shift_reg: u32 = tx_pattern;
+    let mut tx_bits_remaining: u32 = 32;
+    let mut current_tx_bit: u8 = 0;  // bit bridge is driving in the current host slot
+    let mut last_driven_bit: u8 = 0; // bit bridge drove in the most recent (ended) host slot
+    let mut _edges_rejected_mid_slot: u32 = 0;
+    let mut _edges_rejected_wrong_polarity: u32 = 0;
+    let mut _edges_accepted_in_mirror: u32 = 0;
 
     // Edge cap: convert host-provided poll cap to an edge cap. The polling fast_sync
     // does ~15 sys_cyc per iter ≈ 8 MHz, so 16M iters ≈ 2 sec. At 6 kHz edges, that's
@@ -1199,8 +1404,129 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
                 interval_fp_high = acquisition_slot_cyc_high << frac_bits;
                 acquisition_done = true;
                 acquisition_iter_count = iter;
+                if mirror_mode {
+                    // Arm: SM1 starts on the NEXT rising edge (= start of an FPGA
+                    // enclave slot per top_pipe_slotted_oled.v:169-170).
+                    mirror_armed = true;
+                }
             }
             continue;
+        }
+
+        // Mirror mode: start SM1 on the first rising edge after acquisition. The
+        // rising edge marks the start of an FPGA enclave slot; SM1's first
+        // instruction is `nop side 0` (PINDIRS=0, tristate during enclave). Use the
+        // AVERAGE of interval_fp_low and interval_fp_high so SM1 sits at the
+        // symmetric midpoint of the RC-asymmetric FPGA slot pair — minimizes drift
+        // either direction before the per-edge correction loop has time to apply.
+        if mirror_armed && !mirror_started && rising {
+            let interval_fp_avg = ((interval_fp_low as u64 + interval_fp_high as u64) / 2) as u32;
+            let (ci, cf) = interval_fp_to_clkdiv(interval_fp_avg, frac_bits);
+            pio_tx_mirror_start(ci, cf);
+            // Pre-fill FIFO with up to 8 copies of the TX pattern (fjoin_tx=true gives
+            // 8-deep FIFO). Bridge SM1 consumes 1 OSR bit per host slot via autopull at
+            // 32 → 1 word per 32 host slots ≈ 1 word per 90 µs at 348 kHz. 8 words =
+            // 256 host slots ≈ 730 µs of headroom — well above CPU loop latency, so
+            // SM1 keeps drive going even if the filter rejects many consecutive edges.
+            for _ in 0..8 {
+                if pio_tx_try_push(tx_pattern) {
+                    tx_words_consumed = tx_words_consumed.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+            mirror_started = true;
+            // Reset slot-tracking state. This rising edge IS the anchor — cumulative
+            // time begins now; slot_phase is in enclave because SM1's first instruction
+            // (nop side 0) executes there. The anchor edge itself is a reference, not a
+            // data point — skip CDR processing for it.
+            cumulative_cyc_since_anchor = 0;
+            slots_since_anchor = 0;
+            slot_phase = 0;
+            tx_shift_reg = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
+            tx_bits_remaining = 32;
+            current_tx_bit = 0;
+            last_driven_bit = 0;
+            // Count edge for stats but skip CDR update — the anchor is a phase reference,
+            // not a slot-duration measurement. Falls through to rising_total/falling_total
+            // increment below.
+            if rising { rising_total += 1 } else { falling_total += 1 };
+            continue;
+        }
+
+        // Mirror-mode slot-phase tracker: advance through any slot boundaries this
+        // edge implies, updating slot_phase + TX shift register. Then check whether
+        // the edge polarity matches what we expect at the new slot phase. Rejection
+        // categories:
+        //   1. Edge fell mid-slot (cumulative not near a slot boundary) — likely an
+        //      SM1 tristate-glitch from CDR drift. Reject to prevent feedback.
+        //   2. Edge polarity doesn't match predicted (e.g., rising edge during host
+        //      slot when bridge drives 1, or falling edge during enclave with
+        //      last_driven_bit=1 — neither should produce a transition).
+        let mut accept_for_cdr = true;
+        if mirror_started {
+            cumulative_cyc_since_anchor =
+                cumulative_cyc_since_anchor.wrapping_add(own_cyc_u as u64);
+            // Average slot duration in sys_clk cycles. Use the slot-phase-aware tracking
+            // duration — interval_fp_low covers LOW (host) slots, interval_fp_high covers
+            // HIGH (enclave) slots. Use their average so the slot counter ticks at the
+            // FPGA's nominal slot rate regardless of which slot type we're in.
+            let slot_cyc = ((interval_fp_low as u64 + interval_fp_high as u64) / 2) >> frac_bits;
+            if slot_cyc < 8 {
+                accept_for_cdr = false;
+            } else {
+                // Step through any slot boundaries this edge crossed. Round to nearest:
+                // an edge slightly past a boundary (small remainder) AND an edge slightly
+                // before the next boundary (large remainder) both get attributed to that
+                // boundary, mirroring real-world edge timing jitter.
+                let new_slots = (cumulative_cyc_since_anchor + slot_cyc / 2) / slot_cyc;
+                let slots_crossed = new_slots.saturating_sub(slots_since_anchor);
+                for _ in 0..slots_crossed {
+                    slot_phase ^= 1;
+                    if slot_phase == 1 {
+                        // Entering host slot: bridge starts driving the next bit. Mirror
+                        // SM1's OSR consumption (1 bit per host slot, LSB-first).
+                        current_tx_bit = (tx_shift_reg & 1) as u8;
+                        tx_shift_reg >>= 1;
+                        tx_bits_remaining = tx_bits_remaining.saturating_sub(1);
+                        if tx_bits_remaining == 0 {
+                            tx_shift_reg = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
+                            tx_bits_remaining = 32;
+                        }
+                    } else {
+                        // Entering enclave: the bit bridge WAS driving is now last.
+                        last_driven_bit = current_tx_bit;
+                    }
+                }
+                slots_since_anchor = new_slots;
+
+                // How close is the edge to the nearest slot boundary? Edges near a
+                // boundary represent legitimate slot transitions; edges in the middle
+                // of a slot are spurious (SM1 tristate-glitches from drift).
+                let pos_in_slot = cumulative_cyc_since_anchor % slot_cyc;
+                let near_boundary = pos_in_slot < slot_cyc / 4 || pos_in_slot > 3 * slot_cyc / 4;
+                if slots_crossed == 0 || !near_boundary {
+                    _edges_rejected_mid_slot += 1;
+                    accept_for_cdr = false;
+                } else {
+                    // Slot boundary crossed. Predict expected edge polarity based on
+                    // slot phase and which bit bridge drove/is driving:
+                    //   Just entered enclave (slot_phase=0): expect RISING iff
+                    //     last_driven_bit==0 (line was LOW going in → FPGA pulls HIGH).
+                    //   Just entered host (slot_phase=1): expect FALLING iff
+                    //     current_tx_bit==0 (line was HIGH from FPGA → bridge pulls LOW).
+                    let expect_rising_here = slot_phase == 0 && last_driven_bit == 0;
+                    let expect_falling_here = slot_phase == 1 && current_tx_bit == 0;
+                    let polarity_ok = (rising && expect_rising_here)
+                                   || (!rising && expect_falling_here);
+                    if !polarity_ok {
+                        _edges_rejected_wrong_polarity += 1;
+                        accept_for_cdr = false;
+                    } else {
+                        _edges_accepted_in_mirror += 1;
+                    }
+                }
+            }
         }
 
         // Tracking phase. Comparison cascade picks n_slots ∈ {1, 2, 3, 4}: the wire's
@@ -1246,10 +1572,38 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
         let shift = frac_bits as i32 - p_shift as i32;
         let slew = if shift >= 0 { phase_err << shift } else { phase_err >> -shift };
         let new_fp = interval_fp_self.wrapping_add_signed(slew);
-        if rising {
-            interval_fp_low = new_fp;
-        } else {
-            interval_fp_high = new_fp;
+        // Only feed CDR with edges that passed the slot-phase + TX-bit filter.
+        // accept_for_cdr is always true outside mirror mode.
+        if accept_for_cdr {
+            if rising {
+                interval_fp_low = new_fp;
+            } else {
+                interval_fp_high = new_fp;
+            }
+        }
+
+        // Mirror mode CDR-coupled CLKDIV update: only update SM1's clkdiv when the
+        // filter ACCEPTED this edge (interval_fp moved as a real measurement). Reject
+        // events shouldn't move SM1's rate.
+        if mirror_started && accept_for_cdr {
+            let interval_fp_avg = ((interval_fp_low as u64 + interval_fp_high as u64) / 2) as u32;
+            let (ci, cf) = interval_fp_to_clkdiv(interval_fp_avg, frac_bits);
+            embassy_rp::pac::PIO0.sm(PIO_TX_SM).clkdiv().write(|w| {
+                w.set_int(ci);
+                w.set_frac(cf);
+            });
+        }
+
+        // Mirror mode TX FIFO topup — INDEPENDENT of CDR-accept. SM1 consumes 1 OSR
+        // bit per host slot (autopull at 32 → ~32 host slots per refill). If we
+        // only push on accepted edges, the filter's rejection rate starves SM1 and
+        // it stalls on empty FIFO — bridge stops driving, no more edges, deadlock.
+        // Top up every edge regardless; pio_tx_try_push is no-op if FIFO is full.
+        if mirror_started {
+            let pattern = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
+            if pio_tx_try_push(pattern) {
+                tx_words_consumed = tx_words_consumed.saturating_add(1);
+            }
         }
 
         // RX bit decode. Each edge with n_slots gap = (n_slots - 1) quiet slots
@@ -1312,6 +1666,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
 
     pio_edge_stop();
 
+    // Mirror mode cleanup: release GP0 back to SIO input so the wire is clean for
+    // the next operation. Without this, SM1 keeps cycling its program after we
+    // return, and GP0 stays under PIO0 funcsel.
+    if mirror_started {
+        pio_tx_mirror_stop();
+    }
+
     let status: u32 = if rising_total == 0 && falling_total == 0 {
         2
     } else if !acquisition_done {
@@ -1361,6 +1722,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
         falling_hist,
         bits_buffer,
         bits_decoded,
+        tx_words_consumed,
     }
 }
 
@@ -1659,7 +2021,9 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             let frac_req = SYNC_FRAC_REQUEST.load(PaOrdering::Relaxed);
             let settle_req = SYNC_SETTLE_REQUEST.load(PaOrdering::Relaxed);
             let p_shift_req = SYNC_P_SHIFT_REQUEST.load(PaOrdering::Relaxed);
-            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req, p_shift_req));
+            let mirror_mode = SYNC_MIRROR_MODE.load(PaOrdering::Relaxed) != 0;
+            let tx_pattern = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
+            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req, p_shift_req, mirror_mode, tx_pattern));
             let iters = result.total_iterations.max(1);
             unsafe {
                 SYNC_RESULT = result;
@@ -2617,6 +2981,123 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // wire bits (LSB = newest), bits_decoded counts total bits since lock.
                 payload.extend_from_slice(&s.bits_buffer.to_le_bytes());
                 payload.extend_from_slice(&s.bits_decoded.to_le_bytes());
+                // Mirror-mode appendix — count of 32-bit TX words pushed into SM1
+                // FIFO during the run (0 outside mirror mode). Backward compatible.
+                payload.extend_from_slice(&s.tx_words_consumed.to_le_bytes());
+                fields.push(("data".to_string(), VsfType::v(b'b', payload)));
+            }
+        }
+        "wire_mirror" => {
+            // Slot-aware mirror-XOR drive: bridge owns host slots, FPGA owns enclave
+            // slots, no CMOS contention. Runs the same fast_sync CDR as wire_sync,
+            // but with mirror_mode=true so SM1 (with the 2-instr side-set program)
+            // gets enabled on the first rising edge after acquisition, and SM1's
+            // CLKDIV is continuously updated from interval_fp_low (rising-edge-anchored
+            // FPGA timing). TX pattern is shifted LSB-first via `out pins, 1`.
+            //
+            // Input layout: max_iter (u32), frac_bits (u32, opt), p_shift (u32, opt),
+            // tx_pattern (u32, opt, hex). Defaults: max_iter=2^25, frac=16, p_shift=8,
+            // tx=AAAAAAAA (alternating bits maintain edge density for CDR feedback).
+            let data_in = cmd
+                .get("data")
+                .ok()
+                .and_then(|vs| vs.first().cloned())
+                .and_then(|v| match v {
+                    VsfType::v(b'b', bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let max_iter = if data_in.len() >= 4 {
+                u32::from_le_bytes([data_in[0], data_in[1], data_in[2], data_in[3]])
+            } else {
+                1u32 << 25
+            };
+            let frac_bits = if data_in.len() >= 8 {
+                u32::from_le_bytes([data_in[4], data_in[5], data_in[6], data_in[7]])
+            } else {
+                SYNC_FRAC_BITS_DEFAULT
+            };
+            let p_shift = if data_in.len() >= 12 {
+                u32::from_le_bytes([data_in[8], data_in[9], data_in[10], data_in[11]])
+            } else {
+                8
+            };
+            let tx_pattern = if data_in.len() >= 16 {
+                u32::from_le_bytes([data_in[12], data_in[13], data_in[14], data_in[15]])
+            } else {
+                0xAAAA_AAAA
+            };
+            let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
+            let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
+            let p_shift = p_shift.min(24);
+
+            SYNC_RESPONSE.store(0, PaOrdering::Relaxed);
+            SYNC_FRAC_REQUEST.store(frac_bits, PaOrdering::Relaxed);
+            SYNC_SETTLE_REQUEST.store(0, PaOrdering::Relaxed);
+            SYNC_P_SHIFT_REQUEST.store(p_shift, PaOrdering::Relaxed);
+            SYNC_MIRROR_MODE.store(1, PaOrdering::Relaxed);
+            TX_MIRROR_PATTERN.store(tx_pattern, PaOrdering::Relaxed);
+            SYNC_REQUEST.store(max_iter, PaOrdering::Release);
+
+            let deadline = Instant::now() + embassy_time::Duration::from_secs(120);
+            while SYNC_RESPONSE.load(PaOrdering::Acquire) == 0 {
+                if Instant::now() > deadline {
+                    break;
+                }
+                cortex_m::asm::nop();
+            }
+
+            // Clear mirror mode flag so subsequent wire_sync calls don't accidentally
+            // run with mirror enabled. The fast_sync function already called
+            // pio_tx_mirror_stop on its way out.
+            SYNC_MIRROR_MODE.store(0, PaOrdering::Relaxed);
+
+            let iters = SYNC_RESPONSE.load(PaOrdering::Relaxed);
+            if iters == 0 {
+                fields.push(("err".to_string(), VsfType::a("sync_timeout".to_string())));
+            } else {
+                // Same payload encoding as wire_sync — host CLI parses both with the
+                // same SyncResult layout, including the tx_words_consumed appendix.
+                let s = unsafe { SYNC_RESULT };
+                let hist_bytes = SYNC_HIST_BINS * 2;
+                let cap = 24 * 4 + 3 * 8 + 2 * hist_bytes + 8 + 4 + 4;
+                let mut payload = alloc::vec::Vec::with_capacity(cap);
+                payload.extend_from_slice(&s.elapsed_us.to_le_bytes());
+                payload.extend_from_slice(&s.total_iterations.to_le_bytes());
+                payload.extend_from_slice(&s.status.to_le_bytes());
+                payload.extend_from_slice(&s.frac_bits.to_le_bytes());
+                payload.extend_from_slice(&s.p_shift.to_le_bytes());
+                payload.extend_from_slice(&s.locked.to_le_bytes());
+                payload.extend_from_slice(&s.edges_to_lock.to_le_bytes());
+                payload.extend_from_slice(&s.acquisition_slot_iter.to_le_bytes());
+                payload.extend_from_slice(&s.final_interval_fp.to_le_bytes());
+                payload.extend_from_slice(&s.acquisition_slot_cyc_rise.to_le_bytes());
+                payload.extend_from_slice(&s.acquisition_slot_cyc_fall.to_le_bytes());
+                payload.extend_from_slice(&s.final_interval_fp_rise.to_le_bytes());
+                payload.extend_from_slice(&s.final_interval_fp_fall.to_le_bytes());
+                payload.extend_from_slice(&s.acquisition_iter_count.to_le_bytes());
+                payload.extend_from_slice(&s.measurement_iter_count.to_le_bytes());
+                payload.extend_from_slice(&s.acq_rising.to_le_bytes());
+                payload.extend_from_slice(&s.acq_falling.to_le_bytes());
+                payload.extend_from_slice(&s.rising_total.to_le_bytes());
+                payload.extend_from_slice(&s.falling_total.to_le_bytes());
+                payload.extend_from_slice(&s.rising_neg_overflow.to_le_bytes());
+                payload.extend_from_slice(&s.rising_pos_overflow.to_le_bytes());
+                payload.extend_from_slice(&s.falling_neg_overflow.to_le_bytes());
+                payload.extend_from_slice(&s.falling_pos_overflow.to_le_bytes());
+                payload.extend_from_slice(&(SYNC_HIST_BINS as u32).to_le_bytes());
+                payload.extend_from_slice(&s.phase_sum.to_le_bytes());
+                payload.extend_from_slice(&s.fall_to_rise_offset_sum.to_le_bytes());
+                payload.extend_from_slice(&s.rise_to_fall_offset_sum.to_le_bytes());
+                for v in &s.rising_hist {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in &s.falling_hist {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                payload.extend_from_slice(&s.bits_buffer.to_le_bytes());
+                payload.extend_from_slice(&s.bits_decoded.to_le_bytes());
+                payload.extend_from_slice(&s.tx_words_consumed.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
