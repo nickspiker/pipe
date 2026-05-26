@@ -1404,6 +1404,21 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         };
         iter += 1;
 
+        // Mirror mode TX FIFO topup — runs FIRST, before any per-edge filter can
+        // `continue` past the bottom-of-loop topup. SM1 consumes 1 OSR bit per
+        // host slot (autopull at 32 → ~1 word per 32 host slots ≈ ~5800 words/sec
+        // at 348 kHz). If we only push on accepted edges, the filter rejection
+        // rate starves SM1's FIFO, SM1 stalls, bridge stops driving, wire goes
+        // silent, no more edges, deadlock. Topping up here keeps drive continuous
+        // regardless of how many subsequent edges get filtered out.
+        // No-op if FIFO is full (pio_tx_try_push returns false).
+        if mirror_started {
+            let pattern = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
+            if pio_tx_try_push(pattern) {
+                tx_words_consumed = tx_words_consumed.saturating_add(1);
+            }
+        }
+
         // Polarity alternation: edge index N (1-based) is rising iff (N XOR initial)
         // is odd. With initial=0 (pin started LOW): edge 1 is rising, edge 2 falling.
         // With initial=1: edge 1 is falling, edge 2 rising. We discarded edge 0 above
@@ -1589,6 +1604,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             }
         }
 
+        // Mirror-mode FULL SKIP for edges the slot-phase + TX-bit filter rejected:
+        // bridge-driven edges during host slots when we drive HIGH (no transition
+        // expected), or unexpected edges during enclave slots (line should be HIGH
+        // from FPGA throughout). These edges aren't FPGA-anchored timing references
+        // — feeding them through cascade / slew / EMA / bit decoder poisons every
+        // downstream measurement. Drop completely; count for diagnostic only.
+        if mirror_started && !accept_for_cdr {
+            if rising { rising_total += 1 } else { falling_total += 1 };
+            continue;
+        }
+
         // Tracking phase. Comparison cascade picks n_slots ∈ {1, 2, 3, 4}: the wire's
         // mirror-XOR-encoded data can leave 1+ slot boundaries without a transition, so
         // own_cyc may be N × slot rather than always 1 × slot. We compute phase_err on
@@ -1694,17 +1720,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             });
         }
 
-        // Mirror mode TX FIFO topup — INDEPENDENT of CDR-accept. SM1 consumes 1 OSR
-        // bit per host slot (autopull at 32 → ~32 host slots per refill). If we
-        // only push on accepted edges, the filter's rejection rate starves SM1 and
-        // it stalls on empty FIFO — bridge stops driving, no more edges, deadlock.
-        // Top up every edge regardless; pio_tx_try_push is no-op if FIFO is full.
-        if mirror_started {
-            let pattern = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
-            if pio_tx_try_push(pattern) {
-                tx_words_consumed = tx_words_consumed.saturating_add(1);
-            }
-        }
+        // (TX FIFO topup now runs at top of loop so early-skip `continue`s
+        // don't starve SM1 — see comment near pio_edge_read_until.)
 
         // RX bit decode. Each edge with n_slots gap = (n_slots - 1) quiet slots
         // (bit 0) followed by this transition slot (bit 1). Shift the buffer left
