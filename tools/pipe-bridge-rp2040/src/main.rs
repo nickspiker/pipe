@@ -400,6 +400,18 @@ struct SyncResult {
     /// real frequency drift over its ~47 ms time constant. Seeded from
     /// acquisition_slot_cyc_period at end of acquisition so it's usable immediately.
     period_ema_slow_fp: u32,
+    /// Phase 2c: bridge-side decode of FPGA's TX bits per Claim 12.
+    /// `fpga_decoded_buffer` is a 32-bit rolling LSB-first accumulator — new bits go
+    /// into the MSB, older bits shift right. With FPGA TX_PATTERN repeating every 32
+    /// slots, the buffer asymptotically equals a rotation of the FPGA's TX_PATTERN
+    /// once enough enclave slots have been observed. Computed per enclave slot as:
+    ///   fpga_bit = OWN_IDLE_FPGA(=1) XOR last_bridge_driven_bit XOR observed_wire_state
+    /// (the inverse of the Claim 12 encoding rule). Mirror mode only; 0 in wire_sync.
+    fpga_decoded_buffer: u32,
+    /// Total enclave slots from which a fpga_bit was decoded this run. With slot rate
+    /// ~22 kHz × ~750 ms wall time, expect tens of thousands; pre-handshake bits are
+    /// all 0 (FPGA in IDLE), post-handshake bits carry TX_PATTERN content.
+    fpga_decoded_count: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -445,6 +457,8 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     period_min: i32::MAX,
     period_max: i32::MIN,
     period_ema_slow_fp: 0,
+    fpga_decoded_buffer: 0,
+    fpga_decoded_count: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1364,6 +1378,22 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut _edges_rejected_mid_slot: u32 = 0;
     let mut _edges_rejected_wrong_polarity: u32 = 0;
     let mut _edges_accepted_in_mirror: u32 = 0;
+    // Phase 2c bridge-side decode (Claim 12 inverse):
+    //   wire_state    = bridge's running view of the wire level (1=HIGH, 0=LOW),
+    //                   updated AFTER each accepted edge with that edge's polarity
+    //   decode_buffer = u32 LSB-first rolling window of FPGA bits decoded so far,
+    //                   shift-right + insert-MSB, so bit 0 of the buffer = oldest
+    //                   bit and bit 31 = newest. After 32+ enclave slots with FPGA
+    //                   in DATA mode, the buffer's value equals a rotation of the
+    //                   FPGA's TX_PATTERN.
+    //   decode_count  = total enclave-slot crossings that produced a decoded bit.
+    // Decode formula: fpga_bit = 1 XOR last_driven_bit XOR wire_at_enclave_slot,
+    // where wire_at_enclave_slot is the wire level steady during the enclave slot
+    // (= post-boundary edge if the current edge IS the boundary, else == prior
+    // wire_state since no edge crossed that boundary).
+    let mut wire_state: u8 = initial as u8;
+    let mut decode_buffer: u32 = 0;
+    let mut decode_count: u32 = 0;
 
     // Edge cap: convert host-provided poll cap to an edge cap. The polling fast_sync
     // does ~15 sys_cyc per iter ≈ 8 MHz, so 16M iters ≈ 2 sec. At 6 kHz edges, that's
@@ -1690,8 +1720,23 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                 // boundary, mirroring real-world edge timing jitter.
                 let new_slots = (cumulative_cyc_since_anchor + slot_cyc / 2) / slot_cyc;
                 let slots_crossed = new_slots.saturating_sub(slots_since_anchor);
-                for _ in 0..slots_crossed {
+                // Wire state for slots crossed by this edge: all earlier boundary
+                // crossings share the PRIOR wire_state (no edge happened at those
+                // boundaries — wire stayed put); only the LAST crossing aligns with
+                // THIS edge, so that slot's wire = post-edge state. `wire_state` is
+                // updated unconditionally at end of per-edge loop (after the filter)
+                // so acquisition-phase edges keep it fresh too — referencing the
+                // PRE-update value inside the loop preserves the "older slot saw
+                // prior wire state" invariant.
+                let new_wire_state: u8 = if rising { 1 } else { 0 };
+                for slot_idx in 0..slots_crossed {
                     slot_phase ^= 1;
+                    let is_boundary_for_this_edge = slot_idx + 1 == slots_crossed;
+                    let wire_at_slot = if is_boundary_for_this_edge {
+                        new_wire_state
+                    } else {
+                        wire_state
+                    };
                     if slot_phase == 1 {
                         // Entering host slot: bridge starts driving the next bit. Mirror
                         // SM1's OSR consumption (1 bit per host slot, LSB-first).
@@ -1703,8 +1748,18 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                             tx_bits_remaining = 32;
                         }
                     } else {
-                        // Entering enclave: the bit bridge WAS driving is now last.
+                        // Entering enclave: the bit bridge WAS driving in the prior host
+                        // slot is now `last_driven_bit` (used by both the polarity-filter
+                        // below and our decode below).
                         last_driven_bit = current_tx_bit;
+                        // Phase 2c decode: derive the FPGA's TX bit for this enclave slot
+                        // from observed wire state. enclave_drive = 1 ^ fpga_bit ^
+                        // bridge_last_decoded; bridge knows it drove `last_driven_bit` in
+                        // the prior host slot (= what FPGA decoded). Invert:
+                        let fpga_bit: u8 = 1 ^ last_driven_bit ^ wire_at_slot;
+                        decode_buffer = (decode_buffer >> 1)
+                            | (((fpga_bit & 1) as u32) << 31);
+                        decode_count = decode_count.saturating_add(1);
                     }
                 }
                 slots_since_anchor = new_slots;
@@ -1737,6 +1792,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                 }
             }
         }
+
+        // wire_state update happens UNCONDITIONALLY on every edge, including during
+        // acquisition (mirror_started=false) and including filter-rejected edges. The
+        // wire physically transitioned at this edge regardless of whether we accept
+        // it for CDR — failing to update would leave a stale value that poisons the
+        // Phase 2c decode at the next accepted enclave-slot crossing.
+        wire_state = if rising { 1 } else { 0 };
 
         // Mirror-mode FULL SKIP for edges the slot-phase + TX-bit filter rejected:
         // bridge-driven edges during host slots when we drive HIGH (no transition
@@ -2136,6 +2198,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             };
             scaled as u32
         },
+        fpga_decoded_buffer: decode_buffer,
+        fpga_decoded_count: decode_count,
     }
 }
 
@@ -3440,6 +3504,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // Slow EMA appendix — u32 fp value, same frac_bits scaling. The
                 // long-term-stable prediction for the wire period.
                 payload.extend_from_slice(&s.period_ema_slow_fp.to_le_bytes());
+                // Phase 2c decode appendix — u32 LSB-first rolling buffer of FPGA
+                // bits decoded per Claim 12 inverse, u32 cumulative count of enclave
+                // slots that contributed. Both are 0 outside mirror mode.
+                payload.extend_from_slice(&s.fpga_decoded_buffer.to_le_bytes());
+                payload.extend_from_slice(&s.fpga_decoded_count.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3591,6 +3660,14 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.period_sample_count.to_le_bytes());
                 payload.extend_from_slice(&s.period_min.to_le_bytes());
                 payload.extend_from_slice(&s.period_max.to_le_bytes());
+                // Slow EMA appendix — u32 fp value, same frac_bits scaling. Matches
+                // wire_sync's appendix layout; previously absent from wire_mirror's
+                // payload (drift), now in lockstep.
+                payload.extend_from_slice(&s.period_ema_slow_fp.to_le_bytes());
+                // Phase 2c decode appendix — u32 rolling buffer of FPGA bits decoded
+                // per Claim 12 inverse, u32 enclave-slot count. Both 0 in wire_sync.
+                payload.extend_from_slice(&s.fpga_decoded_buffer.to_le_bytes());
+                payload.extend_from_slice(&s.fpga_decoded_count.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

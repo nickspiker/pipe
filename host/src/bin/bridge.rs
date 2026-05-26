@@ -756,6 +756,13 @@ struct SyncResultParsed {
     /// period estimate — use it (not the live P-controller output) as the
     /// "predicted period at start of silence" for silence-budget calculations.
     period_ema_slow_fp: u32,
+    /// Phase 2c: bridge-side decode of FPGA's TX bits. Rolling LSB-first u32 buffer
+    /// of FPGA bits decoded per Claim 12 inverse. After 32+ enclave-slot crossings
+    /// with FPGA in DATA mode, equals a rotation of the FPGA's TX_PATTERN. In wire_sync
+    /// or pre-handshake mirror runs, expect 0 (FPGA stays in IDLE → drives 0).
+    fpga_decoded_buffer: u32,
+    /// Total enclave-slot crossings that decoded a bit (mirror mode only; 0 in wire_sync).
+    fpga_decoded_count: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -936,6 +943,14 @@ fn run_wire_sync_full(
     let period_ema_slow_fp = if data.len() >= slow_ema_off + 4 {
         g32(slow_ema_off)
     } else { 0 };
+    // Phase 2c decode appendix: u32 LSB-first FPGA decode buffer + u32 enclave-slot
+    // count. Backward compatible — wire_sync's payload doesn't include them (this is
+    // the wire_mirror appendix), and older firmware that doesn't surface them returns
+    // a shorter payload → both fields default to 0.
+    let decode_off = slow_ema_off + 4;
+    let (fpga_decoded_buffer, fpga_decoded_count) = if data.len() >= decode_off + 8 {
+        (g32(decode_off), g32(decode_off + 4))
+    } else { (0, 0) };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -977,6 +992,8 @@ fn run_wire_sync_full(
         period_min,
         period_max,
         period_ema_slow_fp,
+        fpga_decoded_buffer,
+        fpga_decoded_count,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1199,6 +1216,27 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         let pct = 100.0 * popcount as f64 / valid as f64;
         println!("  bit decode:  {} total bits since lock; last {} = G#{:016X} (popcount {} = {:.1}% ones)",
             r.bits_decoded, valid, visible, popcount, pct);
+    }
+    if r.fpga_decoded_count > 0 {
+        // Phase 2c: bridge-side decode of FPGA's Claim 12 TX bits. The buffer is a
+        // rolling 32-bit LSB-first window; once 32+ enclave slots have passed in
+        // FPGA DATA mode, the buffer value equals a rotation of TX_PATTERN. Print
+        // both the raw u32 (hex) and the bit string (LSB-first, MSB-first) so the
+        // user can match against the FPGA bitstream's TX_PATTERN parameter.
+        let buf = r.fpga_decoded_buffer;
+        let popcount = buf.count_ones();
+        let pct = 100.0 * popcount as f64 / 32.0;
+        println!("  FPGA decode: {} enclave slots; last 32 bits = G#{:08X} (popcount {} = {:.1}% ones)",
+            r.fpga_decoded_count, buf, popcount, pct);
+        // Rotation-matching helper: if TX_PATTERN was AAAAAAAA, any 32-bit window
+        // that captured a full cycle decodes to a rotation of 0xAAAAAAAA. Show all
+        // 32 rotations of the FPGA-bitstream default so the user can spot a match.
+        // (Compact: just flag whether buf matches any rotation of AAAAAAAA.)
+        let target: u32 = 0xAAAA_AAAA;
+        let matches_default = (0..32).any(|k| buf == target.rotate_left(k));
+        if matches_default {
+            println!("    → matches a rotation of 0xAAAAAAAA (FPGA bitstream default TX_PATTERN)");
+        }
     }
     if r.period_sample_count > 0 {
         let avg_cyc = r.period_sum as f64 / r.period_sample_count as f64;
@@ -1868,6 +1906,14 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
     } else {
         Vec::new()
     };
+    // Phase 2c decode appendix at the tail. Layout from firmware:
+    // [period_sum i64 @ +104][period_sample_count u32 @ +112][period_min i32 @ +116]
+    // [period_max i32 @ +120][period_ema_slow_fp u32 @ +124]
+    // [fpga_decoded_buffer u32 @ +128][fpga_decoded_count u32 @ +132]
+    let decode_off = appendix_off + 36 + PERIOD_HIST_BINS * 4 + 24;
+    let (fpga_decoded_buffer, fpga_decoded_count) = if data.len() >= decode_off + 8 {
+        (g32(decode_off), g32(decode_off + 4))
+    } else { (0, 0) };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -1931,6 +1977,29 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         println!("  PERIOD:      seed {} cyc   final {:.4} cyc   drift {:+.4} cyc ({:+.1} ppm)   silence budget: ±61 ppm",
             period_seed_cyc, period_final_cyc, drift, drift_ppm);
         println!("  P-EMA period: {:+} cyc (threshold ±16; |EMA|≤16 means locked)", period_ema);
+    }
+    if fpga_decoded_count > 0 {
+        // Phase 2c: bridge's inverse-Claim-12 decode of FPGA's TX bits. Rolling
+        // 32-bit LSB-first window — after 32+ enclave slots in FPGA DATA mode the
+        // value equals a rotation of the FPGA's TX_PATTERN parameter.
+        let popcount = fpga_decoded_buffer.count_ones();
+        let pct = 100.0 * popcount as f64 / 32.0;
+        println!();
+        println!("  FPGA decode: {} enclave slots; last 32 bits = G#{:08X} (popcount {} = {:.1}% ones)",
+            fpga_decoded_count, fpga_decoded_buffer, popcount, pct);
+        // Quick spot-check against the FPGA bitstream's default TX_PATTERN.
+        let target: u32 = 0xAAAA_AAAA;
+        let matches_default = (0..32).any(|k| fpga_decoded_buffer == target.rotate_left(k));
+        if matches_default {
+            println!("    → matches a rotation of 0xAAAAAAAA (FPGA bitstream default TX_PATTERN)");
+        } else {
+            // Show all 4 byte-rotations to make visual scan easier.
+            println!("    (rotations: G#{:08X} G#{:08X} G#{:08X} G#{:08X})",
+                fpga_decoded_buffer.rotate_left(8),
+                fpga_decoded_buffer.rotate_left(16),
+                fpga_decoded_buffer.rotate_left(24),
+                fpga_decoded_buffer);
+        }
     }
     print_period_hist(&period_hist, period_seed_cyc);
 

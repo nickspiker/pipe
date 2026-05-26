@@ -28,10 +28,19 @@
 //
 // Handshake detection (Claim 7b):
 //   At the same sample point, if wire_in is 1 and data_mode is 0, set
-//   data_mode <= 1 permanently (until power-on reset). Bridge initiates by
-//   driving its first non-idle bit; the wire transition is what we detect.
-//   data_mode latches to 1 forever once seen — no clear, no timeout. Power
-//   cycle to return to IDLE for fresh acquisition.
+//   data_mode <= 1. Bridge initiates by driving its first non-idle bit; the
+//   wire transition is what we detect.
+//
+// Data-mode auto-clear:
+//   data_mode resets back to 0 after IDLE_CLEAR_SLOTS consecutive host slots
+//   in which bridge_last_decoded sampled 0 (= bridge has gone silent for that
+//   long). For random uniform data, P(64 consecutive 0s) ≈ 2⁻⁶⁴ ≈ never, so
+//   real data traffic never triggers. Only a truly silent bridge (handshake
+//   ended, or transient pause longer than the threshold) returns FPGA to
+//   IDLE. Counter resets on any observed 1, so even sparse 1s in data hold
+//   data_mode high. The auto-clear is what makes back-to-back wire_mirror
+//   tests work without a reprogram — the protocol's idle envelope per Claim
+//   7a naturally provides the reset condition.
 //
 // TX bit advance: fpga_tx_reg rotates right by 1 on every host→enclave
 // transition (slot_owner 1→0), so each enclave slot encodes the next LSB-first
@@ -223,11 +232,21 @@ module top_pipe_mirror_xor #(
     // 1^1^0 = 0 LOW (release). Bridge sees HIGH-LOW-LOW-LOW-HIGH-LOW-LOW-LOW...
     // = a 4-slot-periodic edge pattern. cascade=1 (n=2 unfold) locks naturally.
     // -------------------------------------------------------------------------
-    reg [31:0] fpga_tx_reg = TX_PATTERN;
-    reg        data_mode = 1'b0;                  // Claim 7b: 0 = IDLE (force own_data=0), 1 = DATA (use fpga_tx_reg[0])
-    wire       effective_fpga_tx_bit = data_mode ? fpga_tx_reg[0] : 1'b0;
-    reg        bridge_last_decoded = 1'b0;        // sampled mid-host-slot; idle host = 0
-    reg        prev_slot_owner = 1'b0;
+    // Auto-clear threshold: how many consecutive bridge-silent host slots before
+    // FPGA returns to IDLE. 4096 slots × ~23 µs = ~94 ms; longer than any current
+    // test run, so a single handshake holds DATA mode for the entire run. Real
+    // protocol traffic with mixed 0/1 bits keeps the counter mostly reset, so the
+    // 94 ms ceiling only matters when the bridge has truly gone silent (handshake
+    // complete or transmission ended). Power-of-2 sized counter ($clog2(4096)=12).
+    localparam integer IDLE_CLEAR_SLOTS = 4096;
+    localparam integer IDLE_CLEAR_W     = $clog2(IDLE_CLEAR_SLOTS);
+
+    reg [31:0]              fpga_tx_reg = TX_PATTERN;
+    reg                     data_mode = 1'b0;     // Claim 7b: 0 = IDLE (force own_data=0), 1 = DATA (use fpga_tx_reg[0])
+    wire                    effective_fpga_tx_bit = data_mode ? fpga_tx_reg[0] : 1'b0;
+    reg                     bridge_last_decoded = 1'b0;        // sampled mid-host-slot; idle host = 0
+    reg                     prev_slot_owner = 1'b0;
+    reg [IDLE_CLEAR_W-1:0]  silent_slot_cnt = 0;  // consecutive host slots with bridge_last_decoded=0
 
     wire wire_in_sync;                            // wire_in from wire_io's 2-FF synchroniser
     wire enclave_drive_value = 1'b1 ^ effective_fpga_tx_bit ^ bridge_last_decoded;
@@ -236,11 +255,21 @@ module top_pipe_mirror_xor #(
     always @(posedge enclave_clk) begin
         prev_slot_owner <= slot_owner;
         // host slot mid-sample → latch bridge's drive value as our decoded bit
-        // AND check Claim 7b handshake: bridge driving 1 in idle = data-mode kick-off
+        // AND check Claim 7b handshake / auto-clear conditions:
+        //   bridge sent 1  → kick into DATA mode (or stay), reset silent count
+        //   bridge sent 0  → increment silent count; if it saturates, drop to IDLE
         if (slot_owner == 1'b1 && slot_phase == 2'd2) begin
             bridge_last_decoded <= wire_in_sync;
-            if (wire_in_sync == 1'b1 && data_mode == 1'b0) begin
-                data_mode <= 1'b1;
+            if (wire_in_sync == 1'b1) begin
+                data_mode       <= 1'b1;
+                silent_slot_cnt <= 0;
+            end else begin
+                if (silent_slot_cnt == IDLE_CLEAR_SLOTS - 1) begin
+                    data_mode       <= 1'b0;
+                    silent_slot_cnt <= 0;
+                end else begin
+                    silent_slot_cnt <= silent_slot_cnt + 1'b1;
+                end
             end
         end
         // host→enclave transition → consume next TX bit (rotate right). Rotation
