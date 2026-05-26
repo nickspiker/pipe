@@ -270,6 +270,18 @@ const SYNC_LOCK_EMA_THRESHOLD_CYC: i32 = 16;
 const SYNC_LOCK_THRESHOLD_CYC: i32 = 8;
 const SYNC_LOCK_HOLD_EDGES: u32 = 256;
 
+/// Per-edge slew magnitude limit, in 1/N-of-seed units. Each slew (computed as
+/// `phase_err << (frac_bits - p_shift)` in fp units) is clamped to
+/// ±(seed_fp / SYNC_SLEW_CLAMP_DENOM) BEFORE being added to `interval_fp_*`.
+/// With DENOM=1000, max correction per edge ≈ 0.1% of seed (~5.7 cyc on a
+/// 5730-cyc seed). Real ring-osc drift is ~0.3 ppm/sec, so the clamp gives
+/// ~5000× headroom for legitimate drift while structurally blocking a single
+/// misclassified edge from yanking the loop to the ±30% sanity floor (where it
+/// would stick and reinforce wrong-fixed-point lock via the slot-phase filter).
+/// The destination ±30% window (seed-relative) remains in place as the ultimate
+/// safety net — clamp + window = defense in depth.
+const SYNC_SLEW_CLAMP_DENOM: u32 = 1000;
+
 /// Slow EMA on `period_now` for silence-budget prediction. The fast P-controller
 /// (interval_fp_period) tracks instantaneous drift edge-by-edge so it has ±1-2 cyc
 /// steady-state ringing; the slow EMA averages per-sample noise out over ~1024
@@ -1436,6 +1448,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     // signed values. Seeded from acquisition's period seed once acquisition completes
     // (see acquisition-done block); 0 until then.
     let mut period_ema_slow_scaled: i64 = 0;
+    // Slew-clamp activation counters (diagnostic only, kept local). Each bumps
+    // when raw_slew exceeded ±max_slew at that tracker — high rates mean the
+    // loop is being protected from glitches; near-zero rates mean clamp is
+    // never engaging (loop running smoothly OR clamp is too loose).
+    let mut _slew_clamp_hits_period: u32 = 0;
+    let mut _slew_clamp_hits_rise: u32 = 0;
+    let mut _slew_clamp_hits_fall: u32 = 0;
 
     let mut rising_total: u32 = 0;
     let mut falling_total: u32 = 0;
@@ -1786,14 +1805,21 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                     let expected = n_periods * period_slot;
                     let phase_err_period = period_now - expected;
                     let shift = frac_bits as i32 - p_shift as i32;
-                    let slew = if shift >= 0 {
+                    let raw_slew = if shift >= 0 {
                         phase_err_period << shift
                     } else {
                         phase_err_period >> -shift
                     };
+                    // Per-edge slew magnitude clamp (see SYNC_SLEW_CLAMP_DENOM doc).
+                    // Prevents a single misclassified or glitch edge from yanking
+                    // interval_fp_period to the ±30% sanity floor where it would
+                    // get pinned by the slot-phase filter's wrong-fixed-point lock.
+                    let seed_fp = (acquisition_slot_cyc_period as u64) << frac_bits;
+                    let max_slew = (seed_fp / SYNC_SLEW_CLAMP_DENOM as u64).min(i32::MAX as u64) as i32;
+                    let slew = raw_slew.clamp(-max_slew, max_slew);
+                    if raw_slew != slew { _slew_clamp_hits_period += 1; }
                     let new_fp = interval_fp_period.wrapping_add_signed(slew);
                     // Sanity window: keep period within ±30% of acquisition seed.
-                    let seed_fp = (acquisition_slot_cyc_period as u64) << frac_bits;
                     let min_fp = ((seed_fp * 7 / 10) as u32).max(1u32 << frac_bits);
                     let max_fp = (seed_fp * 13 / 10).min(u32::MAX as u64) as u32;
                     if new_fp >= min_fp && new_fp <= max_fp {
@@ -1879,7 +1905,18 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // timing, and risk positive-feedback drift). Filter at this point — accept the
         // edge only if it doesn't coincide with a known own-TX transition.
         let shift = frac_bits as i32 - p_shift as i32;
-        let slew = if shift >= 0 { phase_err << shift } else { phase_err >> -shift };
+        let raw_slew = if shift >= 0 { phase_err << shift } else { phase_err >> -shift };
+        // Per-edge slew magnitude clamp (per-polarity). Uses the seed of the
+        // current polarity (low for rising, high for falling) as the reference,
+        // matching the per-polarity ±30% sanity window below. See
+        // SYNC_SLEW_CLAMP_DENOM doc for rationale.
+        let polarity_seed_cyc = if rising { acquisition_slot_cyc_low } else { acquisition_slot_cyc_high };
+        let polarity_seed_fp = (polarity_seed_cyc as u64) << frac_bits;
+        let max_slew = (polarity_seed_fp / SYNC_SLEW_CLAMP_DENOM as u64).min(i32::MAX as u64) as i32;
+        let slew = raw_slew.clamp(-max_slew, max_slew);
+        if raw_slew != slew {
+            if rising { _slew_clamp_hits_rise += 1 } else { _slew_clamp_hits_fall += 1 };
+        }
         let new_fp = interval_fp_self.wrapping_add_signed(slew);
         // Only feed CDR with edges that passed the slot-phase + TX-bit filter.
         // accept_for_cdr is always true outside mirror mode.
@@ -1892,12 +1929,12 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             // the loop pure: only plausible edges contribute to slot estimate.
             // Ring-osc drift is well under 1000 ppm/sec so ±30% is generous slack for
             // legitimate frequency wander while structurally rejecting noise.
-            let (seed_cyc, target_fp_mut): (u32, &mut u32) = if rising {
-                (acquisition_slot_cyc_low, &mut interval_fp_low)
+            let target_fp_mut: &mut u32 = if rising {
+                &mut interval_fp_low
             } else {
-                (acquisition_slot_cyc_high, &mut interval_fp_high)
+                &mut interval_fp_high
             };
-            let seed_fp = (seed_cyc as u64) << frac_bits;
+            let seed_fp = polarity_seed_fp;
             let min_fp = ((seed_fp * 7 / 10) as u32).max(1u32 << frac_bits);
             let max_fp = (seed_fp * 13 / 10).min(u32::MAX as u64) as u32;
             if new_fp >= min_fp && new_fp <= max_fp {
