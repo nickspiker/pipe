@@ -270,6 +270,14 @@ const SYNC_LOCK_EMA_THRESHOLD_CYC: i32 = 16;
 const SYNC_LOCK_THRESHOLD_CYC: i32 = 8;
 const SYNC_LOCK_HOLD_EDGES: u32 = 256;
 
+/// Period-tracker diagnostic histogram. 17 bins of width = seed/8 covering [0, 2×seed)
+/// with bin 16 catching ≥2×seed as overflow. Bin 8 is the seed bin; bin 4 sits at
+/// seed/2 (the "missed-edge" suspect — a dropped rising means the next rising's
+/// own_cyc spans only one polarity instead of two, so period_now reads ≈ seed/2).
+/// A clean lock shows mass piled in bin 8 with empty neighbours; missed edges show
+/// a bimodal spike at bin 4 and bin 8; RC ringing shows a continuous low-side tail.
+const PERIOD_HIST_BINS: usize = 17;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SyncResult {
@@ -349,6 +357,22 @@ struct SyncResult {
     acquisition_slot_cyc_period: u32,
     final_interval_fp_period: u32,
     phase_err_ema_period: i32,
+    /// Histogram of `period_now` (rising-to-rising interval, raw cyc) sampled BEFORE
+    /// the cascade window check — so rejected glitches and missed-edge artefacts
+    /// are visible. Bin width = seed/8. See PERIOD_HIST_BINS doc comment for the
+    /// shape-interpretation guide.
+    period_hist: [u32; PERIOD_HIST_BINS],
+    /// Signed sum of every `period_now` value that fed `period_hist`, in cyc. Lets
+    /// the host cross-check the histogram: `period_sum × 8 ns` should equal the
+    /// total tracking-phase elapsed time. If it doesn't, the histogram is dropping
+    /// samples or measuring the wrong thing.
+    period_sum: i64,
+    period_sample_count: u32,
+    /// Min and max `period_now` value observed (cyc). Together with the sum and
+    /// count this fully constrains the distribution shape — if min is near 0 but
+    /// max ≫ seed, the wire is bimodal; if min ≈ max ≈ seed, lock is perfect.
+    period_min: i32,
+    period_max: i32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -388,6 +412,11 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     acquisition_slot_cyc_period: 0,
     final_interval_fp_period: 0,
     phase_err_ema_period: 0,
+    period_hist: [0; PERIOD_HIST_BINS],
+    period_sum: 0,
+    period_sample_count: 0,
+    period_min: i32::MAX,
+    period_max: i32::MIN,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1377,6 +1406,14 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut interval_fp_period: u32 = 0;
     let mut acquisition_slot_cyc_period: u32 = 0;
     let mut have_prev_own_cyc: bool = false;
+    // See PERIOD_HIST_BINS for shape interpretation. Filled in the period block before
+    // the cascade window check so we observe every rising-to-rising sample, including
+    // ones the window rejects.
+    let mut period_hist: [u32; PERIOD_HIST_BINS] = [0; PERIOD_HIST_BINS];
+    let mut period_sum_local: i64 = 0;
+    let mut period_sample_count_local: u32 = 0;
+    let mut period_min_local: i32 = i32::MAX;
+    let mut period_max_local: i32 = i32::MIN;
 
     let mut rising_total: u32 = 0;
     let mut falling_total: u32 = 0;
@@ -1664,6 +1701,23 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // tracker — they just record their own_cyc for the next rising to consume.
         if rising && have_prev_own_cyc {
             let period_now = own_cyc.wrapping_add(prev_own_cyc);
+            // Diagnostic histogram, sampled BEFORE the cascade window check.
+            // bin = period_now * 8 / seed, clamped at PERIOD_HIST_BINS-1 (= overflow).
+            // Bin 8 = seed, bin 4 = seed/2 (missed-edge suspect), bin 16 = ≥2×seed.
+            // NOTE: we accept ALL period_now values (including negative — indicating a
+            // huge own_cyc cast to negative i32) into sum/count/min/max so the host can
+            // cross-check `period_sum × 8 ns ≟ wall-time`. The binning step itself still
+            // gates on period_now >= 0 because the bin math doesn't accept negatives.
+            period_sum_local = period_sum_local.wrapping_add(period_now as i64);
+            period_sample_count_local = period_sample_count_local.saturating_add(1);
+            if period_now < period_min_local { period_min_local = period_now; }
+            if period_now > period_max_local { period_max_local = period_now; }
+            let seed_cyc = acquisition_slot_cyc_period;
+            if seed_cyc > 0 && period_now >= 0 {
+                let bin = ((period_now as u64 * 8) / seed_cyc as u64) as usize;
+                let bin = bin.min(PERIOD_HIST_BINS - 1);
+                period_hist[bin] = period_hist[bin].saturating_add(1);
+            }
             let period_slot = (interval_fp_period >> frac_bits) as i32;
             if period_slot >= 16 {
                 let half_period = period_slot / 2;
@@ -1973,6 +2027,11 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         acquisition_slot_cyc_period,
         final_interval_fp_period: interval_fp_period,
         phase_err_ema_period: phase_err_ema_period_scaled >> SYNC_LOCK_EMA_SHIFT,
+        period_hist,
+        period_sum: period_sum_local,
+        period_sample_count: period_sample_count_local,
+        period_min: period_min_local,
+        period_max: period_max_local,
     }
 }
 
@@ -3264,6 +3323,16 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.acquisition_slot_cyc_period.to_le_bytes());
                 payload.extend_from_slice(&s.final_interval_fp_period.to_le_bytes());
                 payload.extend_from_slice(&s.phase_err_ema_period.to_le_bytes());
+                // PERIOD histogram appendix — 17 × u32, see PERIOD_HIST_BINS.
+                // Backward compatible (old parsers stop after phase_err_ema_period).
+                for v in &s.period_hist {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                // PERIOD sanity-check appendix — i64 sum, u32 count, i32 min, i32 max.
+                payload.extend_from_slice(&s.period_sum.to_le_bytes());
+                payload.extend_from_slice(&s.period_sample_count.to_le_bytes());
+                payload.extend_from_slice(&s.period_min.to_le_bytes());
+                payload.extend_from_slice(&s.period_max.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3394,6 +3463,16 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.acquisition_slot_cyc_period.to_le_bytes());
                 payload.extend_from_slice(&s.final_interval_fp_period.to_le_bytes());
                 payload.extend_from_slice(&s.phase_err_ema_period.to_le_bytes());
+                // PERIOD histogram appendix — 17 × u32, see PERIOD_HIST_BINS.
+                for v in &s.period_hist {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                // PERIOD sanity-check appendix — i64 sum, u32 count, i32 min, i32 max.
+                // Lets the host verify `period_sum × 8 ns ≟ tracking-phase wall time`.
+                payload.extend_from_slice(&s.period_sum.to_le_bytes());
+                payload.extend_from_slice(&s.period_sample_count.to_le_bytes());
+                payload.extend_from_slice(&s.period_min.to_le_bytes());
+                payload.extend_from_slice(&s.period_max.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

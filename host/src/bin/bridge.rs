@@ -739,6 +739,18 @@ struct SyncResultParsed {
     acquisition_slot_cyc_period: u32,
     final_interval_fp_period: u32,
     phase_err_ema_period: i32,
+    /// Period diagnostic histogram. 17 bins of width = seed/8 covering [0, 2×seed).
+    /// Bin 8 = seed, bin 4 = seed/2 (missed-edge suspect), bin 16 = ≥2×seed overflow.
+    /// Sampled BEFORE the cascade window check so glitches are visible. Empty Vec
+    /// on firmware that predates the appendix.
+    period_hist: Vec<u32>,
+    /// PERIOD sanity-check: sum of every period_now value that contributed to the
+    /// histogram, plus count + min + max. `period_sum × 8 ns` should equal the
+    /// tracking-phase wall time; if not, the histogram is missing samples.
+    period_sum: i64,
+    period_sample_count: u32,
+    period_min: i32,
+    period_max: i32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -894,6 +906,26 @@ fn run_wire_sync_full(
         } else {
             (0, 0, 0)
         };
+    // Period histogram appendix: 17 × u32 immediately after phase_err_ema_period.
+    // Layout must match firmware PERIOD_HIST_BINS constant.
+    const PERIOD_HIST_BINS: usize = 17;
+    let period_hist_off = appendix_off + 36;
+    let period_hist: Vec<u32> = if data.len() >= period_hist_off + PERIOD_HIST_BINS * 4 {
+        (0..PERIOD_HIST_BINS).map(|i| g32(period_hist_off + i * 4)).collect()
+    } else {
+        Vec::new()
+    };
+    // PERIOD sanity-check appendix: i64 sum + u32 count + i32 min + i32 max.
+    let sanity_off = period_hist_off + PERIOD_HIST_BINS * 4;
+    let (period_sum, period_sample_count, period_min, period_max) = if data.len() >= sanity_off + 20 {
+        let sum = gi64(sanity_off);
+        let count = g32(sanity_off + 8);
+        let mn = i32::from_le_bytes([data[sanity_off+12], data[sanity_off+13], data[sanity_off+14], data[sanity_off+15]]);
+        let mx = i32::from_le_bytes([data[sanity_off+16], data[sanity_off+17], data[sanity_off+18], data[sanity_off+19]]);
+        (sum, count, mn, mx)
+    } else {
+        (0, 0, 0, 0)
+    };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -929,11 +961,53 @@ fn run_wire_sync_full(
         acquisition_slot_cyc_period,
         final_interval_fp_period,
         phase_err_ema_period,
+        period_hist,
+        period_sum,
+        period_sample_count,
+        period_min,
+        period_max,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
         falling_hist,
     })
+}
+
+/// Print the period diagnostic histogram. Reads the shape:
+/// - tight pile at bin 8 alone → clean lock
+/// - bimodal at bin 4 AND bin 8 → missed-edge artefacts (one rising lost merges two periods)
+/// - continuous low-side tail (bins 1..7) → RC ringing / false transitions on shoulders
+/// - mass at bin 16 (overflow) → long silence runs or dropped runs of edges
+fn print_period_hist(hist: &[u32], seed_cyc: u32) {
+    if hist.is_empty() || seed_cyc == 0 {
+        return;
+    }
+    let bin_width = seed_cyc / 8;
+    if bin_width == 0 {
+        return;
+    }
+    let total: u64 = hist.iter().map(|&c| c as u64).sum();
+    let max = hist.iter().copied().max().unwrap_or(0).max(1);
+    let n = hist.len();
+    println!();
+    println!("  PERIOD histogram ({} samples, bin width = seed/8 = {} cyc; bin 8 = seed {} cyc):",
+        total, bin_width, seed_cyc);
+    for (i, &count) in hist.iter().enumerate() {
+        let range = if i + 1 == n {
+            format!(">={:5} cyc       ", i as u32 * bin_width)
+        } else {
+            format!("{:5}..{:5} cyc   ", i as u32 * bin_width, (i as u32 + 1) * bin_width)
+        };
+        let bar_len = (count as u64 * 40 / max as u64) as usize;
+        let bar: String = core::iter::repeat('#').take(bar_len).collect();
+        let marker = match i {
+            4 => "  ← seed/2 (missed-edge suspect)",
+            8 => "  ← seed",
+            _ if i + 1 == n => "  ← ≥2×seed overflow",
+            _ => "",
+        };
+        println!("    bin {:02} [{}]: {:8} {}{}", i, range, count, bar, marker);
+    }
 }
 
 fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
@@ -1063,6 +1137,20 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         period_drift_cyc, period_drift_ppm, silence_budget_ppm);
     println!("  P-EMA final: period {:+5} cyc (active lock signal)   rise {:+5} cyc   fall {:+5} cyc   (threshold ±16)",
         r.phase_err_ema_period, r.phase_err_ema_rise, r.phase_err_ema_fall);
+    if r.period_sample_count > 0 {
+        let avg_cyc = r.period_sum as f64 / r.period_sample_count as f64;
+        let sum_ns = r.period_sum as f64 * NS_PER_CYC;
+        let elapsed_ns = elapsed_us as f64 * 1000.0;
+        let ratio = if elapsed_ns > 0.0 { sum_ns / elapsed_ns } else { 0.0 };
+        println!("  PERIOD sanity: sum {} cyc = {:.3} ms over {} samples (avg {:.1} cyc); wall-time {:.3} ms; ratio {:.3}",
+            r.period_sum, sum_ns / 1e6, r.period_sample_count, avg_cyc,
+            elapsed_ns / 1e6, ratio);
+        println!("                 min {} cyc / max {} cyc (= {:.0} ns / {:.0} ns)",
+            r.period_min, r.period_max,
+            r.period_min as f64 * NS_PER_CYC,
+            r.period_max as f64 * NS_PER_CYC);
+    }
+    print_period_hist(&r.period_hist, r.acquisition_slot_cyc_period);
 
     if total_edges == 0 {
         println!("  no tracking edges — increase MAX_ITER or check wire");
@@ -1678,6 +1766,23 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
     } else {
         0
     };
+    // PERIOD appendix (3 × 4 bytes after EMA pair) + histogram (17 × 4 bytes).
+    // Layout: [bits_buffer u64][bits_decoded u32][tx_words u32][ema_rise i32]
+    //         [ema_fall i32][period_seed u32][period_fp u32][period_ema i32][hist 17×u32]
+    let period_seed_cyc = if data.len() >= appendix_off + 28 { g32(appendix_off + 24) } else { 0 };
+    let period_final_fp = if data.len() >= appendix_off + 32 { g32(appendix_off + 28) } else { 0 };
+    let period_ema = if data.len() >= appendix_off + 36 {
+        i32::from_le_bytes([
+            data[appendix_off + 32], data[appendix_off + 33],
+            data[appendix_off + 34], data[appendix_off + 35],
+        ])
+    } else { 0 };
+    const PERIOD_HIST_BINS: usize = 17;
+    let period_hist: Vec<u32> = if data.len() >= appendix_off + 36 + PERIOD_HIST_BINS * 4 {
+        (0..PERIOD_HIST_BINS).map(|i| g32(appendix_off + 36 + i * 4)).collect()
+    } else {
+        Vec::new()
+    };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -1718,6 +1823,16 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         let words_per_k_edge = tx_words_consumed as f64 / (rising_total as f64 / 1000.0);
         println!("  TX words / 1000 rising edges: {:.2}  (~1000 expected — one push per rising edge in mirror mode, only when FIFO not full)", words_per_k_edge);
     }
+    if period_seed_cyc > 0 {
+        let period_final_cyc = period_final_fp as f64 / fp_scale;
+        let drift = period_final_cyc - period_seed_cyc as f64;
+        let drift_ppm = 1e6 * drift / period_seed_cyc as f64;
+        println!();
+        println!("  PERIOD:      seed {} cyc   final {:.4} cyc   drift {:+.4} cyc ({:+.1} ppm)   silence budget: ±61 ppm",
+            period_seed_cyc, period_final_cyc, drift, drift_ppm);
+        println!("  P-EMA period: {:+} cyc (threshold ±16; |EMA|≤16 means locked)", period_ema);
+    }
+    print_period_hist(&period_hist, period_seed_cyc);
 
     Ok(())
 }
