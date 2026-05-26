@@ -101,6 +101,7 @@ fn main() -> ExitCode {
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
         "wire_bits" => cmd_wire_bits(&port_path, cmd_args),
         "wire_loopback" => cmd_wire_loopback(&port_path, cmd_args),
+        "wire_tx_diag" => cmd_wire_tx_diag(&port_path),
         "tune_p" => cmd_tune_p(&port_path, cmd_args),
         "wire_decode" => cmd_wire_decode(&port_path, cmd_args),
         "bootsel" => cmd_action(&port_path, "bootsel"),
@@ -1254,6 +1255,50 @@ fn cmd_wire_loopback(port_path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `wire_tx_diag` — fires PIO TX with pattern G#AAAAAAAA and polls GP0 directly via
+/// SIO (not PIO RX) to count actual pad transitions. Used to diagnose why
+/// wire_loopback isn't capturing edges: if transitions==0, the pin isn't physically
+/// toggling and the problem is in PIO TX config / pad enable. If transitions>0 but
+/// wire_loopback fails, the issue is in PIO RX or the loopback handler.
+fn cmd_wire_tx_diag(port_path: &str) -> Result<(), String> {
+    let (resp, _rtt) = send_cmd(port_path, "wire_tx_diag", 42, vec![])?;
+    let section = parse_resp(&resp)?;
+    let data = section.get("data").map_err(|e| format!("missing data: {e}"))?
+        .first().and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        }).ok_or_else(|| "data field not binary".to_string())?;
+    if data.len() < 28 {
+        return Err(format!("response too short: {} bytes (want >=28)", data.len()));
+    }
+    let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+    let samples = g32(0);
+    let transitions = g32(4);
+    let first_state = g32(8);
+    let last_state = g32(12);
+    let ctrl_before = g32(16);
+    let ctrl_after = g32(20);
+    let pads_after = g32(24);
+    println!("wire_tx_diag results (pattern G#AAAAAAAA, {samples} SIO samples):");
+    println!("  transitions: {transitions}");
+    println!("  first/last pad state: {first_state} → {last_state}");
+    println!("  IO_BANK0.gpio(0).ctrl before TX: G#{ctrl_before:08X}");
+    println!("                          after:  G#{ctrl_after:08X}");
+    println!("    funcsel = G#{:X} (5=SIO, 6=PIO0)", ctrl_after & 0x1F);
+    println!("    outover = G#{:X}  oeover = G#{:X}", (ctrl_after >> 8) & 0x3, (ctrl_after >> 12) & 0x3);
+    println!("  PADS_BANK0.gpio(0) after TX: G#{pads_after:08X}");
+    println!("    IE = {}  OD = {}  (IE bit 6, OD bit 7)",
+        (pads_after >> 6) & 1, (pads_after >> 7) & 1);
+    if transitions == 0 {
+        println!("  → no transitions: pin not driven. Check funcsel/oeover/OD above.");
+    } else if transitions < 10 {
+        println!("  → very few transitions: TX might be stalled (FIFO underrun?) or clkdiv wrong.");
+    } else {
+        println!("  → TX driving pin. wire_loopback's RX path is what's failing.");
+    }
+    Ok(())
+}
+
 /// `wire_decode [MAX_ITER [FRAC_BITS]]` — runs the bridge decoder: same acquisition + bang-bang CDR as wire_sync, plus a continuous slot clock driven by interval_fp that ticks every slot regardless of edge density. Samples mid-slot, decodes via codec.rx during enclave slots, codec.tx(0) during host slots. Reports the locked slot, per-polarity HIGH/LOW widths (RC asymmetry), slot count, and last 256 decoded bits.
 fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
     const DECODE_MAX_ITER: u32 = 1 << 28;
@@ -1517,6 +1562,48 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     let src_path = std::path::Path::new(src_path);
     if !src_path.exists() {
         return Err(format!("image not found: {}", src_path.display()));
+    }
+
+    // Reset the bridge to flash manager BEFORE streaming. The dev image's load_dev
+    // handler lives in SRAM 0x20004600+ (~11 KB long) — the first 17% of the dev
+    // image's text. Streaming bytes linearly into 0x20000000+ overwrites the handler
+    // while it's still running the receive loop, which wedges the chip in random
+    // ways. Manager-in-flash doesn't have this race: its code is at 0x10000000+,
+    // physically separate from the SRAM region being written. One reset adds ~3 sec
+    // per hot-reload but makes load_dev fully reliable. See git log for the binary
+    // address analysis (llvm-nm on the dispatch symbol).
+    let port_pb = std::path::PathBuf::from(port_path);
+    if port_pb.exists() {
+        print!("→ reset to flash manager ");
+        let _ = std::io::stdout().flush();
+        // Best-effort reset. If the bridge is already wedged the send_cmd will fail —
+        // that's fine, we still wait for the port and assume the user power-cycled.
+        let _ = send_cmd(port_path, "reset", 7, vec![]);
+        // Wait for the device to disappear (USB disconnect after reset).
+        let disappear_deadline = Instant::now() + Duration::from_secs(3);
+        while port_pb.exists() && Instant::now() < disappear_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Wait for the device to come back as the manager.
+        wait_for(
+            Instant::now() + Duration::from_secs(10),
+            || if port_pb.exists() { Some(()) } else { None },
+            "serial device after reset",
+        )?;
+        // CDC settling — first ping may race the DTR/RTS handshake.
+        let manager_deadline = Instant::now() + Duration::from_secs(10);
+        let mut delay_ms = 200u64;
+        loop {
+            if try_ping_short(port_path).is_ok() {
+                break;
+            }
+            if Instant::now() > manager_deadline {
+                return Err("manager didn't pong after reset".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            delay_ms = (delay_ms * 3 / 2).min(800);
+        }
+        println!("(ready)");
     }
 
     let elf_magic = {

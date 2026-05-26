@@ -971,6 +971,7 @@ fn pio_tx_init() {
 /// responsible for pumping the FIFO (via pio_tx_push_word) and stopping when done.
 fn pio_tx_start() {
     use embassy_rp::pac::{IO_BANK0, PADS_BANK0, PIO0};
+    use embassy_rp::pac::io::vals::{Oeover, Outover};
 
     // Clear PAD output-disable so PIO can actually drive the pin. Flex::set_as_input
     // leaves PADS_BANK0.gpio[N].od at its boot default (which is typically 1 = output
@@ -981,8 +982,16 @@ fn pio_tx_start() {
         w.set_ie(true);    // keep input enabled so PIO RX can still read the pad
     });
 
-    // Switch GP0 to PIO0 funcsel so the PIO drives the pin.
-    IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().modify(|w| w.set_funcsel(PIO_FUNCSEL_PIO0));
+    // Switch GP0 to PIO0 funcsel and FORCE output enabled (Oeover::ENABLE bypasses
+    // PIO's PINDIRS — even if the SET PINDIRS injection during init didn't take,
+    // the IO_BANK0 override here will drive the pad). Use write() to ensure all
+    // ctrl fields go to known values (outover=NORMAL so peripheral signal reaches
+    // pad, oeover=ENABLE to force drive).
+    IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().write(|w| {
+        w.set_funcsel(PIO_FUNCSEL_PIO0);
+        w.set_outover(Outover::NORMAL);
+        w.set_oeover(Oeover::ENABLE);
+    });
 
     // Restart + enable SM1.
     PIO0.ctrl().modify(|w| {
@@ -2597,6 +2606,60 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.bits_decoded.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
+        }
+        "wire_tx_diag" => {
+            // PIO TX diagnostic. Enables PIO TX with pattern G#AAAAAAAA, then samples
+            // GP0 via direct SIO read 4096 times in a tight loop (so we see the actual
+            // pad state independent of PIO RX SM). Returns:
+            //   - samples_taken (u32)
+            //   - transitions (u32) — count of pad state changes across the sample run
+            //   - first_state, last_state (u32 each) — initial and final pad reading
+            //   - ctrl_before, ctrl_after (u32 each) — IO_BANK0.gpio(0).ctrl values
+            //   - pads_after (u32) — PADS_BANK0.gpio(0) value after enable
+            // If TX is working, transitions should be in the hundreds-to-thousands range
+            // (4096 samples × <1 µs/sample ÷ 2.87 µs/transition ≈ ~1400). Zero means TX
+            // isn't actually driving the pin.
+            cortex_m::interrupt::free(|_| {
+                pio_tx_init();
+                let ctrl_before = embassy_rp::pac::IO_BANK0.gpio(0).ctrl().read().0;
+                pio_tx_start();
+                for _ in 0..4 { pio_tx_push_word(0xAAAA_AAAA); }
+                let ctrl_after = embassy_rp::pac::IO_BANK0.gpio(0).ctrl().read().0;
+                let pads_after = embassy_rp::pac::PADS_BANK0.gpio(0).read().0;
+
+                // Brief settle (let TX get going).
+                for _ in 0..1000 { cortex_m::asm::nop(); }
+
+                let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
+                let first_state = unsafe { gpio_in.read_volatile() & 1 };
+                let mut last_seen = first_state;
+                let mut transitions: u32 = 0;
+                const SAMPLES: u32 = 4096;
+                for _ in 0..SAMPLES {
+                    let cur = unsafe { gpio_in.read_volatile() & 1 };
+                    if cur != last_seen {
+                        transitions += 1;
+                        last_seen = cur;
+                    }
+                    // Refill TX FIFO if room.
+                    if (embassy_rp::pac::PIO0.fstat().read().txfull() & (1 << PIO_TX_SM)) == 0 {
+                        embassy_rp::pac::PIO0.txf(PIO_TX_SM).write_value(0xAAAA_AAAA);
+                    }
+                }
+                let last_state = last_seen;
+
+                pio_tx_stop();
+
+                let mut payload = alloc::vec::Vec::with_capacity(28);
+                payload.extend_from_slice(&SAMPLES.to_le_bytes());
+                payload.extend_from_slice(&transitions.to_le_bytes());
+                payload.extend_from_slice(&first_state.to_le_bytes());
+                payload.extend_from_slice(&last_state.to_le_bytes());
+                payload.extend_from_slice(&ctrl_before.to_le_bytes());
+                payload.extend_from_slice(&ctrl_after.to_le_bytes());
+                payload.extend_from_slice(&pads_after.to_le_bytes());
+                fields.push(("data".to_string(), VsfType::v(b'b', payload)));
+            });
         }
         "wire_decode" => {
             // Input: bytes 0..4 = max_iter (u32 LE), bytes 4..8 = frac_bits (u32 LE, optional).
