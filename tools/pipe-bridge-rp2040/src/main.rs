@@ -1523,16 +1523,17 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
                 continue;
             }
 
-            // Post-acquisition gated phase detector with continuous P (gain 1/512). At most one adjustment per slot — first qualifying edge wins. iter_in_slot_fp is the error signal: V=0 is the target (boundary aligned with wire transition).
+            // Post-acquisition gated phase detector with continuous P (gain 1/32). At most one adjustment per slot — first qualifying edge wins. iter_in_slot_fp is the error signal: V=0 is the target (boundary aligned with wire transition).
+            //
+            // Uses raw interval_fp (NOT the 8-iter pre-acquisition floor that interval_eff applies for safety against div-by-zero). The floor only matters before acquisition; once interval_fp is seeded from acquisition_slot_iter it's a real slot and the phase detector must operate on the real value. Using the floor here would: compute signed_offset relative to a synthetic ≥8-iter slot while interval_fp may be smaller (e.g. 4 iter at low iter rates), so adj = signed_offset >> 5 can exceed interval_fp, drag it below zero, and i32 wraparound makes it max u32 — runaway.
             //
             // Two cases based on which side of V the edge falls:
-            //   V SMALL (<= half): edge happened just past our boundary in the new slot. Our clock fired too soon — slow down. Expected polarity = transition INTO new slot (slot_phase has already toggled): slot_phase==0 (now enclave) → rising; slot_phase==1 (now host) → falling. signed_offset = V (positive); adj = V >> 9 (positive); interval_fp += adj.
-            //   V LARGE (> half): edge happened in the second half of the current slot, BEFORE our boundary. Our clock period is too long — speed up. Expected polarity = transition OUT of current slot: slot_phase==0 (enclave ending) → falling; slot_phase==1 (host ending) → rising. signed_offset = V - interval_eff (negative); adj = signed_offset >> 9 (negative); interval_fp += adj → decreases.
+            //   V SMALL (<= half): edge happened just past our boundary in the new slot. Our clock fired too soon — slow down. Expected polarity = transition INTO new slot (slot_phase has already toggled): slot_phase==0 (now enclave) → rising; slot_phase==1 (now host) → falling. signed_offset = V (positive); adj = V >> 5 (positive); interval_fp += adj.
+            //   V LARGE (> half): edge happened in the second half of the current slot, BEFORE our boundary. Our clock period is too long — speed up. Expected polarity = transition OUT of current slot: slot_phase==0 (enclave ending) → falling; slot_phase==1 (host ending) → rising. signed_offset = V - interval_fp (negative); adj = signed_offset >> 5 (negative); interval_fp += adj → decreases.
             //
-            // Polarity check rejects edges from wrong-direction transitions (noise, RC ringing, real protocol data bits mid-slot). Continuous P with target=0 has no bias at perfect lock — adj == 0 when V == 0. Gain 1/512 = slot/512 per qualifying edge, well below the slot/256 cap from crypto's 256-bit max-run guarantee. Skips chasing every edge: at most one P adjustment per slot, survives long zero-runs in protocol data.
-            if phase_anchored && !phase_adj_done {
-                let interval_eff_pd = interval_fp.max(8u32 << frac_bits);
-                let half_pd = interval_eff_pd >> 1;
+            // Polarity check rejects edges from wrong-direction transitions (noise, RC ringing, real protocol data bits mid-slot). After every adjustment we clamp interval_fp to [seed/8, seed*8] — bounded enough that bang-bang noise can't drive the loop into the absurd, loose enough to track real ring-osc drift (hundreds of ppm/sec from chip self-heating).
+            if phase_anchored && !phase_adj_done && interval_fp != 0 {
+                let half_pd = interval_fp >> 1;
                 let in_first_half = iter_in_slot_fp <= half_pd;
                 let expected_rising = if in_first_half {
                     slot_phase == 0
@@ -1543,11 +1544,15 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
                     let signed_offset = if in_first_half {
                         iter_in_slot_fp as i32
                     } else {
-                        iter_in_slot_fp as i32 - interval_eff_pd as i32
+                        iter_in_slot_fp as i32 - interval_fp as i32
                     };
-                    // P gain 1/32 — higher than the user's suggested 1/512, but the loop is undamped (pure P on a phase error → 2nd-order oscillator) so we trade convergence speed against oscillation amplitude. Stronger gain damps oscillation faster.
                     let adj = signed_offset >> 5;
-                    interval_fp = (interval_fp as i32).wrapping_add(adj) as u32;
+                    let new_fp = (interval_fp as i32).wrapping_add(adj);
+                    // Clamp to [seed/8, seed*8] in fp units — covers any plausible ring-osc drift while bounding runaway from bang-bang misfire.
+                    let seed_fp = (acquisition_slot_iter as u64) << frac_bits;
+                    let min_fp = ((seed_fp >> 3) as u32).max(1u32 << frac_bits);
+                    let max_fp = (seed_fp << 3).min(u32::MAX as u64) as u32;
+                    interval_fp = (new_fp.max(min_fp as i32) as u32).min(max_fp);
                     phase_adj_done = true;
                 }
             }
@@ -1587,7 +1592,8 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
         // Pre-acquisition (interval_fp == 0), interval_eff saturates to 8<<frac_bits so the boundary check stays well-defined and constant-cost. Actions are gated by phase_anchored; checks themselves run every iter to keep the per-iter cost uniform across acquisition / pre-anchor / post-anchor.
         let one_iter_fp: u32 = 1u32 << frac_bits;
         iter_in_slot_fp = iter_in_slot_fp.wrapping_add(one_iter_fp);
-        let interval_eff = interval_fp.max(8u32 << frac_bits);
+        // Pre-acquisition floor (interval_fp == 0) keeps the boundary check well-defined; once interval_fp seeds from acquisition the real value drives the slot clock. Without this conditional, a real interval_fp smaller than 8 iter at low CPU rates (e.g. 4 iter at ~1 MHz iter rate) would be silently doubled and the bang-bang's per-edge adjustments would slew the clock toward absurd values.
+        let interval_eff = if interval_fp == 0 { 8u32 << frac_bits } else { interval_fp };
         let half_interval = interval_eff >> 1;
         let mid_slot_hit = !sample_done_this_slot && iter_in_slot_fp >= half_interval;
         let slot_boundary_hit = iter_in_slot_fp >= interval_eff;

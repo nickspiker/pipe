@@ -162,31 +162,31 @@ module top_pipe_slotted_oled #(
     // frequency counter that uses it elsewhere — no, actually nothing reads it
     // outside the LFSR block. Removed to keep the netlist clean.
     // -------------------------------------------------------------------------
-    reg [31:0] wire_lfsr  = 32'hDEADBEEF;
-    reg        wire_out   = 1'b0;
+    // CLEAN TOGGLE — no LFSR for the wire driver. FPGA drives the BB high
+    // every enclave slot (slot_owner=0) and tristates every host slot
+    // (slot_owner=1). With the FPGA-internal pulldown, the wire becomes a
+    // clean H-L-H-L toggle at slot rate: one edge per slot, periodic. Bridge
+    // CDR locks trivially. Slot phase mapping is mechanical: the first rising
+    // edge after acquisition marks the start of an enclave slot. Mid-slot
+    // samples then directly identify which side owns each slot — enclave→HI
+    // (FPGA driving), host→LO (pulldown, if bridge silent) or whatever the
+    // bridge drives during host slots (overrides pulldown via 470 Ω).
     reg [1:0]  slot_phase = 2'd0;
     reg        slot_owner = 1'b0;     // 0 = enclave drives, 1 = host drives (we tristate)
     always @(posedge enclave_clk) begin
         slot_phase <= slot_phase + 1'b1;
         if (slot_phase == 2'd3) begin
-            // Slot boundary — step LFSR, maybe-flip wire, flip slot ownership.
-            wire_lfsr <= {wire_lfsr[30:0],
-                          wire_lfsr[31] ^ wire_lfsr[21] ^ wire_lfsr[1] ^ wire_lfsr[0]};
-            if (wire_lfsr[0]) wire_out <= ~wire_out;
             slot_owner <= ~slot_owner;
         end
     end
 
-    // Bidirectional pad: drive when slot_owner=0 (enclave slot), tristate
-    // otherwise. wire_in carries the synchronized incoming bit — wired up for
-    // future host-slot decode work; ignored for the slot-ownership-only test.
     wire wire_in_unused;
     wire wire_drive_en = ~slot_owner;
     wire_io u_wire (
         .clk(enclave_clk),
         .reset_n(1'b1),
         .drive_en(wire_drive_en),
-        .wire_out(wire_out),
+        .wire_out(1'b1),
         .wire_in(wire_in_unused),
         .pad(pipe_pad)
     );
