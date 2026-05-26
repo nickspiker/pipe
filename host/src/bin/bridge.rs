@@ -303,6 +303,13 @@ fn cmd_info(port_path: &str) -> Result<(), String> {
     if let Some(up) = resp_u64(&section, "up") {
         println!("up:   {} ms", up);
     }
+    if let Some(pipe) = resp_u64(&section, "pipe") {
+        let state = match pipe {
+            1 => "LOCKED (comms held in last sync)",
+            _ => "UNLOCKED (no comms / never synced)",
+        };
+        println!("pipe: {state}");
+    }
     println!("({:.2?})", rtt);
     Ok(())
 }

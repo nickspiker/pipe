@@ -386,6 +386,14 @@ static SYNC_MIRROR_MODE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32
 /// pins, 1` shifts the OSR right (set_out_shiftdir(true)). Pushed once per
 /// FIFO-not-full check inside fast_sync's edge loop.
 static TX_MIRROR_PATTERN: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Persistent "we have comms with PIPE" indicator. Reflects the locked state of
+/// the MOST RECENT fast_sync / wire_mirror call: 1 = both polarities held 256
+/// consecutive in-threshold edges (per SYNC_LOCK_HOLD_EDGES), 0 = lost lock or
+/// never locked since the most recent sync. Cleared at start of each sync run
+/// while the new lock state is being measured. Surfaced via the `info` command
+/// as the `pipe` field so the host (or any peer code) can poll comms state
+/// without needing to re-run a full sync.
+static PIPE_COMMS_LOCKED: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
 // Wire decode — slot-aligned continuous decode, runs after wire_sync acquisition.
@@ -1337,6 +1345,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut edges_seen: u32 = 0;
     let mut edges_to_lock: u32 = u32::MAX;
 
+    // PIPE comms latch — clear at start of sync, set at end based on final lock
+    // state. Reflects the most recent sync run; host polls via the `info` cmd's
+    // `pipe` field. A 1 means we held both polarities' lock for 256 consecutive
+    // in-threshold edges (SYNC_LOCK_HOLD_EDGES), well inside the 2^12-slot
+    // stability margin proven on this wire.
+    PIPE_COMMS_LOCKED.store(0, PaOrdering::Relaxed);
+
     while iter < max_edges {
         let raw = match pio_edge_read_until(wall_cap_us, start) {
             Some(r) => r,
@@ -1672,6 +1687,9 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     if mirror_started {
         pio_tx_mirror_stop();
     }
+
+    // Publish current PIPE comms state — reflects whether this sync run held lock.
+    PIPE_COMMS_LOCKED.store(if locked { 1 } else { 0 }, PaOrdering::Release);
 
     let status: u32 = if rising_total == 0 && falling_total == 0 {
         2
@@ -2703,6 +2721,13 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 VsfType::u(embassy_rp::clocks::clk_sys_freq() as usize, false),
             ));
             fields.push(("up".to_string(), VsfType::u(up_ms as usize, false)));
+            // PIPE comms state from the most recent fast_sync/wire_mirror run.
+            // 0 = never locked or lost lock; 1 = held lock for 256 consecutive
+            // in-threshold edges per polarity (= we have comms with PIPE).
+            fields.push((
+                "pipe".to_string(),
+                VsfType::u(PIPE_COMMS_LOCKED.load(PaOrdering::Acquire) as usize, false),
+            ));
         }
         "uptime" => {
             fields.push(("ms".to_string(), VsfType::u(up_ms as usize, false)));
