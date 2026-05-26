@@ -1137,6 +1137,15 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         period_drift_cyc, period_drift_ppm, silence_budget_ppm);
     println!("  P-EMA final: period {:+5} cyc (active lock signal)   rise {:+5} cyc   fall {:+5} cyc   (threshold ±16)",
         r.phase_err_ema_period, r.phase_err_ema_rise, r.phase_err_ema_fall);
+    if r.bits_decoded > 0 {
+        let valid = (r.bits_decoded as u32).min(64);
+        let mask = if valid == 64 { u64::MAX } else { (1u64 << valid) - 1 };
+        let visible = r.bits_buffer & mask;
+        let popcount = visible.count_ones();
+        let pct = 100.0 * popcount as f64 / valid as f64;
+        println!("  bit decode:  {} total bits since lock; last {} = G#{:016X} (popcount {} = {:.1}% ones)",
+            r.bits_decoded, valid, visible, popcount, pct);
+    }
     if r.period_sample_count > 0 {
         let avg_cyc = r.period_sum as f64 / r.period_sample_count as f64;
         let sum_ns = r.period_sum as f64 * NS_PER_CYC;
