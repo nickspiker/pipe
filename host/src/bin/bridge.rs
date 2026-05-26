@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|wire_loopback [TX_PATTERN_HEX [P_SHIFT]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|wire_loopback [TX_PATTERN_HEX [P_SHIFT]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS [DRIVE_HOST [HOST_TX_WORD_HEX]]]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
             );
             return ExitCode::from(2);
         }
@@ -1331,10 +1331,23 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
         .transpose()?
         .unwrap_or(13)
         .clamp(2, 19);
+    let drive_host: u32 = args
+        .get(2)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad DRIVE_HOST (0/1): {e}")))
+        .transpose()?
+        .unwrap_or(0);
+    let host_tx_word: u32 = args
+        .get(3)
+        .map(|s| u32::from_str_radix(s.trim_start_matches("G#"), 16)
+            .map_err(|e| format!("bad HOST_TX_WORD (hex): {e}")))
+        .transpose()?
+        .unwrap_or(0);
 
-    let mut params = Vec::with_capacity(8);
+    let mut params = Vec::with_capacity(16);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
+    params.extend_from_slice(&drive_host.to_le_bytes());
+    params.extend_from_slice(&host_tx_word.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -1356,9 +1369,11 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
         })
         .ok_or_else(|| "data field not a binary blob".to_string())?;
     // Layout (LE): 16 × u32 + 2 × u64 (hi/lo sums) + 4 × u64 (recent_bits) = 112 bytes.
+    // Optional appended (newer firmware): 4 × u32 (enclave_lo, enclave_hi, host_lo, host_hi) = 128 bytes.
     if data.len() < 112 {
         return Err(format!("decode response too short: {} bytes (want 112)", data.len()));
     }
+    let has_slot_buckets = data.len() >= 128;
 
     let g32 = |off: usize| u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
     let g64 = |off: usize| u64::from_le_bytes([
@@ -1385,6 +1400,11 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
     let ones = g32(72);
     let zeros = g32(76);
     let recent_bits: [u64; 4] = [g64(80), g64(88), g64(96), g64(104)];
+    let (enclave_lo, enclave_hi, host_lo, host_hi) = if has_slot_buckets {
+        (g32(112), g32(116), g32(120), g32(124))
+    } else {
+        (0, 0, 0, 0)
+    };
 
     let ns_per_iter = if total_iter > 0 {
         (elapsed_us as f64 * 1000.0) / total_iter as f64
@@ -1449,6 +1469,27 @@ fn cmd_wire_decode(port_path: &str, args: &[String]) -> Result<(), String> {
     if bits_decoded > 0 {
         let pct_ones = 100.0 * ones as f64 / bits_decoded as f64;
         println!("  ones ratio:   {:.1}%  (idle wire decodes to all zeros)", pct_ones);
+    }
+
+    if has_slot_buckets {
+        let enc = enclave_lo + enclave_hi;
+        let hst = host_lo + host_hi;
+        println!();
+        println!("  per-slot mid-slot samples (mirror-XOR / slot-ownership rig):");
+        if enc > 0 {
+            let pct_hi = 100.0 * enclave_hi as f64 / enc as f64;
+            println!("    enclave slots: {} samples — LO:{} HI:{} (HI {:.1}%)", enc, enclave_lo, enclave_hi, pct_hi);
+        } else {
+            println!("    enclave slots: 0 samples");
+        }
+        if hst > 0 {
+            let pct_hi = 100.0 * host_hi as f64 / hst as f64;
+            println!("    host slots:    {} samples — LO:{} HI:{} (HI {:.1}%)", hst, host_lo, host_hi, pct_hi);
+            println!("      expected with slotted FPGA, no bridge drive: LO≈100% (pulldown)");
+            println!("      expected with slotted FPGA, bridge drives pattern: HI fraction = popcount(tx_word)/32");
+        } else {
+            println!("    host slots:    0 samples");
+        }
     }
 
     if bits_decoded == 0 {
