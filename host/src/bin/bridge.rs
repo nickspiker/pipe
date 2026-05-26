@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         Some(s) => s.clone(),
         None => {
             eprintln!(
-                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|wire_loopback [TX_PATTERN_HEX [P_SHIFT]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|wire_mirror [MAX_EDGES [FRAC_BITS [P_SHIFT [TX_PATTERN_HEX]]]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
+                "usage: bridge [--port <path>] [--inspect] <ping|info|uptime|random [N]|wire_trace [SAMPLES [PERIOD_NS]]|wire_stats [SAMPLES]|wire_sync [MAX_ITER [FRAC_BITS [SETTLE_ITER [P_SHIFT [CASCADE_MODE]]]]]|wire_bits [P_SHIFT [LFSR_SEED_HEX]]|wire_loopback [TX_PATTERN_HEX [P_SHIFT]]|tune_p [P_MIN [P_MAX [MAX_ITER [FRAC_BITS]]]]|wire_decode [MAX_ITER [FRAC_BITS]]|wire_mirror [MAX_EDGES [FRAC_BITS [P_SHIFT [TX_PATTERN_HEX]]]]|bootsel|reset|flash <uf2>|load_dev <elf-or-bin>>"
             );
             return ExitCode::from(2);
         }
@@ -730,6 +730,10 @@ struct SyncResultParsed {
     /// Mirror-mode appendix: count of 32-bit TX words pushed to SM1 FIFO during
     /// the run (32 host slots per word). 0 outside mirror mode or on older firmware.
     tx_words_consumed: u32,
+    /// Final phase_err EMA values (per polarity, SYSTICK cycles). |EMA| <= 16 cyc
+    /// (= SYNC_LOCK_EMA_THRESHOLD_CYC) means locked.
+    phase_err_ema_rise: i32,
+    phase_err_ema_fall: i32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -746,13 +750,14 @@ fn run_wire_sync(
     settle_iter: u32,
     p_shift: u32,
 ) -> Result<SyncResultParsed, String> {
-    run_wire_sync_with_tx(port_path, max_iter, frac_bits, settle_iter, p_shift, 0)
+    run_wire_sync_full(port_path, max_iter, frac_bits, settle_iter, p_shift, 0, 1)
 }
 
 /// Same as run_wire_sync but appends a 32-bit TX pattern that the bridge drives onto
 /// GP0 via PIO TX during the capture. tx_pattern=0 disables TX (identical to
 /// run_wire_sync). Used by cmd_wire_loopback to validate the TX path with the
 /// bridge's own PIO RX as the verification end.
+#[allow(dead_code)]
 fn run_wire_sync_with_tx(
     port_path: &str,
     max_iter: u32,
@@ -761,13 +766,38 @@ fn run_wire_sync_with_tx(
     p_shift: u32,
     tx_pattern: u32,
 ) -> Result<SyncResultParsed, String> {
-    let mut params = Vec::with_capacity(20);
+    run_wire_sync_full(port_path, max_iter, frac_bits, settle_iter, p_shift, tx_pattern, 1)
+}
+
+/// Full-parameter version that includes cascade_mode for the firmware's n_slots
+/// gating: 0 = force n_slots=1 (clean-toggle / mirror-XOR / single-interval data,
+/// any out-of-window edge dropped as glitch); 1 = enable the n=1..4 cascade for
+/// real multi-slot data (LFSR / random). Old callers via run_wire_sync /
+/// run_wire_sync_with_tx default to 1 (preserves original behaviour).
+fn run_wire_sync_full(
+    port_path: &str,
+    max_iter: u32,
+    frac_bits: u32,
+    settle_iter: u32,
+    p_shift: u32,
+    tx_pattern: u32,
+    cascade_mode: u32,
+) -> Result<SyncResultParsed, String> {
+    let mut params = Vec::with_capacity(24);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
     params.extend_from_slice(&settle_iter.to_le_bytes());
     params.extend_from_slice(&p_shift.to_le_bytes());
-    if tx_pattern != 0 {
+    // tx_pattern always emitted when cascade_mode is non-default so the bridge sees
+    // both fields contiguously. When cascade_mode is the default 1 AND tx_pattern is
+    // 0, we can drop both for backward compat with old firmware (which expects 20-byte
+    // or 16-byte params and stops there).
+    let include_tx = tx_pattern != 0 || cascade_mode != 1;
+    if include_tx {
         params.extend_from_slice(&tx_pattern.to_le_bytes());
+    }
+    if cascade_mode != 1 {
+        params.extend_from_slice(&cascade_mode.to_le_bytes());
     }
 
     let (resp, _rtt) = send_cmd(
@@ -832,6 +862,20 @@ fn run_wire_sync_with_tx(
     } else {
         0
     };
+    // EMA appendix: i32 phase_err_ema_rise, i32 phase_err_ema_fall after tx_words_consumed.
+    let (phase_err_ema_rise, phase_err_ema_fall) = if data.len() >= appendix_off + 24 {
+        let r = i32::from_le_bytes([
+            data[appendix_off + 16], data[appendix_off + 17],
+            data[appendix_off + 18], data[appendix_off + 19],
+        ]);
+        let f = i32::from_le_bytes([
+            data[appendix_off + 20], data[appendix_off + 21],
+            data[appendix_off + 22], data[appendix_off + 23],
+        ]);
+        (r, f)
+    } else {
+        (0, 0)
+    };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -862,6 +906,8 @@ fn run_wire_sync_with_tx(
         bits_buffer,
         bits_decoded,
         tx_words_consumed,
+        phase_err_ema_rise,
+        phase_err_ema_fall,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -894,8 +940,14 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         .transpose()?
         .unwrap_or(8)
         .min(24);
+    let cascade_mode: u32 = args
+        .get(4)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad CASCADE_MODE (0 = clean-toggle, 1 = multi-slot): {e}")))
+        .transpose()?
+        .unwrap_or(1)
+        .min(1);
 
-    let r = run_wire_sync(port_path, max_iter, frac_bits, settle_iter, p_shift)?;
+    let r = run_wire_sync_full(port_path, max_iter, frac_bits, settle_iter, p_shift, 0, cascade_mode)?;
     let SyncResultParsed { elapsed_us, total_iter, status, frac_bits, p_shift: _,
         locked, edges_to_lock,
         acquisition_slot_iter: _acq_avg, final_interval_fp: _final_avg,
@@ -967,10 +1019,12 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
     );
 
     if locked {
-        println!("  LOCK:        achieved after {} edges (both polarities under threshold for 256 consecutive)", edges_to_lock);
+        println!("  LOCK:        held at end of run (P-EMA within ±16 cyc on both polarities; first achieved at edge {})", edges_to_lock);
     } else {
-        println!("  LOCK:        not achieved (need 256 consecutive in-threshold edges on BOTH polarities)");
+        println!("  LOCK:        NOT held (P-EMA exceeded ±16 cyc on at least one polarity at end of run)");
     }
+    println!("  P-EMA final: rise {:+5} cyc   fall {:+5} cyc   (threshold ±16, |EMA|≤16 = locked)",
+        r.phase_err_ema_rise, r.phase_err_ema_fall);
 
     if total_edges == 0 {
         println!("  no tracking edges — increase MAX_ITER or check wire");

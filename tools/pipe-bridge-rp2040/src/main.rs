@@ -251,14 +251,23 @@ const SYNC_MAX_ITERATIONS: u32 = 1 << 28;
 const SYNC_HIST_BINS: usize = 256;
 const SYNC_HIST_HALF_RANGE: i32 = (SYNC_HIST_BINS as i32) / 2;
 
-/// Lock detector threshold (cycles). |phase_err| below this is "in lock"; we need
-/// SYNC_LOCK_HOLD_EDGES consecutive in-lock edges to flip the locked flag. At 125 MHz
-/// SYSTICK that's ±64 ns ≈ ±2% of slot at the current 170 kHz wire. Adjust if a slower
-/// wire wants a tighter threshold or a noisier one wants slack.
+/// EMA filter rate for the P-based lock detector. The running average of phase_err
+/// is updated each edge as `ema += (phase_err - ema) >> SYNC_LOCK_EMA_SHIFT`. Alpha
+/// = 2^-shift, so shift=10 gives alpha=1/1024 — settles in ~1024 edges (~3 ms at
+/// 348 kHz slot rate), EMA std ≈ σ/√2047. With observed per-edge phase_err std of
+/// ~70 cyc (a few % outliers around ±128 cyc) the EMA jitters ±1.5 cyc — comfortably
+/// inside the lock threshold even on this noisy wire.
+const SYNC_LOCK_EMA_SHIFT: u32 = 10;
+/// Threshold on |phase_err EMA| (in SYSTICK cycles) for declaring lock. With
+/// shift=10 (α=1/1024) the EMA std is ≈1.5 cyc on this wire, so ±16 cyc gives ~10σ
+/// margin — basically zero false negatives, but tight enough that genuine wire
+/// drift (a slot shift of >16 cyc would mean the CDR is off by 5%+) clears lock.
+const SYNC_LOCK_EMA_THRESHOLD_CYC: i32 = 16;
+/// (Legacy) Per-edge in/out threshold and consecutive-hold counter, kept for the
+/// histogram overflow accounting only. The active lock signal is now EMA-based
+/// (SYNC_LOCK_EMA_*). Single-edge consec_in/out_lock counters are no longer used
+/// to gate rise_locked/fall_locked.
 const SYNC_LOCK_THRESHOLD_CYC: i32 = 8;
-/// Consecutive in-lock edges required before declaring locked. 256 = one exchange's
-/// worth — matches the per-exchange convergence design (P shifted ~1/256 per edge so
-/// a 1-iter error converges in one exchange).
 const SYNC_LOCK_HOLD_EDGES: u32 = 256;
 
 #[repr(C)]
@@ -327,6 +336,12 @@ struct SyncResult {
     /// Mirror mode only: count of 32-bit TX words pushed into SM1 FIFO during
     /// this run. Each word = 32 host slots = 32 driven bits. 0 outside mirror mode.
     tx_words_consumed: u32,
+    /// Final phase_err EMA values (per polarity, in SYSTICK cycles) at end of run.
+    /// |EMA| <= SYNC_LOCK_EMA_THRESHOLD_CYC == locked. Surfaces the P-based lock
+    /// detector's actual state so we can see if it's marginal (near threshold) or
+    /// solidly inside/outside.
+    phase_err_ema_rise: i32,
+    phase_err_ema_fall: i32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -361,6 +376,8 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     bits_buffer: 0,
     bits_decoded: 0,
     tx_words_consumed: 0,
+    phase_err_ema_rise: 0,
+    phase_err_ema_fall: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -377,6 +394,21 @@ static SYNC_SETTLE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::Atomic
 /// phase_err is consistently 1 iter, which converges in roughly one exchange. Larger
 /// shifts (10-12) are gentler / more averaging-friendly.
 static SYNC_P_SHIFT_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(8);
+/// n_slots cascade mode. 0 = force n_slots=1 (clean-toggle data, single-interval
+/// wire by protocol — any edge outside ±half-slot of slot estimate is treated as
+/// noise and skipped, no slew). 1 = enable n=1..4 cascade for multi-slot data
+/// (LFSR / random data with real multi-slot gaps). Default 1 preserves the
+/// historical wire_sync behaviour; wire_mirror forces this to 0 because mirror-XOR
+/// data is single-interval by construction. Set BEFORE SYNC_REQUEST goes non-zero.
+///
+/// Background: the cascade has stable fixed points at own_cyc/n for n ∈ {1,2,3,4}.
+/// On data where only n=1 is real, a single noisy edge above the n=1 threshold pulls
+/// the loop to the own_cyc/2 fixed point, then own_cyc/3, then own_cyc/4 (cascade
+/// promotion chain). Result: interval_fp drifts to ~1/8 of true and the cascade
+/// rejects everything. Disabling cascade for known-single-interval data eliminates
+/// the dynamic entirely. See plan doc + research notes for prior art (USB SerDes,
+/// line-coded comms — same fix pattern).
+static SYNC_CASCADE_MODE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(1);
 static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 /// Mirror-XOR mode flag. 0 = normal wire_sync (no SM1 drive). 1 = wire_mirror
 /// (after CDR lock, enable SM1 on next rising edge with TX_MIRROR_PATTERN as
@@ -1224,7 +1256,7 @@ fn interval_fp_to_clkdiv(interval_fp: u32, frac_bits: u32) -> (u16, u8) {
     (clkdiv_int, clkdiv_frac)
 }
 
-fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirror_mode: bool, tx_pattern: u32) -> SyncResult {
+fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirror_mode: bool, tx_pattern: u32, cascade_mode: u32) -> SyncResult {
     let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
     let start = embassy_time::Instant::now();
 
@@ -1337,8 +1369,21 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     // SYNC_LOCK_HOLD_EDGES threshold simultaneously — single-polarity lock isn't enough
     // because the wire isn't truly stable until both HIGH and LOW widths are tracked
     // independently. edges_to_lock is wall-edge count at the moment both crossed.
+    // (Legacy diagnostic only — see SYNC_LOCK_THRESHOLD_CYC comment.)
     let mut consec_in_lock_rise: u32 = 0;
     let mut consec_in_lock_fall: u32 = 0;
+    let mut consec_out_lock_rise: u32 = 0;
+    let mut consec_out_lock_fall: u32 = 0;
+    // P-based lock detector — per-polarity EMA of phase_err in SCALED fixed-point.
+    // Stored as ema_value × 2^SYNC_LOCK_EMA_SHIFT so the per-edge update never has
+    // to divide phase_err. Update: state = state - (state >> shift) + phase_err.
+    // Equivalent to y[n] = (1-α)y[n-1] + αx[n] with α = 1/2^shift, but unbiased —
+    // a naive `(phase_err - ema) >> shift` update has asymmetric rounding (-∞ for
+    // negatives, 0 for positives) that pulls the EMA toward -∞ even with mean
+    // phase_err near zero. The scaled form has no input shift so no input bias.
+    // Visible EMA at any time = ema_scaled >> SYNC_LOCK_EMA_SHIFT.
+    let mut phase_err_ema_rise_scaled: i32 = 0;
+    let mut phase_err_ema_fall_scaled: i32 = 0;
     let mut rise_locked: bool = false;
     let mut fall_locked: bool = false;
     let mut locked: bool = false;
@@ -1556,7 +1601,23 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             continue;
         }
         let half_slot = slot / 2;
-        let n_slots: i32 = if own_cyc < slot + half_slot { 1 }
+        // n_slots cascade — modal. cascade_mode=1 enables the historical n=1..4 cascade
+        // for data with real multi-slot gaps (LFSR / random); cascade_mode=0 forces n=1
+        // for single-interval data (clean toggle / mirror-XOR) and rejects any edge that
+        // isn't in a symmetric window [slot-half_slot, slot+half_slot] around the slot
+        // estimate — "in space, drop". The cascade-promotion runaway that plagued
+        // clean-toggle data is structurally impossible in cascade_mode=0, AND sub-slot
+        // glitches (RC ringing, sub-threshold transitions) don't get folded as
+        // legitimate n=1 edges that would pull slot estimate downward toward the noise.
+        let n_slots: i32 = if cascade_mode == 0 {
+            if own_cyc >= slot - half_slot && own_cyc < slot + half_slot {
+                1
+            } else {
+                _multi_slot_skipped_track += 1;
+                if rising { rising_total += 1 } else { falling_total += 1 };
+                continue;
+            }
+        } else if own_cyc < slot + half_slot { 1 }
                            else if own_cyc < 2 * slot + half_slot { 2 }
                            else if own_cyc < 3 * slot + half_slot { 3 }
                            else if own_cyc < 4 * slot + half_slot { 4 }
@@ -1590,10 +1651,34 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // Only feed CDR with edges that passed the slot-phase + TX-bit filter.
         // accept_for_cdr is always true outside mirror mode.
         if accept_for_cdr {
-            if rising {
-                interval_fp_low = new_fp;
+            // Per-polarity sanity window: if the proposed new interval_fp would land
+            // outside ±30% of the acquisition seed, the edge is a glitch / cosmic ray
+            // / spurious transient — DROP it entirely, no slew, no count toward CDR.
+            // Clamping toward the rail would let the bogus direction leak into the
+            // integrator's state and bias subsequent lock decisions. Skipping keeps
+            // the loop pure: only plausible edges contribute to slot estimate.
+            // Ring-osc drift is well under 1000 ppm/sec so ±30% is generous slack for
+            // legitimate frequency wander while structurally rejecting noise.
+            let (seed_cyc, target_fp_mut): (u32, &mut u32) = if rising {
+                (acquisition_slot_cyc_low, &mut interval_fp_low)
             } else {
-                interval_fp_high = new_fp;
+                (acquisition_slot_cyc_high, &mut interval_fp_high)
+            };
+            let seed_fp = (seed_cyc as u64) << frac_bits;
+            let min_fp = ((seed_fp * 7 / 10) as u32).max(1u32 << frac_bits);
+            let max_fp = (seed_fp * 13 / 10).min(u32::MAX as u64) as u32;
+            if new_fp >= min_fp && new_fp <= max_fp {
+                *target_fp_mut = new_fp;
+            } else {
+                // Edge "in space" — drop it FULLY. Bump the skip counter and
+                // total counter for diagnostic, then `continue` so neither
+                // interval_fp nor the lock-detector EMA gets touched by a glitch.
+                // (Letting a -200 cyc phase_err shift the EMA by -0.8 cyc each
+                // time keeps the lock detector chattering near the threshold
+                // even when the loop itself is well-tracked.)
+                _multi_slot_skipped_track += 1;
+                if rising { rising_total += 1 } else { falling_total += 1 };
+                continue;
             }
         }
 
@@ -1630,25 +1715,45 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
 
         edges_seen += 1;
         let in_threshold = phase_err.abs() <= SYNC_LOCK_THRESHOLD_CYC;
+        // Legacy consec counters — kept only because tests/diagnostics use them
+        // for "edges-to-lock convergence rate". Not on the lock decision path.
         if rising {
             if in_threshold {
                 consec_in_lock_rise = consec_in_lock_rise.saturating_add(1);
-                if consec_in_lock_rise >= SYNC_LOCK_HOLD_EDGES { rise_locked = true; }
+                consec_out_lock_rise = 0;
             } else {
+                consec_out_lock_rise = consec_out_lock_rise.saturating_add(1);
                 consec_in_lock_rise = 0;
-                rise_locked = false;
             }
+            // P-based lock: scaled EMA of phase_err (see decl comment). Single-edge
+            // outliers wash out; sustained drift moves the EMA past threshold.
+            phase_err_ema_rise_scaled = phase_err_ema_rise_scaled
+                .wrapping_sub(phase_err_ema_rise_scaled >> SYNC_LOCK_EMA_SHIFT)
+                .wrapping_add(phase_err);
+            let ema_rise = phase_err_ema_rise_scaled >> SYNC_LOCK_EMA_SHIFT;
+            rise_locked = ema_rise.abs() <= SYNC_LOCK_EMA_THRESHOLD_CYC;
         } else {
             if in_threshold {
                 consec_in_lock_fall = consec_in_lock_fall.saturating_add(1);
-                if consec_in_lock_fall >= SYNC_LOCK_HOLD_EDGES { fall_locked = true; }
+                consec_out_lock_fall = 0;
             } else {
+                consec_out_lock_fall = consec_out_lock_fall.saturating_add(1);
                 consec_in_lock_fall = 0;
-                fall_locked = false;
             }
+            phase_err_ema_fall_scaled = phase_err_ema_fall_scaled
+                .wrapping_sub(phase_err_ema_fall_scaled >> SYNC_LOCK_EMA_SHIFT)
+                .wrapping_add(phase_err);
+            let ema_fall = phase_err_ema_fall_scaled >> SYNC_LOCK_EMA_SHIFT;
+            fall_locked = ema_fall.abs() <= SYNC_LOCK_EMA_THRESHOLD_CYC;
         }
-        if !locked && rise_locked && fall_locked {
-            locked = true;
+        // Global locked is the AND of per-polarity locks at this very edge —
+        // current-state semantics so PIPE_COMMS_LOCKED reflects whether comms is
+        // held NOW, not "ever was held". edges_to_lock records the moment of first
+        // SET only (latched at u32::MAX otherwise) for "how many edges did it take
+        // to achieve first lock" tuning.
+        let was_locked = locked;
+        locked = rise_locked && fall_locked;
+        if locked && !was_locked && edges_to_lock == u32::MAX {
             edges_to_lock = edges_seen;
         }
 
@@ -1741,6 +1846,10 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         bits_buffer,
         bits_decoded,
         tx_words_consumed,
+        // Report visible EMA (= scaled >> shift) so host doesn't need to know the
+        // internal storage form.
+        phase_err_ema_rise: phase_err_ema_rise_scaled >> SYNC_LOCK_EMA_SHIFT,
+        phase_err_ema_fall: phase_err_ema_fall_scaled >> SYNC_LOCK_EMA_SHIFT,
     }
 }
 
@@ -2041,7 +2150,8 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             let p_shift_req = SYNC_P_SHIFT_REQUEST.load(PaOrdering::Relaxed);
             let mirror_mode = SYNC_MIRROR_MODE.load(PaOrdering::Relaxed) != 0;
             let tx_pattern = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
-            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req, p_shift_req, mirror_mode, tx_pattern));
+            let cascade_mode = SYNC_CASCADE_MODE.load(PaOrdering::Relaxed);
+            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req, p_shift_req, mirror_mode, tx_pattern, cascade_mode));
             let iters = result.total_iterations.max(1);
             unsafe {
                 SYNC_RESULT = result;
@@ -2909,6 +3019,14 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 0
             };
+            // Optional cascade_mode (bytes 20..24). 0 = force n_slots=1 (clean toggle /
+            // single-interval data), 1 = enable 1..4 cascade (LFSR / multi-slot). Default
+            // 1 preserves the original wire_sync behaviour for existing callers.
+            let cascade_mode = if data_in.len() >= 24 {
+                u32::from_le_bytes([data_in[20], data_in[21], data_in[22], data_in[23]])
+            } else {
+                1
+            };
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
             let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
             let settle_iter = settle_iter.min(max_iter / 2);
@@ -2930,6 +3048,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             SYNC_FRAC_REQUEST.store(frac_bits, PaOrdering::Relaxed);
             SYNC_SETTLE_REQUEST.store(settle_iter, PaOrdering::Relaxed);
             SYNC_P_SHIFT_REQUEST.store(p_shift, PaOrdering::Relaxed);
+            SYNC_CASCADE_MODE.store(cascade_mode, PaOrdering::Relaxed);
             SYNC_REQUEST.store(max_iter, PaOrdering::Release);
 
             // SYNC_MAX_ITERATIONS = 2^28 = ~45-90 s worst case; 120 s deadline gives margin. USB CDC stays up on core 0 during this because interrupt::free on core 1 doesn't gate core 0's IRQs.
@@ -3009,6 +3128,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // Mirror-mode appendix — count of 32-bit TX words pushed into SM1
                 // FIFO during the run (0 outside mirror mode). Backward compatible.
                 payload.extend_from_slice(&s.tx_words_consumed.to_le_bytes());
+                // EMA-based lock detector appendix — per-polarity phase_err EMA value
+                // (i32 cycles) at end of run. |EMA| <= SYNC_LOCK_EMA_THRESHOLD_CYC
+                // means locked. Backward compatible (old parsers stop earlier).
+                payload.extend_from_slice(&s.phase_err_ema_rise.to_le_bytes());
+                payload.extend_from_slice(&s.phase_err_ema_fall.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3062,6 +3186,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             SYNC_P_SHIFT_REQUEST.store(p_shift, PaOrdering::Relaxed);
             SYNC_MIRROR_MODE.store(1, PaOrdering::Relaxed);
             TX_MIRROR_PATTERN.store(tx_pattern, PaOrdering::Relaxed);
+            // Mirror-XOR data is single-interval by protocol — force cascade off so the
+            // n=2/n=3/n=4 false fixed points can never pull the loop.
+            SYNC_CASCADE_MODE.store(0, PaOrdering::Relaxed);
             SYNC_REQUEST.store(max_iter, PaOrdering::Release);
 
             let deadline = Instant::now() + embassy_time::Duration::from_secs(120);
@@ -3123,6 +3250,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.bits_buffer.to_le_bytes());
                 payload.extend_from_slice(&s.bits_decoded.to_le_bytes());
                 payload.extend_from_slice(&s.tx_words_consumed.to_le_bytes());
+                // EMA-based lock detector appendix — per-polarity phase_err EMA value
+                // (i32 cycles) at end of run. |EMA| <= SYNC_LOCK_EMA_THRESHOLD_CYC
+                // means locked. Backward compatible (old parsers stop earlier).
+                payload.extend_from_slice(&s.phase_err_ema_rise.to_le_bytes());
+                payload.extend_from_slice(&s.phase_err_ema_fall.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
