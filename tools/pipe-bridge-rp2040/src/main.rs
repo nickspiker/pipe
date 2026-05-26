@@ -3446,6 +3446,19 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 0xAAAA_AAAA
             };
+            // cascade_mode is optional; default 0 (force n_periods=1). This is the
+            // right default for AAAAAAAA-class TX patterns where the rising-to-
+            // rising period after the slot-phase filter is reliably 1× seed.
+            // cascade=1 (n=1..4 unfolding) reintroduces cascade-promotion fixed
+            // points — observed to pull the loop down to seed/2 in mirror mode for
+            // both AAAAAAAA and DEADBEEF. Truly sparse TX patterns like DEADBEEF
+            // need TX-aware period prediction (compute exact n_periods from the
+            // known TX pattern) before they'll lock — neither cascade value works.
+            let cascade_mode = if data_in.len() >= 20 {
+                u32::from_le_bytes([data_in[16], data_in[17], data_in[18], data_in[19]])
+            } else {
+                0
+            }.min(1);
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
             let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
             let p_shift = p_shift.min(24);
@@ -3456,9 +3469,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             SYNC_P_SHIFT_REQUEST.store(p_shift, PaOrdering::Relaxed);
             SYNC_MIRROR_MODE.store(1, PaOrdering::Relaxed);
             TX_MIRROR_PATTERN.store(tx_pattern, PaOrdering::Relaxed);
-            // Mirror-XOR data is single-interval by protocol — force cascade off so the
-            // n=2/n=3/n=4 false fixed points can never pull the loop.
-            SYNC_CASCADE_MODE.store(0, PaOrdering::Relaxed);
+            SYNC_CASCADE_MODE.store(cascade_mode, PaOrdering::Relaxed);
             SYNC_REQUEST.store(max_iter, PaOrdering::Release);
 
             let deadline = Instant::now() + embassy_time::Duration::from_secs(120);

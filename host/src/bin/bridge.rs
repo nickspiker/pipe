@@ -1776,12 +1776,24 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("bad TX_PATTERN_HEX: {e}")))
         .transpose()?
         .unwrap_or(0xAAAA_AAAA);
+    // cascade_mode default is 0 (force single-period). This is the right default
+    // for AAAAAAAA-class TX patterns. cascade=1 (multi-period unfold) is exposed
+    // for experimentation but reintroduces cascade-promotion fixed points in mirror
+    // mode and isn't currently usable for any tested TX pattern. Sparse data (like
+    // DEADBEEF) needs TX-aware period prediction — a separate future change.
+    let cascade_mode: u32 = args
+        .get(4)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad CASCADE_MODE (0=single-period, 1=multi-period unfold): {e}")))
+        .transpose()?
+        .unwrap_or(0)
+        .min(1);
 
-    let mut params = Vec::with_capacity(16);
+    let mut params = Vec::with_capacity(20);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
     params.extend_from_slice(&p_shift.to_le_bytes());
     params.extend_from_slice(&tx_pattern.to_le_bytes());
+    params.extend_from_slice(&cascade_mode.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -1829,6 +1841,16 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
     } else {
         0
     };
+    // Bits decoder appendix (first 12 bytes of the appendix block).
+    let bits_buffer: u64 = if data.len() >= appendix_off + 8 {
+        u64::from_le_bytes([
+            data[appendix_off],     data[appendix_off + 1],
+            data[appendix_off + 2], data[appendix_off + 3],
+            data[appendix_off + 4], data[appendix_off + 5],
+            data[appendix_off + 6], data[appendix_off + 7],
+        ])
+    } else { 0 };
+    let bits_decoded: u32 = if data.len() >= appendix_off + 12 { g32(appendix_off + 8) } else { 0 };
     // PERIOD appendix (3 × 4 bytes after EMA pair) + histogram (17 × 4 bytes).
     // Layout: [bits_buffer u64][bits_decoded u32][tx_words u32][ema_rise i32]
     //         [ema_fall i32][period_seed u32][period_fp u32][period_ema i32][hist 17×u32]
@@ -1885,6 +1907,21 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
     if rising_total > 0 {
         let words_per_k_edge = tx_words_consumed as f64 / (rising_total as f64 / 1000.0);
         println!("  TX words / 1000 rising edges: {:.2}  (~1000 expected — one push per rising edge in mirror mode, only when FIFO not full)", words_per_k_edge);
+    }
+    // Bit decoder readback. In mirror mode with cascade=0 (default), each accepted
+    // rising contributes exactly 1 bit (a "1") to bits_buffer, so the output is all
+    // 1s when locked. Truly recovering the TX pattern from this stream requires
+    // TX-aware period prediction (compute exact n_periods from the known TX bits,
+    // unfold accepted edges into the right (n-1) zeros + 1) — not currently done.
+    if bits_decoded > 0 {
+        let valid = (bits_decoded as u32).min(64);
+        let mask = if valid == 64 { u64::MAX } else { (1u64 << valid) - 1 };
+        let visible = bits_buffer & mask;
+        let popcount = visible.count_ones();
+        let pct = 100.0 * popcount as f64 / valid as f64;
+        println!("  bit decode:  {} total bits since lock; last {} = G#{:016X} (popcount {} = {:.1}% ones)",
+            bits_decoded, valid, visible, popcount, pct);
+        println!("               (cascade=0: every accepted edge → 1 \"1\" bit; pattern recovery needs TX-aware unfold)");
     }
     if period_seed_cyc > 0 {
         let period_final_cyc = period_final_fp as f64 / fp_scale;
