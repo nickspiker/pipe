@@ -414,17 +414,6 @@ struct DecodeResult {
     zeros: u32,
     /// Last 256 decoded bits. Push: new bit shifts into [0] LSB.
     recent_bits: [u64; 4],
-    /// Per-slot mid-slot sample counts, gated by phase_anchored. Counts how
-    /// many mid-slot samples landed at LOW vs HIGH, bucketed by which side
-    /// owns the slot. With the slotted FPGA bitstream and no bridge drive:
-    ///   enclave_lo + enclave_hi ≈ slots_total / 2 (LFSR-driven random ~50/50)
-    ///   host_lo ≈ slots_total / 2,  host_hi ≈ 0  (FPGA tristated → pulldown)
-    /// Diverging from that pattern indicates either FPGA-side drive bleed,
-    /// bridge-side OE bug, or wire-RC dynamics from the 470 Ω + pulldown.
-    enclave_lo: u32,
-    enclave_hi: u32,
-    host_lo: u32,
-    host_hi: u32,
 }
 
 static mut DECODE_RESULT: DecodeResult = DecodeResult {
@@ -447,25 +436,11 @@ static mut DECODE_RESULT: DecodeResult = DecodeResult {
     ones: 0,
     zeros: 0,
     recent_bits: [0; 4],
-    enclave_lo: 0,
-    enclave_hi: 0,
-    host_lo: 0,
-    host_hi: 0,
 };
 
 static DECODE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 static DECODE_FRAC_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 static DECODE_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-/// Bit pattern to drive on GP0 during host-owned slots (mirror-XOR rig). 0 =
-/// listen only (don't drive). Nonzero: one bit per host slot, LSB-first, then
-/// rotated right so the 32-bit pattern repeats every 32 host slots. Active
-/// only inside fast_decode after phase anchor; OE is released on slot boundary
-/// out of a host slot. Set BEFORE issuing DECODE_REQUEST.
-static DECODE_HOST_TX_WORD: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-/// 0 = no drive (listen only). 1 = drive GP0 from DECODE_HOST_TX_WORD during
-/// host slots. Kept separate from the word so word=0 means "drive all zeros"
-/// when drive=1.
-static DECODE_DRIVE_HOST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 /// Host-side mirror-XOR codec, byte-identical to host/src/codec.rs. Inlined here to keep the firmware crate self-contained for now; once the codec is stable we'll lift it into a shared `pipe_codec` crate that both host and firmware import.
 struct Codec {
@@ -1396,35 +1371,11 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32) -> S
 /// Phase anchor: first rising edge after acquisition marks the start of an enclave (even) slot. From there the slot clock alternates polarity every `slot_iter` iter.
 ///
 /// Caller MUST run inside `cortex_m::interrupt::free`.
-fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u32) -> DecodeResult {
+fn fast_decode(max_iter: u32, frac_bits: u32) -> DecodeResult {
     let max_iter = max_iter.min(SYNC_MAX_ITERATIONS);
     let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
     let gpio_in: *const u32 = embassy_rp::pac::SIO.gpio_in(0).as_ptr();
     let start = embassy_time::Instant::now();
-
-    // Bridge GP0 mirror-XOR rig — host-slot drive. Pre-stage: configure GP0
-    // funcsel = SIO, output value cleared, OE *disabled* (we'll toggle OE per
-    // slot inside the loop so the FPGA's enclave-slot drive isn't fought).
-    // Even when drive_host == false we restore GP0 to SIO-input on the way out
-    // so the wire is left clean — but we only TOUCH the regs when actually
-    // driving, to avoid disturbing PIO RX state if a caller upstream parked
-    // GP0 differently.
-    let mut tx_word: u32 = tx_word_init;
-    if drive_host {
-        use embassy_rp::pac::{IO_BANK0, PADS_BANK0};
-        use embassy_rp::pac::io::vals::{Oeover, Outover};
-        PADS_BANK0.gpio(PIO_EDGE_GPIO as usize).modify(|w| {
-            w.set_od(false);
-            w.set_ie(true);
-        });
-        IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().write(|w| {
-            w.set_funcsel(PIO_FUNCSEL_SIO);
-            w.set_outover(Outover::NORMAL);
-            w.set_oeover(Oeover::NORMAL);
-        });
-        embassy_rp::pac::SIO.gpio_oe(0).value_clr().write_value(1 << PIO_EDGE_GPIO);
-        embassy_rp::pac::SIO.gpio_out(0).value_clr().write_value(1 << PIO_EDGE_GPIO);
-    }
 
     let mut prev: u32 = unsafe { gpio_in.read_volatile() & 1 };
     let mut iter: u32 = 1;
@@ -1467,10 +1418,6 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
     let mut ones: u32 = 0;
     let mut zeros: u32 = 0;
     let mut recent_bits: [u64; 4] = [0; 4];
-    let mut enclave_lo: u32 = 0;
-    let mut enclave_hi: u32 = 0;
-    let mut host_lo: u32 = 0;
-    let mut host_hi: u32 = 0;
 
     while iter < max_iter {
         let cur = unsafe { gpio_in.read_volatile() & 1 };
@@ -1602,7 +1549,6 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
             if phase_anchored {
                 let sample = cur as u8;
                 if slot_phase == 0 {
-                    if sample & 1 == 1 { enclave_hi += 1 } else { enclave_lo += 1 };
                     let bit = codec.rx(sample);
                     if bit & 1 == 1 { ones += 1 } else { zeros += 1 };
                     bits_decoded += 1;
@@ -1611,7 +1557,6 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
                     recent_bits[1] = (recent_bits[1] << 1) | (recent_bits[0] >> 63);
                     recent_bits[0] = (recent_bits[0] << 1) | (bit as u64 & 1);
                 } else {
-                    if sample & 1 == 1 { host_hi += 1 } else { host_lo += 1 };
                     let _ = codec.tx(0);
                 }
             }
@@ -1625,30 +1570,8 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
             phase_adj_done = false;
             if phase_anchored {
                 slots_total += 1;
-                if drive_host {
-                    if slot_phase == 1 {
-                        // Just crossed into host slot. Set output bit and enable OE.
-                        let bit = (tx_word & 1) as u32;
-                        if bit != 0 {
-                            embassy_rp::pac::SIO.gpio_out(0).value_set().write_value(1 << PIO_EDGE_GPIO);
-                        } else {
-                            embassy_rp::pac::SIO.gpio_out(0).value_clr().write_value(1 << PIO_EDGE_GPIO);
-                        }
-                        embassy_rp::pac::SIO.gpio_oe(0).value_set().write_value(1 << PIO_EDGE_GPIO);
-                        // Rotate pattern right so next host slot drives next bit. 32-slot period.
-                        tx_word = tx_word.rotate_right(1);
-                    } else {
-                        // Just crossed into enclave slot. Release GP0 (let FPGA drive).
-                        embassy_rp::pac::SIO.gpio_oe(0).value_clr().write_value(1 << PIO_EDGE_GPIO);
-                    }
-                }
             }
         }
-    }
-
-    // Restore GP0 to input mode on the way out.
-    if drive_host {
-        embassy_rp::pac::SIO.gpio_oe(0).value_clr().write_value(1 << PIO_EDGE_GPIO);
     }
 
     if hi_count == 0 { hi_min = 0; }
@@ -1684,10 +1607,6 @@ fn fast_decode(max_iter: u32, frac_bits: u32, drive_host: bool, tx_word_init: u3
         ones,
         zeros,
         recent_bits,
-        enclave_lo,
-        enclave_hi,
-        host_lo,
-        host_hi,
     }
 }
 
@@ -1753,9 +1672,7 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
         let decode_req = DECODE_REQUEST.load(PaOrdering::Acquire);
         if decode_req != 0 {
             let frac_req = DECODE_FRAC_REQUEST.load(PaOrdering::Relaxed);
-            let drive = DECODE_DRIVE_HOST.load(PaOrdering::Relaxed) != 0;
-            let tx_word = DECODE_HOST_TX_WORD.load(PaOrdering::Relaxed);
-            let result = cortex_m::interrupt::free(|_| fast_decode(decode_req, frac_req, drive, tx_word));
+            let result = cortex_m::interrupt::free(|_| fast_decode(decode_req, frac_req));
             let iters = result.total_iterations.max(1);
             unsafe {
                 DECODE_RESULT = result;
@@ -2807,11 +2724,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             });
         }
         "wire_decode" => {
-            // Input layout (all LE, all optional past byte 8):
-            //   bytes 0..4   = max_iter (u32)
-            //   bytes 4..8   = frac_bits (u32)
-            //   bytes 8..12  = drive_host (u32, 0/1) — drive GP0 during host slots
-            //   bytes 12..16 = host_tx_word (u32) — bit pattern, LSB-first, rotated per host slot
+            // Input: bytes 0..4 = max_iter (u32 LE), bytes 4..8 = frac_bits (u32 LE, optional).
             let data_in = cmd
                 .get("data")
                 .ok()
@@ -2831,23 +2744,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 SYNC_FRAC_BITS_DEFAULT
             };
-            let drive_host = if data_in.len() >= 12 {
-                u32::from_le_bytes([data_in[8], data_in[9], data_in[10], data_in[11]])
-            } else {
-                0
-            };
-            let host_tx_word = if data_in.len() >= 16 {
-                u32::from_le_bytes([data_in[12], data_in[13], data_in[14], data_in[15]])
-            } else {
-                0
-            };
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
             let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
 
             DECODE_RESPONSE.store(0, PaOrdering::Relaxed);
             DECODE_FRAC_REQUEST.store(frac_bits, PaOrdering::Relaxed);
-            DECODE_HOST_TX_WORD.store(host_tx_word, PaOrdering::Relaxed);
-            DECODE_DRIVE_HOST.store(drive_host, PaOrdering::Relaxed);
             DECODE_REQUEST.store(max_iter, PaOrdering::Release);
 
             let deadline = Instant::now() + embassy_time::Duration::from_secs(120);
@@ -2862,12 +2763,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 fields.push(("err".to_string(), VsfType::a("decode_timeout".to_string())));
             } else {
                 let d = unsafe { DECODE_RESULT };
-                // Layout (all LE), 128 bytes total (was 112; appended 4 u32 per-slot counters):
+                // Layout (all LE), 112 bytes total:
                 //   16 × u32: elapsed_us, total_iterations, status, frac_bits, acquisition_slot_iter, final_interval_fp, hi_count, hi_min_iter, hi_max_iter, lo_count, lo_min_iter, lo_max_iter, slots_total, bits_decoded, ones, zeros
                 //   2 × u64: hi_sum_iter, lo_sum_iter
                 //   4 × u64: recent_bits[]
-                //   4 × u32: enclave_lo, enclave_hi, host_lo, host_hi  (slot-bucket sample counts)
-                let cap = 16 * 4 + 2 * 8 + 4 * 8 + 4 * 4;
+                let cap = 16 * 4 + 2 * 8 + 4 * 8;
                 let mut payload = alloc::vec::Vec::with_capacity(cap);
                 payload.extend_from_slice(&d.elapsed_us.to_le_bytes());
                 payload.extend_from_slice(&d.total_iterations.to_le_bytes());
@@ -2890,10 +2790,6 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 for v in &d.recent_bits {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
-                payload.extend_from_slice(&d.enclave_lo.to_le_bytes());
-                payload.extend_from_slice(&d.enclave_hi.to_le_bytes());
-                payload.extend_from_slice(&d.host_lo.to_le_bytes());
-                payload.extend_from_slice(&d.host_hi.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
