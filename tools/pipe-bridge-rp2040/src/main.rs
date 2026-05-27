@@ -437,6 +437,18 @@ struct SyncResult {
     mirror_claim12_match: u32,
     mirror_claim12_mispredict_no_edge_observed: u32,
     mirror_claim12_mispredict_wrong_polarity: u32,
+    /// Raw wire-state-per-slot-boundary log. Captures the first up-to-256 slot boundaries
+    /// after `mirror_started`, one bit per slot, LSB-first within bytes. Slot 0 in the
+    /// log = first boundary crossed (= entering host slot 1 from initial enclave slot 0).
+    /// Subsequent indices: 1=enclave slot 2, 2=host slot 3, ...
+    /// Diagnostic for decode-vs-expected wire pattern: compare on host against the
+    /// computed Claim-12 wire signature for (FPGA TX_PATTERN × bridge TX_PATTERN) to
+    /// distinguish handshake-fired-DATA-mode (=expected DEADBEEF-driven pattern) from
+    /// handshake-never-fired-IDLE-mode (=different pattern), or from slot_phase tracker
+    /// drift (=noise). Linear (not ring): captures FIRST 256 slots, not last 256.
+    slot_wire_log: [u8; 32],
+    /// Number of bits actually written into slot_wire_log (clamps at 256).
+    slot_wire_log_count: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -490,6 +502,8 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     mirror_claim12_match: 0,
     mirror_claim12_mispredict_no_edge_observed: 0,
     mirror_claim12_mispredict_wrong_polarity: 0,
+    slot_wire_log: [0; 32],
+    slot_wire_log_count: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1424,6 +1438,11 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut _edges_claim12_mispredict_no_edge_observed: u32 = 0;   // model: no edge; observed: edge
     let mut _edges_claim12_mispredict_wrong_polarity: u32 = 0;     // model: edge with polarity X; observed: opposite
     let mut _edges_claim12_match: u32 = 0;                         // model and observation agree on polarity
+    // Raw wire-state-per-slot log: 256 bits captured at the FIRST 256 slot boundaries
+    // crossed after mirror_started. Push happens inside the slots_crossed inner loop
+    // (next to where wire_at_slot is computed). Linear, not ring — stop logging at 256.
+    let mut slot_wire_log: [u8; 32] = [0; 32];
+    let mut slot_wire_log_count: u32 = 0;
     // Phase 2c bridge-side decode (Claim 12 inverse):
     //   wire_state    = bridge's running view of the wire level (1=HIGH, 0=LOW),
     //                   updated AFTER each accepted edge with that edge's polarity
@@ -1734,6 +1753,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             last_driven_bit = 0;
             fpga_data_mode = false;
             fpga_tx_pos = 0;
+            slot_wire_log = [0; 32];
+            slot_wire_log_count = 0;
             // Count edge for stats but skip CDR update — the anchor is a phase reference,
             // not a slot-duration measurement. Falls through to rising_total/falling_total
             // increment below.
@@ -1785,6 +1806,15 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                     } else {
                         wire_state
                     };
+                    // Log raw wire-state for the first 256 slot boundaries (diagnostic).
+                    if slot_wire_log_count < 256 {
+                        let byte_idx = (slot_wire_log_count >> 3) as usize;
+                        let bit_in_byte = slot_wire_log_count & 7;
+                        if wire_at_slot != 0 {
+                            slot_wire_log[byte_idx] |= 1 << bit_in_byte;
+                        }
+                        slot_wire_log_count += 1;
+                    }
                     if slot_phase == 1 {
                         // Entering host slot: bridge starts driving the next bit. Mirror
                         // SM1's OSR consumption (1 bit per host slot, LSB-first).
@@ -2340,6 +2370,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         mirror_claim12_match: _edges_claim12_match,
         mirror_claim12_mispredict_no_edge_observed: _edges_claim12_mispredict_no_edge_observed,
         mirror_claim12_mispredict_wrong_polarity: _edges_claim12_mispredict_wrong_polarity,
+        slot_wire_log,
+        slot_wire_log_count,
     }
 }
 
@@ -3658,6 +3690,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.mirror_claim12_match.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_claim12_mispredict_no_edge_observed.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_claim12_mispredict_wrong_polarity.to_le_bytes());
+                // Raw wire-state-per-slot log (32 bytes = 256 bits) + count (u32).
+                payload.extend_from_slice(&s.slot_wire_log);
+                payload.extend_from_slice(&s.slot_wire_log_count.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3826,6 +3861,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.mirror_claim12_match.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_claim12_mispredict_no_edge_observed.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_claim12_mispredict_wrong_polarity.to_le_bytes());
+                // Raw wire-state-per-slot log (32 bytes = 256 bits) + count (u32).
+                payload.extend_from_slice(&s.slot_wire_log);
+                payload.extend_from_slice(&s.slot_wire_log_count.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

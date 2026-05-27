@@ -142,6 +142,54 @@ fn now_eagle_oscillations() -> i64 {
     nunc::eagle::from_system_time(SystemTime::now())
 }
 
+/// Compute the expected wire value at each slot boundary, given the bridge's TX pattern
+/// and the FPGA's TX pattern, simulating the Claim 12 mirror-XOR protocol per slot.
+///
+/// Returns N bits where bit i = wire value during absolute slot (i + 1). Slot indexing:
+/// slot 0 = initial enclave slot (pre-log; FPGA in IDLE), slot 1 = first host slot
+/// (bridge's first drive bit), slot 2 = first DATA-mode-possible enclave slot, etc.
+///
+/// `force_idle = true` keeps fpga_data_mode false the whole simulation (= simulates
+/// "handshake never fired", whatever bridge sent). Used to print IDLE-mode expected
+/// pattern side-by-side with DATA-mode expected for the operator to compare.
+///
+/// FPGA TX rotation: per top_pipe_mirror_xor.v, `fpga_tx_reg` rotates right on every
+/// host→enclave transition. So slot 0 uses fpga_tx[0], slot 2 uses fpga_tx[1], slot 4
+/// uses fpga_tx[2], etc. (the index is half the slot index).
+///
+/// Handshake: at FPGA's mid-host-slot sample, if wire==1 and data_mode==0, then
+/// data_mode <= 1 (effective starting the NEXT enclave slot).
+fn expected_wire_pattern(bridge_tx: u32, fpga_tx: u32, n_slots: usize, force_idle: bool) -> Vec<u8> {
+    let mut result = Vec::with_capacity(n_slots);
+    let mut fpga_data_mode = false;
+    let mut fpga_tx_pos: u32 = 0;
+    let mut bridge_last_decoded: u8 = 0;
+    let mut bridge_bit_idx: u32 = 0;
+    for slot_in_log in 0..n_slots {
+        let absolute_slot = slot_in_log + 1;
+        let is_host = absolute_slot % 2 == 1;
+        let wire = if is_host {
+            let drive = ((bridge_tx >> (bridge_bit_idx & 31)) & 1) as u8;
+            bridge_bit_idx = bridge_bit_idx.wrapping_add(1);
+            if drive == 1 && !fpga_data_mode && !force_idle {
+                fpga_data_mode = true;
+            }
+            bridge_last_decoded = drive;
+            drive
+        } else {
+            fpga_tx_pos = fpga_tx_pos.wrapping_add(1);
+            let fpga_bit = if fpga_data_mode {
+                ((fpga_tx >> (fpga_tx_pos & 31)) & 1) as u8
+            } else {
+                0
+            };
+            1 ^ fpga_bit ^ bridge_last_decoded
+        };
+        result.push(wire);
+    }
+    result
+}
+
 /// Build a complete VSF document containing a single `cmd` section with the given fields, hp-stamped via VsfBuilder.provenance_only().
 fn build_cmd_doc(
     op: &str,
@@ -778,6 +826,12 @@ struct SyncResultParsed {
     mirror_claim12_match: u32,
     mirror_claim12_mispredict_no_edge_observed: u32,
     mirror_claim12_mispredict_wrong_polarity: u32,
+    /// Raw wire-state-per-slot diagnostic: up to 256 bits captured at the FIRST 256
+    /// slot boundaries crossed after mirror_started. LSB-first within bytes. Bit 0
+    /// = wire at first boundary (entering host slot 1 from initial enclave slot 0),
+    /// bit 1 = wire at second boundary (entering enclave slot 2), etc.
+    slot_wire_log: [u8; 32],
+    slot_wire_log_count: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -979,6 +1033,13 @@ fn run_wire_sync_full(
         if data.len() >= claim12_off + 12 {
             (g32(claim12_off), g32(claim12_off + 4), g32(claim12_off + 8))
         } else { (0, 0, 0) };
+    // Raw wire-state-per-slot log (32 bytes) + count (u32).
+    let wire_log_off = claim12_off + 12;
+    let (slot_wire_log, slot_wire_log_count) = if data.len() >= wire_log_off + 36 {
+        let mut log = [0u8; 32];
+        log.copy_from_slice(&data[wire_log_off..wire_log_off + 32]);
+        (log, g32(wire_log_off + 32))
+    } else { ([0u8; 32], 0) };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -1028,6 +1089,8 @@ fn run_wire_sync_full(
         mirror_claim12_match,
         mirror_claim12_mispredict_no_edge_observed,
         mirror_claim12_mispredict_wrong_polarity,
+        slot_wire_log,
+        slot_wire_log_count,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1962,6 +2025,14 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         if data.len() >= claim12_off + 12 {
             (g32(claim12_off), g32(claim12_off + 4), g32(claim12_off + 8))
         } else { (0, 0, 0) };
+    // Raw wire-state-per-slot log (32 bytes) + count (u32).
+    let wire_log_off = claim12_off + 12;
+    let (slot_wire_log, slot_wire_log_count): ([u8; 32], u32) =
+        if data.len() >= wire_log_off + 36 {
+            let mut log = [0u8; 32];
+            log.copy_from_slice(&data[wire_log_off..wire_log_off + 32]);
+            (log, g32(wire_log_off + 32))
+        } else { ([0u8; 32], 0) };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -2047,6 +2118,44 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
                 fpga_decoded_buffer.rotate_left(16),
                 fpga_decoded_buffer.rotate_left(24),
                 fpga_decoded_buffer);
+        }
+    }
+    // Raw wire-state-per-slot diagnostic — captures the actual wire value at each of
+    // the first up-to-256 slot boundaries crossed after mirror_started. Compare against
+    // the computed Claim-12 wire pattern for (FPGA TX = 0xDEADBEEF × bridge TX) in DATA
+    // mode and in IDLE mode side-by-side. Any of these three outcomes is diagnostic:
+    //   - matches DATA → handshake fired AND slot tracker correctly aligned ✓
+    //   - matches IDLE → handshake never fired (FPGA stayed in IDLE the whole test)
+    //   - matches neither → slot tracker drifted, OR FPGA bitstream isn't what we think
+    if slot_wire_log_count > 0 {
+        let n = (slot_wire_log_count as usize).min(64);
+        let actual: Vec<u8> = (0..n).map(|i| (slot_wire_log[i / 8] >> (i % 8)) & 1).collect();
+        let data_expected = expected_wire_pattern(tx_pattern, 0xDEAD_BEEF, n, false);
+        let idle_expected = expected_wire_pattern(tx_pattern, 0xDEAD_BEEF, n, true);
+        let to_bits = |v: &[u8]| -> String {
+            v.iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    let c = if b != 0 { '1' } else { '0' };
+                    if i > 0 && i % 8 == 0 { format!(" {c}") } else { c.to_string() }
+                })
+                .collect()
+        };
+        let data_match = actual.iter().zip(&data_expected).filter(|(a, e)| a == e).count();
+        let idle_match = actual.iter().zip(&idle_expected).filter(|(a, e)| a == e).count();
+        println!();
+        println!("  WIRE LOG (first {} slot boundaries, slot 1 .. slot {}):",
+            n, n);
+        println!("    actual:        {}", to_bits(&actual));
+        println!("    DATA expected: {}  ({}/{} match)", to_bits(&data_expected), data_match, n);
+        println!("    IDLE expected: {}  ({}/{} match)", to_bits(&idle_expected), idle_match, n);
+        if data_match >= n * 90 / 100 {
+            println!("    → DATA mode: handshake fired, slot tracker aligned, decode should work");
+        } else if idle_match >= n * 90 / 100 {
+            println!("    → IDLE mode: handshake never fired (FPGA stayed in IDLE the whole test)");
+        } else {
+            let max_match = data_match.max(idle_match);
+            println!("    → neither pattern matches (best: {}/{}). slot_phase tracker drift, FPGA bitstream mismatch, or partial-handshake mid-stream", max_match, n);
         }
     }
     // Mirror-mode edge filter accounting. Sum = post-acquisition edges processed.
