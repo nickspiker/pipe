@@ -2019,6 +2019,25 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                             .wrapping_sub(period_ema_slow_scaled >> SYNC_PERIOD_EMA_SLOW_SHIFT)
                             .wrapping_add(period_now as i64);
                     }
+                    // TIMING RE-ANCHOR on accepted period sample. An accepted period
+                    // sample is a rising edge that the narrow-window check just confirmed
+                    // is at an integer N * seed_period from the last accepted rising —
+                    // i.e., bridge KNOWS this edge sits at a true FPGA slot boundary.
+                    // Reset the timing tracker (cumulative_cyc + slots_since_anchor) to
+                    // 0 so the per-edge slot_phase calculation only has to extrapolate
+                    // over the ≤8 slots until the next accepted period sample, not over
+                    // the entire run. Bounds accumulated arithmetic drift.
+                    //
+                    // slot_phase parity is NOT reset — risings can land at host-entry
+                    // OR enclave-entry depending on bridge's TX pattern (e.g., bridge
+                    // FFFFFFFF gives risings at host-entry; bridge AAAAAAAA gives them
+                    // at enclave-entry in IDLE mode). The slot tracker just advanced
+                    // slot_phase based on slots_crossed for this edge; trust that
+                    // value and reset only the timing accumulator.
+                    if mirror_started {
+                        cumulative_cyc_since_anchor = 0;
+                        slots_since_anchor = 0;
+                    }
                 }
             }
         }
