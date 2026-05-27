@@ -22,7 +22,7 @@
 //
 // FPGA decode (sample bridge during host slot):
 //   At slot_phase==2 (mid-host-slot), latch wire_in into bridge_last_decoded.
-//   With 4-enclave_clk-per-slot and the 2-FF wire_in synchroniser, mid-slot is
+//   With 4-wire_clk-per-slot and the 2-FF wire_in synchroniser, mid-slot is
 //   safely past bridge's drive settling. Becomes other_last_decoded_data for
 //   the next enclave slot's encode.
 //
@@ -80,8 +80,8 @@
 module top_pipe_mirror_xor #(
     parameter integer CLK_DIV     = 7,            // 25 MHz / 7 → ~3.5 MHz CE → ~28 kHz SCL
     parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench): 1 XOR + 4 buffers. Drives BOTH the blake-clock divider and (downstream of that) the enclave-clock divider — cascaded power-of-2 dividers, no comparators.
-    parameter integer BLAKE_DIV_LOG2   = 6,       // First-stage divider: ring_raw → blake_clk = ring / 2^BLAKE_DIV_LOG2. At 365 MHz ring, 2^6 = /64 → ~5.7 MHz (well below the 125 MHz BLAKE3 silicon Fmax per Phase D, plenty of margin for future BLAKE3 wiring). Pure binary-counter bit-tap (no subtractor / no comparator). 6 is small enough to keep the counter shallow but big enough to keep blake_clk in a comfortable range.
-    parameter integer ENCLAVE_DIV_LOG2 = 8,       // Second-stage divider: blake_clk → enclave_clk = blake / 2^ENCLAVE_DIV_LOG2. From ~5.7 MHz blake_clk, 2^8 = /256 → ~22 kHz enclave_clk. Slot rate (enclave_clk/4) ≈ 5.5 kHz, slot ≈ 180 µs. Pure binary-counter bit-tap. Independent counter from the blake divider — they're cascaded but each is its own state machine.
+    parameter integer ENCLAVE_DIV_LOG2 = 7,       // First-stage divider: ring_raw → enclave_clk = ring / 2^N. At ~365 MHz ring, 2^7 = /128 → ~2.85 MHz. Target range 1-5 MHz: fast enough for BLAKE3 (Phase D Fmax 125 MHz — plenty of margin) and any in-enclave compute, slow enough that the 25 MHz crystal-clocked 3-FF synchronisers in the OLED frequency counter (and any other clk-domain crossing) sample cleanly (~8.7× oversample here vs the ~4.4× we'd get at /64, which is right on the Nyquist edge and likely the reason BL displayed 0 in the prior /64 build). Pure binary-counter bit-tap (no comparator/subtractor).
+    parameter integer WIRE_DIV_LOG2 = 8,          // Second-stage divider: enclave_clk → wire_clk = enclave / 2^N. From ~2.85 MHz enclave_clk, 2^8 = /256 → ~11 kHz wire_clk (within the 10-40 kHz target range). Slot rate (wire_clk/4) ≈ 2.8 kHz, slot ≈ 357 µs. Independent counter from the enclave divider.
     parameter [31:0]  TX_PATTERN  = 32'hDEADBEEF  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Non-symmetric so bridge-side decode quality can be distinguished from accidental phase-shift artefacts: any rotation of DEADBEEF is recognisable, and bit errors show up as deviations from those rotations (unlike a symmetric pattern like AAAAAAAA, where every bit-shift maps back to itself). IDLE mode (pre-handshake) always sends 0 regardless of this parameter.
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
@@ -159,7 +159,7 @@ module top_pipe_mirror_xor #(
     end
 
     // -------------------------------------------------------------------------
-    // Ring oscillator → mod-N divider → enclave_clk. BEL-pinned (same as
+    // Ring oscillator → mod-N divider → wire_clk. BEL-pinned (same as
     // random/toggle) for build-to-build frequency consistency.
     // -------------------------------------------------------------------------
     (* noglobal *) wire [RING_STAGES-1:0] ring_q;
@@ -195,37 +195,37 @@ module top_pipe_mirror_xor #(
     // output clock. Each output goes through a DCCA buffer so it can drive
     // multiple FFs cleanly per Phase D's "ring fanout needs DCCA" lesson.
     //
-    //   stage 1: ring_raw → blake_clk      (= ring / 2^BLAKE_DIV_LOG2 → ~5.7 MHz)
-    //   stage 2: blake_clk → enclave_clk   (= blake / 2^ENCLAVE_DIV_LOG2 → ~22 kHz)
+    //   stage 1: ring_raw → enclave_clk      (= ring / 2^ENCLAVE_DIV_LOG2 → ~5.7 MHz)
+    //   stage 2: enclave_clk → wire_clk   (= blake / 2^WIRE_DIV_LOG2 → ~22 kHz)
     //
-    // Independence: stage 2 counter is clocked by blake_clk, not by ring_raw.
+    // Independence: stage 2 counter is clocked by enclave_clk, not by ring_raw.
     // No comparator, no reset, just a free-running counter whose MSB is the
-    // output. Stages are cascaded for the protocol clock but blake_clk is
-    // independently usable (when BLAKE3 lands it'll clock off blake_clk
+    // output. Stages are cascaded for the protocol clock but enclave_clk is
+    // independently usable (when BLAKE3 lands it'll clock off enclave_clk
     // directly without touching the enclave divider).
     // -------------------------------------------------------------------------
-    reg [BLAKE_DIV_LOG2-1:0] blake_div_cnt = 0;
-    always @(posedge ring_raw) blake_div_cnt <= blake_div_cnt + 1'b1;
-    wire blake_clk;
-    (* keep *) DCCA dcca_blake_clk (
-        .CLKI(blake_div_cnt[BLAKE_DIV_LOG2-1]), .CE(1'b1), .CLKO(blake_clk)
-    );
-
     reg [ENCLAVE_DIV_LOG2-1:0] enclave_div_cnt = 0;
-    always @(posedge blake_clk) enclave_div_cnt <= enclave_div_cnt + 1'b1;
+    always @(posedge ring_raw) enclave_div_cnt <= enclave_div_cnt + 1'b1;
     wire enclave_clk;
     (* keep *) DCCA dcca_enclave_clk (
         .CLKI(enclave_div_cnt[ENCLAVE_DIV_LOG2-1]), .CE(1'b1), .CLKO(enclave_clk)
     );
 
+    reg [WIRE_DIV_LOG2-1:0] wire_div_cnt = 0;
+    always @(posedge enclave_clk) wire_div_cnt <= wire_div_cnt + 1'b1;
+    wire wire_clk;
+    (* keep *) DCCA dcca_wire_clk (
+        .CLKI(wire_div_cnt[WIRE_DIV_LOG2-1]), .CE(1'b1), .CLKO(wire_clk)
+    );
+
     // -------------------------------------------------------------------------
     // Slot-phase / slot-owner machinery — unchanged from slotted_oled.
-    //   slot_phase: 0..3 per enclave_clk → 4-enclave_clk per slot
+    //   slot_phase: 0..3 per wire_clk → 4-wire_clk per slot
     //   slot_owner: 0 = enclave (FPGA drives), 1 = host (bridge drives, FPGA tristates)
     // -------------------------------------------------------------------------
     reg [1:0]  slot_phase = 2'd0;
     reg        slot_owner = 1'b0;
-    always @(posedge enclave_clk) begin
+    always @(posedge wire_clk) begin
         slot_phase <= slot_phase + 1'b1;
         if (slot_phase == 2'd3) begin
             slot_owner <= ~slot_owner;
@@ -283,7 +283,7 @@ module top_pipe_mirror_xor #(
     // add a series resistor with the piezo). At slow-rate slot ~230 µs the toggle is
     // up to ~2.2 kHz, well in the audible range.
     reg piezo_value = 1'b0;
-    always @(posedge enclave_clk) begin
+    always @(posedge wire_clk) begin
         if (slot_owner == 1'b0) begin
             piezo_value <= enclave_drive_value;
         end
@@ -291,7 +291,7 @@ module top_pipe_mirror_xor #(
     assign piezo_enclave_p =  piezo_value;
     assign piezo_enclave_n = ~piezo_value;
 
-    always @(posedge enclave_clk) begin
+    always @(posedge wire_clk) begin
         prev_slot_owner <= slot_owner;
         // host slot mid-sample → latch bridge's drive value as our decoded bit
         // AND check Claim 7b handshake / auto-clear conditions:
@@ -321,7 +321,7 @@ module top_pipe_mirror_xor #(
     end
 
     // -------------------------------------------------------------------------
-    // data_mode → clk-domain LED override. data_mode lives on enclave_clk; the
+    // data_mode → clk-domain LED override. data_mode lives on wire_clk; the
     // LED FSM (geiger_cnt block) lives on the 25 MHz clk domain. Cross with a
     // 3-stage synchroniser, then override the LED to solid ON when data_mode_q
     // is high. The geiger-pattern blink in IDLE mode → solid ON in DATA mode
@@ -332,7 +332,7 @@ module top_pipe_mirror_xor #(
     wire data_mode_q = data_mode_sync[2];
 
     wire_io u_wire (
-        .clk(enclave_clk),
+        .clk(wire_clk),
         .reset_n(1'b1),
         .drive_en(wire_drive_en),
         .wire_out(enclave_drive_value),
@@ -341,8 +341,8 @@ module top_pipe_mirror_xor #(
     );
 
     // -------------------------------------------------------------------------
-    // Frequency counters — TWO parallel: enclave_clk (line 2) + blake_clk (line 3).
-    // Same genlocked pattern as random/slotted_oled, but cloned for blake_clk so the
+    // Frequency counters — TWO parallel: wire_clk (line 2) + enclave_clk (line 3).
+    // Same genlocked pattern as random/slotted_oled, but cloned for enclave_clk so the
     // OLED shows both rate-divider taps. Each toggles a register on its own clock,
     // 3-FF synchronises into clk domain, counts the synced edges between frame_pulses,
     // multiplies by FREQ_MAGIC, BCDs the result, then a digit-write FSM streams the
@@ -351,6 +351,17 @@ module top_pipe_mirror_xor #(
     reg         frame_pulse = 1'b0;
 
     // Enclave-clk counter
+    reg  [31:0] freq_hz_wire  = 32'd0;
+    reg         freq_valid_wire = 1'b0;
+    reg meas_toggle_wire = 1'b0;
+    always @(posedge wire_clk) meas_toggle_wire <= ~meas_toggle_wire;
+    reg [2:0] toggle_sync_wire = 3'b0;
+    always @(posedge clk) toggle_sync_wire <= {toggle_sync_wire[1:0], meas_toggle_wire};
+    wire meas_edge_wire = toggle_sync_wire[2] ^ toggle_sync_wire[1];
+
+    // Blake-clk counter (~5.7 MHz — same divider into clk domain works because
+    // 25 MHz crystal > 2 × 5.7 MHz, Nyquist OK; 3-FF synchroniser handles the
+    // metastability margin).
     reg  [31:0] freq_hz_en  = 32'd0;
     reg         freq_valid_en = 1'b0;
     reg meas_toggle_en = 1'b0;
@@ -359,33 +370,22 @@ module top_pipe_mirror_xor #(
     always @(posedge clk) toggle_sync_en <= {toggle_sync_en[1:0], meas_toggle_en};
     wire meas_edge_en = toggle_sync_en[2] ^ toggle_sync_en[1];
 
-    // Blake-clk counter (~5.7 MHz — same divider into clk domain works because
-    // 25 MHz crystal > 2 × 5.7 MHz, Nyquist OK; 3-FF synchroniser handles the
-    // metastability margin).
-    reg  [31:0] freq_hz_bl  = 32'd0;
-    reg         freq_valid_bl = 1'b0;
-    reg meas_toggle_bl = 1'b0;
-    always @(posedge blake_clk) meas_toggle_bl <= ~meas_toggle_bl;
-    reg [2:0] toggle_sync_bl = 3'b0;
-    always @(posedge clk) toggle_sync_bl <= {toggle_sync_bl[1:0], meas_toggle_bl};
-    wire meas_edge_bl = toggle_sync_bl[2] ^ toggle_sync_bl[1];
-
     localparam integer FREQ_MAGIC = 100;
+    reg [23:0] edge_cnt_wire = 24'd0;
     reg [23:0] edge_cnt_en = 24'd0;
-    reg [23:0] edge_cnt_bl = 24'd0;
     always @(posedge clk) begin
+        freq_valid_wire <= 1'b0;
         freq_valid_en <= 1'b0;
-        freq_valid_bl <= 1'b0;
         if (frame_pulse) begin
+            freq_hz_wire    <= edge_cnt_wire * FREQ_MAGIC;
+            edge_cnt_wire   <= meas_edge_wire ? 24'd1 : 24'd0;
+            freq_valid_wire <= 1'b1;
             freq_hz_en    <= edge_cnt_en * FREQ_MAGIC;
             edge_cnt_en   <= meas_edge_en ? 24'd1 : 24'd0;
             freq_valid_en <= 1'b1;
-            freq_hz_bl    <= edge_cnt_bl * FREQ_MAGIC;
-            edge_cnt_bl   <= meas_edge_bl ? 24'd1 : 24'd0;
-            freq_valid_bl <= 1'b1;
         end else begin
+            if (meas_edge_wire) edge_cnt_wire <= edge_cnt_wire + 24'd1;
             if (meas_edge_en) edge_cnt_en <= edge_cnt_en + 24'd1;
-            if (meas_edge_bl) edge_cnt_bl <= edge_cnt_bl + 24'd1;
         end
     end
 
@@ -394,19 +394,19 @@ module top_pipe_mirror_xor #(
     // -------------------------------------------------------------------------
     localparam integer BCD_DIGITS = 8;
     localparam integer BIN_W      = 24;
+    wire [BCD_DIGITS*4-1:0] bcd_wire;
+    wire                    bcd_done_wire;
+    bin_to_bcd #(.BIN_W(BIN_W), .BCD_DIGITS(BCD_DIGITS)) b2b_wire (
+        .clk(clk), .reset_n(1'b1),
+        .start(freq_valid_wire), .bin(freq_hz_wire[BIN_W-1:0]),
+        .bcd(bcd_wire), .done(bcd_done_wire)
+    );
     wire [BCD_DIGITS*4-1:0] bcd_en;
     wire                    bcd_done_en;
     bin_to_bcd #(.BIN_W(BIN_W), .BCD_DIGITS(BCD_DIGITS)) b2b_en (
         .clk(clk), .reset_n(1'b1),
         .start(freq_valid_en), .bin(freq_hz_en[BIN_W-1:0]),
         .bcd(bcd_en), .done(bcd_done_en)
-    );
-    wire [BCD_DIGITS*4-1:0] bcd_bl;
-    wire                    bcd_done_bl;
-    bin_to_bcd #(.BIN_W(BIN_W), .BCD_DIGITS(BCD_DIGITS)) b2b_bl (
-        .clk(clk), .reset_n(1'b1),
-        .start(freq_valid_bl), .bin(freq_hz_bl[BIN_W-1:0]),
-        .bcd(bcd_bl), .done(bcd_done_bl)
     );
 
     // -------------------------------------------------------------------------
@@ -452,9 +452,9 @@ module top_pipe_mirror_xor #(
         strings[24] = "M"; strings[25] = "I"; strings[26] = "R"; strings[27] = "R";
         strings[28] = "O"; strings[29] = "R"; strings[30] = "-"; strings[31] = "X";
         strings[32] = "O"; strings[33] = "R";
-        // Line 2: "EN: X,XXX,XXX Hz" — enclave_clk (protocol slot rate × 4)
-        strings[LINE2_BASE + 0] = "E";
-        strings[LINE2_BASE + 1] = "N";
+        // Line 2: "WI: X,XXX,XXX Hz" — wire_clk (protocol/slot timing, 10-40 kHz target)
+        strings[LINE2_BASE + 0] = "W";
+        strings[LINE2_BASE + 1] = "I";
         strings[LINE2_BASE + 2] = ":";
         strings[LINE2_BASE + 3] = " ";
         strings[LINE2_BASE + 4] = "0";
@@ -469,9 +469,9 @@ module top_pipe_mirror_xor #(
         strings[LINE2_BASE +13] = " ";
         strings[LINE2_BASE +14] = "H";
         strings[LINE2_BASE +15] = "z";
-        // Line 3: "BL: X,XXX,XXX Hz" — blake_clk (= ring / 2^BLAKE_DIV_LOG2, future BLAKE3 src)
-        strings[LINE3_BASE + 0] = "B";
-        strings[LINE3_BASE + 1] = "L";
+        // Line 3: "EN: X,XXX,XXX Hz" — enclave_clk (= ring / 2^ENCLAVE_DIV_LOG2, 1-5 MHz internal compute / future BLAKE3 src)
+        strings[LINE3_BASE + 0] = "E";
+        strings[LINE3_BASE + 1] = "N";
         strings[LINE3_BASE + 2] = ":";
         strings[LINE3_BASE + 3] = " ";
         strings[LINE3_BASE + 4] = "0";
@@ -525,6 +525,30 @@ module top_pipe_mirror_xor #(
     endfunction
 
     // Enclave-clk line FSM (line 2)
+    reg [3:0] digit_write_idx_wire = 4'd0;
+    reg       seen_nonzero_wire    = 1'b0;
+    wire [7:0] sel_char_wire = digit_char_for(digit_write_idx_wire, {{8{1'b0}}, bcd_wire}, seen_nonzero_wire);
+    wire       show_digit_wire = (digit_write_idx_wire == 4'd1 || digit_write_idx_wire == 4'd3
+                              || digit_write_idx_wire == 4'd4 || digit_write_idx_wire == 4'd5
+                              || digit_write_idx_wire == 4'd7 || digit_write_idx_wire == 4'd8
+                              || digit_write_idx_wire == 4'd9)
+                              && sel_char_wire >= 8'h30;
+    always @(posedge clk) begin
+        if (bcd_done_wire) begin
+            digit_write_idx_wire <= 4'd1;
+            seen_nonzero_wire    <= 1'b0;
+        end else if (digit_write_idx_wire != 4'd0) begin
+            strings[LINE2_DIGIT_BASE + (digit_write_idx_wire - 1)] <= sel_char_wire;
+            if (show_digit_wire) seen_nonzero_wire <= 1'b1;
+            if (digit_write_idx_wire == LINE2_DYN_LEN[3:0]) begin
+                digit_write_idx_wire <= 4'd0;
+            end else begin
+                digit_write_idx_wire <= digit_write_idx_wire + 4'd1;
+            end
+        end
+    end
+
+    // Blake-clk line FSM (line 3)
     reg [3:0] digit_write_idx_en = 4'd0;
     reg       seen_nonzero_en    = 1'b0;
     wire [7:0] sel_char_en = digit_char_for(digit_write_idx_en, {{8{1'b0}}, bcd_en}, seen_nonzero_en);
@@ -538,9 +562,9 @@ module top_pipe_mirror_xor #(
             digit_write_idx_en <= 4'd1;
             seen_nonzero_en    <= 1'b0;
         end else if (digit_write_idx_en != 4'd0) begin
-            strings[LINE2_DIGIT_BASE + (digit_write_idx_en - 1)] <= sel_char_en;
+            strings[LINE3_DIGIT_BASE + (digit_write_idx_en - 1)] <= sel_char_en;
             if (show_digit_en) seen_nonzero_en <= 1'b1;
-            if (digit_write_idx_en == LINE2_DYN_LEN[3:0]) begin
+            if (digit_write_idx_en == LINE3_DYN_LEN[3:0]) begin
                 digit_write_idx_en <= 4'd0;
             end else begin
                 digit_write_idx_en <= digit_write_idx_en + 4'd1;
@@ -548,34 +572,10 @@ module top_pipe_mirror_xor #(
         end
     end
 
-    // Blake-clk line FSM (line 3)
-    reg [3:0] digit_write_idx_bl = 4'd0;
-    reg       seen_nonzero_bl    = 1'b0;
-    wire [7:0] sel_char_bl = digit_char_for(digit_write_idx_bl, {{8{1'b0}}, bcd_bl}, seen_nonzero_bl);
-    wire       show_digit_bl = (digit_write_idx_bl == 4'd1 || digit_write_idx_bl == 4'd3
-                              || digit_write_idx_bl == 4'd4 || digit_write_idx_bl == 4'd5
-                              || digit_write_idx_bl == 4'd7 || digit_write_idx_bl == 4'd8
-                              || digit_write_idx_bl == 4'd9)
-                              && sel_char_bl >= 8'h30;
-    always @(posedge clk) begin
-        if (bcd_done_bl) begin
-            digit_write_idx_bl <= 4'd1;
-            seen_nonzero_bl    <= 1'b0;
-        end else if (digit_write_idx_bl != 4'd0) begin
-            strings[LINE3_DIGIT_BASE + (digit_write_idx_bl - 1)] <= sel_char_bl;
-            if (show_digit_bl) seen_nonzero_bl <= 1'b1;
-            if (digit_write_idx_bl == LINE3_DYN_LEN[3:0]) begin
-                digit_write_idx_bl <= 4'd0;
-            end else begin
-                digit_write_idx_bl <= digit_write_idx_bl + 4'd1;
-            end
-        end
-    end
-
     // Re-render trigger: pulse when EITHER FSM finishes writing its line
     always @(posedge clk) begin
         re_render_req <= 1'b0;
-        if (digit_write_idx_en == LINE2_DYN_LEN[3:0] || digit_write_idx_bl == LINE3_DYN_LEN[3:0])
+        if (digit_write_idx_wire == LINE2_DYN_LEN[3:0] || digit_write_idx_en == LINE3_DYN_LEN[3:0])
             re_render_req <= 1'b1;
     end
 
