@@ -80,8 +80,8 @@
 module top_pipe_mirror_xor #(
     parameter integer CLK_DIV     = 7,            // 25 MHz / 7 → ~3.5 MHz CE → ~28 kHz SCL
     parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench): 1 XOR + 4 buffers. Drives BOTH the blake-clock divider and (downstream of that) the enclave-clock divider — cascaded power-of-2 dividers, no comparators.
-    parameter integer ENCLAVE_DIV_LOG2 = 7,       // First-stage divider: ring_raw → enclave_clk = ring / 2^N. At ~365 MHz ring, 2^7 = /128 → ~2.85 MHz. Target range 1-5 MHz: fast enough for BLAKE3 (Phase D Fmax 125 MHz — plenty of margin) and any in-enclave compute, slow enough that the 25 MHz crystal-clocked 3-FF synchronisers in the OLED frequency counter (and any other clk-domain crossing) sample cleanly (~8.7× oversample here vs the ~4.4× we'd get at /64, which is right on the Nyquist edge and likely the reason BL displayed 0 in the prior /64 build). Pure binary-counter bit-tap (no comparator/subtractor).
-    parameter integer WIRE_DIV_LOG2 = 8,          // Second-stage divider: enclave_clk → wire_clk = enclave / 2^N. From ~2.85 MHz enclave_clk, 2^8 = /256 → ~11 kHz wire_clk (within the 10-40 kHz target range). Slot rate (wire_clk/4) ≈ 2.8 kHz, slot ≈ 357 µs. Independent counter from the enclave divider.
+    parameter integer ENCLAVE_DIV_LOG2 = 7,       // First-stage divider: ring_raw → enclave_clk = ring / 2^N. Measured on silicon: ring_raw ≈ 381 MHz → enclave_clk ≈ 2.98 MHz at /128. Target range 1-5 MHz: fast enough for BLAKE3 (Phase D Fmax 125 MHz — 40× margin) and any in-enclave compute, slow enough that the 25 MHz crystal-clocked 3-FF synchronisers in the OLED frequency counter (and any other clk-domain crossing) sample cleanly (~8.4× oversample). Pure binary-counter bit-tap (no comparator/subtractor).
+    parameter integer WIRE_DIV_LOG2 = 8,          // Second-stage divider: enclave_clk → wire_clk = enclave / 2^N. Measured: 2.98 MHz / 256 = 11.6 kHz (within the 10-40 kHz target range). Slot rate (wire_clk/4) ≈ 2.9 kHz, slot ≈ 345 µs. Independent counter from the enclave divider.
     parameter [31:0]  TX_PATTERN  = 32'hDEADBEEF  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Non-symmetric so bridge-side decode quality can be distinguished from accidental phase-shift artefacts: any rotation of DEADBEEF is recognisable, and bit errors show up as deviations from those rotations (unlike a symmetric pattern like AAAAAAAA, where every bit-shift maps back to itself). IDLE mode (pre-handshake) always sends 0 regardless of this parameter.
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
@@ -496,43 +496,62 @@ module top_pipe_mirror_xor #(
     // -------------------------------------------------------------------------
     reg       re_render_req   = 1'b0;
 
-    function automatic [7:0] digit_char_for;
-        input [3:0]  widx;
-        input [31:0] bcd_in;
-        input        seen_nz;
-        reg          is_comma, is_digit, is_last;
-        reg [3:0]    d;
-        reg          show;
-        begin
-            is_comma = 1'b0; is_digit = 1'b0; is_last = 1'b0; d = 4'd0;
-            case (widx)
-                4'd1: begin is_digit = 1'b1; d = bcd_in[27:24]; end
-                4'd2: is_comma = 1'b1;
-                4'd3: begin is_digit = 1'b1; d = bcd_in[23:20]; end
-                4'd4: begin is_digit = 1'b1; d = bcd_in[19:16]; end
-                4'd5: begin is_digit = 1'b1; d = bcd_in[15:12]; end
-                4'd6: is_comma = 1'b1;
-                4'd7: begin is_digit = 1'b1; d = bcd_in[11:8]; end
-                4'd8: begin is_digit = 1'b1; d = bcd_in[7:4]; end
-                4'd9: begin is_digit = 1'b1; d = bcd_in[3:0]; is_last = 1'b1; end
-                default: ;
-            endcase
-            show = is_digit && (seen_nz || d != 4'd0 || is_last);
-            digit_char_for = is_comma ? (seen_nz ? 8'h2C : 8'h20)
-                            : show    ? (8'h30 + {4'b0, d})
-                                        : 8'h20;
-        end
-    endfunction
-
-    // Enclave-clk line FSM (line 2)
+    // -------------------------------------------------------------------------
+    // Inline per-FSM digit-char selection (no function — function call from two
+    // FSMs was apparently being collapsed to one shared resource by synthesis,
+    // leaving the second line's display showing 0).
+    // -------------------------------------------------------------------------
     reg [3:0] digit_write_idx_wire = 4'd0;
     reg       seen_nonzero_wire    = 1'b0;
-    wire [7:0] sel_char_wire = digit_char_for(digit_write_idx_wire, {{8{1'b0}}, bcd_wire}, seen_nonzero_wire);
-    wire       show_digit_wire = (digit_write_idx_wire == 4'd1 || digit_write_idx_wire == 4'd3
-                              || digit_write_idx_wire == 4'd4 || digit_write_idx_wire == 4'd5
-                              || digit_write_idx_wire == 4'd7 || digit_write_idx_wire == 4'd8
-                              || digit_write_idx_wire == 4'd9)
-                              && sel_char_wire >= 8'h30;
+    reg [3:0] digit_write_idx_en = 4'd0;
+    reg       seen_nonzero_en    = 1'b0;
+
+    // Wire-line digit selection
+    reg [3:0] d_wire;
+    reg       is_comma_wire, is_digit_wire, is_last_wire;
+    always @* begin
+        is_comma_wire = 1'b0; is_digit_wire = 1'b0; is_last_wire = 1'b0; d_wire = 4'd0;
+        case (digit_write_idx_wire)
+            4'd1: begin is_digit_wire = 1'b1; d_wire = bcd_wire[27:24]; end
+            4'd2: is_comma_wire = 1'b1;
+            4'd3: begin is_digit_wire = 1'b1; d_wire = bcd_wire[23:20]; end
+            4'd4: begin is_digit_wire = 1'b1; d_wire = bcd_wire[19:16]; end
+            4'd5: begin is_digit_wire = 1'b1; d_wire = bcd_wire[15:12]; end
+            4'd6: is_comma_wire = 1'b1;
+            4'd7: begin is_digit_wire = 1'b1; d_wire = bcd_wire[11:8]; end
+            4'd8: begin is_digit_wire = 1'b1; d_wire = bcd_wire[7:4]; end
+            4'd9: begin is_digit_wire = 1'b1; d_wire = bcd_wire[3:0]; is_last_wire = 1'b1; end
+            default: ;
+        endcase
+    end
+    wire show_digit_wire = is_digit_wire && (seen_nonzero_wire || d_wire != 4'd0 || is_last_wire);
+    wire [7:0] sel_char_wire = is_comma_wire ? (seen_nonzero_wire ? 8'h2C : 8'h20)
+                            : show_digit_wire ? (8'h30 + {4'b0, d_wire})
+                                              : 8'h20;
+
+    // Enclave-line digit selection — INLINED, completely separate logic
+    reg [3:0] d_en;
+    reg       is_comma_en, is_digit_en, is_last_en;
+    always @* begin
+        is_comma_en = 1'b0; is_digit_en = 1'b0; is_last_en = 1'b0; d_en = 4'd0;
+        case (digit_write_idx_en)
+            4'd1: begin is_digit_en = 1'b1; d_en = bcd_en[27:24]; end
+            4'd2: is_comma_en = 1'b1;
+            4'd3: begin is_digit_en = 1'b1; d_en = bcd_en[23:20]; end
+            4'd4: begin is_digit_en = 1'b1; d_en = bcd_en[19:16]; end
+            4'd5: begin is_digit_en = 1'b1; d_en = bcd_en[15:12]; end
+            4'd6: is_comma_en = 1'b1;
+            4'd7: begin is_digit_en = 1'b1; d_en = bcd_en[11:8]; end
+            4'd8: begin is_digit_en = 1'b1; d_en = bcd_en[7:4]; end
+            4'd9: begin is_digit_en = 1'b1; d_en = bcd_en[3:0]; is_last_en = 1'b1; end
+            default: ;
+        endcase
+    end
+    wire show_digit_en = is_digit_en && (seen_nonzero_en || d_en != 4'd0 || is_last_en);
+    wire [7:0] sel_char_en = is_comma_en ? (seen_nonzero_en ? 8'h2C : 8'h20)
+                          : show_digit_en ? (8'h30 + {4'b0, d_en})
+                                          : 8'h20;
+
     always @(posedge clk) begin
         if (bcd_done_wire) begin
             digit_write_idx_wire <= 4'd1;
@@ -548,15 +567,6 @@ module top_pipe_mirror_xor #(
         end
     end
 
-    // Blake-clk line FSM (line 3)
-    reg [3:0] digit_write_idx_en = 4'd0;
-    reg       seen_nonzero_en    = 1'b0;
-    wire [7:0] sel_char_en = digit_char_for(digit_write_idx_en, {{8{1'b0}}, bcd_en}, seen_nonzero_en);
-    wire       show_digit_en = (digit_write_idx_en == 4'd1 || digit_write_idx_en == 4'd3
-                              || digit_write_idx_en == 4'd4 || digit_write_idx_en == 4'd5
-                              || digit_write_idx_en == 4'd7 || digit_write_idx_en == 4'd8
-                              || digit_write_idx_en == 4'd9)
-                              && sel_char_en >= 8'h30;
     always @(posedge clk) begin
         if (bcd_done_en) begin
             digit_write_idx_en <= 4'd1;
@@ -572,7 +582,6 @@ module top_pipe_mirror_xor #(
         end
     end
 
-    // Re-render trigger: pulse when EITHER FSM finishes writing its line
     always @(posedge clk) begin
         re_render_req <= 1'b0;
         if (digit_write_idx_wire == LINE2_DYN_LEN[3:0] || digit_write_idx_en == LINE3_DYN_LEN[3:0])
@@ -609,7 +618,8 @@ module top_pipe_mirror_xor #(
     reg        partial_mode = 1'b0;
 
     localparam integer LINE2_FB_START = 32 * FB_W;
-    localparam integer LINE2_FB_END   = 48 * FB_W - 1;
+    // Cover both dynamic lines (2 + 3) — clear bottom half on partial re-render.
+    localparam integer LINE2_FB_END   = 64 * FB_W - 1;
 
     reg [1:0]  line_idx     = 0;
     reg [4:0]  char_in_line = 0;
@@ -710,7 +720,11 @@ module top_pipe_mirror_xor #(
             end
 
             R_NEXT_LN: begin
-                if (line_idx == NUM_LINES - 1 || (partial_mode && line_idx == 2'd2)) begin
+                // Always render to last line (NUM_LINES-1 = 3). partial_mode skips
+                // the title lines 0+1 (= clears at line 2 start) but still walks
+                // through 2 → 3 → done. Previously stopped at line 2 in partial,
+                // which is why the EN frequency on line 3 never rendered.
+                if (line_idx == NUM_LINES - 1) begin
                     rstate <= R_DONE;
                 end else begin
                     line_idx     <= line_idx + 1;
