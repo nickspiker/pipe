@@ -32,6 +32,20 @@ use vsf::vsf_builder::VsfBuilder;
 
 const DEFAULT_PORT: &str = "/dev/ttyACM0";
 
+/// 256-bit FPGA TX_PATTERN mirror. Must match `TX_PATTERN` in
+/// rtl/measure/top_pipe_mirror_xor.v exactly. Source string is
+/// "The quick brown fox jumps over t" (32 ASCII chars = 256 bits).
+/// Byte 0 = 'T' = G#54; bit 0 within each byte is consumed first by the
+/// FPGA's `fpga_tx_reg[0]` (LSB-first per byte). A 256/256 match between
+/// bridge's `fpga_decoded_log` and a rotation of this constant proves
+/// Claims 7+12 bit-clean over that 256-slot capture window.
+const FPGA_TX_PATTERN_256: [u8; 32] = [
+    b'T', b'h', b'e', b' ', b'q', b'u', b'i', b'c',
+    b'k', b' ', b'b', b'r', b'o', b'w', b'n', b' ',
+    b'f', b'o', b'x', b' ', b'j', b'u', b'm', b'p',
+    b's', b' ', b'o', b'v', b'e', b'r', b' ', b't',
+];
+
 /// Global `--inspect` flag — set once during arg parsing, read by send_cmd to optionally pretty-print every request and response.
 static INSPECT: AtomicBool = AtomicBool::new(false);
 
@@ -832,6 +846,19 @@ struct SyncResultParsed {
     /// bit 1 = wire at second boundary (entering enclave slot 2), etc.
     slot_wire_log: [u8; 32],
     slot_wire_log_count: u32,
+    /// FPGA-decoded-bits log: up to 256 bits captured at the FIRST 256 enclave-slot
+    /// crossings after `mirror_started`. Each bit is `1 ^ last_driven_bit ^ wire_at_slot`
+    /// at that boundary — the bridge's belief about the FPGA's TX bit for that slot.
+    /// LSB-first within bytes. Host verifies bit-exact match against all 256 rotations
+    /// of FPGA_TX_PATTERN_256.
+    fpga_decoded_log: [u8; 32],
+    fpga_decoded_log_count: u32,
+    /// Diagnostic: per-edge slots_crossed >SLOTS_CROSSED_MAX events. Non-zero =
+    /// slot_phase parity drifted by however many slots got clamped (drift cascades
+    /// from there).
+    edges_slots_crossed_capped: u32,
+    /// Diagnostic: largest pre-clamp slots_crossed observed in this run.
+    max_observed_slots_crossed: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -1040,6 +1067,19 @@ fn run_wire_sync_full(
         log.copy_from_slice(&data[wire_log_off..wire_log_off + 32]);
         (log, g32(wire_log_off + 32))
     } else { ([0u8; 32], 0) };
+    // FPGA-decoded-bits log (32 bytes) + count (u32). Same backward-compat rule.
+    let fpga_log_off = wire_log_off + 36;
+    let (fpga_decoded_log, fpga_decoded_log_count) = if data.len() >= fpga_log_off + 36 {
+        let mut log = [0u8; 32];
+        log.copy_from_slice(&data[fpga_log_off..fpga_log_off + 32]);
+        (log, g32(fpga_log_off + 32))
+    } else { ([0u8; 32], 0) };
+    // slots_crossed clamp diagnostic (2 × u32). Older firmware → both 0.
+    let clamp_off = fpga_log_off + 36;
+    let (edges_slots_crossed_capped, max_observed_slots_crossed) =
+        if data.len() >= clamp_off + 8 {
+            (g32(clamp_off), g32(clamp_off + 4))
+        } else { (0, 0) };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -1091,6 +1131,10 @@ fn run_wire_sync_full(
         mirror_claim12_mispredict_wrong_polarity,
         slot_wire_log,
         slot_wire_log_count,
+        fpga_decoded_log,
+        fpga_decoded_log_count,
+        edges_slots_crossed_capped,
+        max_observed_slots_crossed,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -2033,6 +2077,21 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
             log.copy_from_slice(&data[wire_log_off..wire_log_off + 32]);
             (log, g32(wire_log_off + 32))
         } else { ([0u8; 32], 0) };
+    // FPGA-decoded-bits log (32 bytes) + count (u32). First 256 decoded enclave-slot
+    // bits for bit-exact verify against the 256-bit FPGA TX_PATTERN.
+    let fpga_log_off = wire_log_off + 36;
+    let (fpga_decoded_log, fpga_decoded_log_count): ([u8; 32], u32) =
+        if data.len() >= fpga_log_off + 36 {
+            let mut log = [0u8; 32];
+            log.copy_from_slice(&data[fpga_log_off..fpga_log_off + 32]);
+            (log, g32(fpga_log_off + 32))
+        } else { ([0u8; 32], 0) };
+    // slots_crossed clamp diagnostic (2 × u32).
+    let clamp_off = fpga_log_off + 36;
+    let (edges_slots_crossed_capped, max_observed_slots_crossed): (u32, u32) =
+        if data.len() >= clamp_off + 8 {
+            (g32(clamp_off), g32(clamp_off + 4))
+        } else { (0, 0) };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -2156,6 +2215,65 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         } else {
             let max_match = data_match.max(idle_match);
             println!("    → neither pattern matches (best: {}/{}). slot_phase tracker drift, FPGA bitstream mismatch, or partial-handshake mid-stream", max_match, n);
+        }
+    }
+    // Rung 1: 256-bit bit-exact verify against FPGA_TX_PATTERN_256. Captures the first
+    // 256 decoded enclave-slot bits and finds the best rotation alignment. A 256/256
+    // match proves Claims 7+12 bit-clean for that capture window. The rotation offset
+    // reflects how many enclave slots elapsed before mirror_started snapshotted the log
+    // (= startup race between FPGA shift register and bridge's first enclave anchor).
+    if fpga_decoded_log_count > 0 {
+        let n = (fpga_decoded_log_count as usize).min(256);
+        let bit_at = |buf: &[u8; 32], i: usize| (buf[i / 8] >> (i % 8)) & 1;
+        let mut best_match = 0usize;
+        let mut best_rot = 0usize;
+        for rot in 0..256 {
+            let matches: usize = (0..n)
+                .filter(|&i| bit_at(&fpga_decoded_log, i) == bit_at(&FPGA_TX_PATTERN_256, (i + rot) & 255))
+                .count();
+            if matches > best_match {
+                best_match = matches;
+                best_rot = rot;
+            }
+        }
+        println!();
+        println!("  FPGA DECODE LOG: first {} enclave-slot bits captured", n);
+        if max_observed_slots_crossed > 0 {
+            println!("    slots_crossed: max observed = {} (clamp = 32){}",
+                max_observed_slots_crossed,
+                if edges_slots_crossed_capped > 0 {
+                    format!("; CLAMP FIRED {} times — slot_phase parity lost on each event",
+                        edges_slots_crossed_capped)
+                } else { String::new() });
+        }
+        let hex_dump = |buf: &[u8; 32]| -> String {
+            buf.iter().enumerate()
+                .map(|(i, &b)| if i % 4 == 0 && i > 0 { format!(" {b:02X}") } else { format!("{b:02X}") })
+                .collect()
+        };
+        println!("    decoded:  {}", hex_dump(&fpga_decoded_log));
+        println!("    expected: {}", hex_dump(&FPGA_TX_PATTERN_256));
+        if best_match == n {
+            println!("    PASS: Claim 7/12 bit-clean over {} enclave slots, rotation +{}", n, best_rot);
+        } else {
+            let pct = 100.0 * best_match as f64 / n as f64;
+            println!("    best rotation: +{}   match: {}/{} ({:.1}%)", best_rot, best_match, n, pct);
+            if best_match < n / 2 + n / 8 {
+                println!("    → far from any rotation. Slot tracker may be misaligned, FPGA bitstream may not match the 256-bit TX_PATTERN, or handshake never fired");
+            } else if (n - best_match) <= n / 32 {
+                println!("    → near-perfect ({} bits off). Residual slot-phase drift over the capture window or off-by-one near the start", n - best_match);
+            }
+        }
+        if n >= 64 {
+            println!("    per-32-bit window match @ best rotation +{}:", best_rot);
+            for w in 0..(n / 32) {
+                let s = w * 32;
+                let e = ((w + 1) * 32).min(n);
+                let m: usize = (s..e)
+                    .filter(|&i| bit_at(&fpga_decoded_log, i) == bit_at(&FPGA_TX_PATTERN_256, (i + best_rot) & 255))
+                    .count();
+                println!("      slots {:3}..{:3}: {:2}/32", s, e, m);
+            }
         }
     }
     // Mirror-mode edge filter accounting. Sum = post-acquisition edges processed.

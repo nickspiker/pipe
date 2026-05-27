@@ -449,6 +449,21 @@ struct SyncResult {
     slot_wire_log: [u8; 32],
     /// Number of bits actually written into slot_wire_log (clamps at 256).
     slot_wire_log_count: u32,
+    /// First-256 FPGA-decoded bits (linear, not ring). One bit per enclave slot:
+    /// LSB of byte 0 = first decoded bit. The bit values are `fpga_bit` from the
+    /// decode line `1 ^ last_driven_bit ^ wire_at_slot`. Host-side compares this
+    /// against all 256 rotations of FPGA_TX_PATTERN_256 — a 256/256 match proves
+    /// Claims 7 + 12 bit-clean for that capture window. Captures FIRST 256 enclave
+    /// slots after `mirror_started`, same convention as slot_wire_log.
+    fpga_decoded_log: [u8; 32],
+    /// Number of bits actually written into fpga_decoded_log (clamps at 256).
+    fpga_decoded_log_count: u32,
+    /// Diagnostic: per-edge slots_crossed >SLOTS_CROSSED_MAX (= clamp fired). Each
+    /// clamp event means slot_phase parity is wrong by however many slots were truncated.
+    edges_slots_crossed_capped: u32,
+    /// Diagnostic: largest single-edge slots_crossed value observed (pre-clamp). Lets
+    /// us see whether the clamp threshold is reasonable for the actual workload.
+    max_observed_slots_crossed: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -504,6 +519,10 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     mirror_claim12_mispredict_wrong_polarity: 0,
     slot_wire_log: [0; 32],
     slot_wire_log_count: 0,
+    fpga_decoded_log: [0; 32],
+    fpga_decoded_log_count: 0,
+    edges_slots_crossed_capped: 0,
+    max_observed_slots_crossed: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1452,6 +1471,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut _edges_rejected_mid_slot: u32 = 0;
     let mut _edges_rejected_wrong_polarity: u32 = 0;
     let mut _edges_accepted_in_mirror: u32 = 0;
+    let mut _edges_slots_crossed_capped: u32 = 0;
+    let mut _max_observed_slots_crossed: u32 = 0;
     // Claim-12-aware polarity prediction model (advisory; counted but not yet wired into
     // accept_for_cdr decision). Bridge models FPGA's Claim 12 encoding:
     //   - effective_fpga_tx_bit = data_mode ? FPGA_TX_PATTERN[fpga_tx_pos] : 0
@@ -1461,7 +1482,22 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     // polarity?) against the observed edge. If new model is right, _edges_claim12_mispredict
     // should be near zero and far less than _edges_rejected_wrong_polarity (the old
     // slotted_oled-tuned check). That signals the new model can safely replace the old.
-    const FPGA_TX_PATTERN: u32 = 0xDEADBEEF;
+    // FPGA TX_PATTERN mirrored on the bridge side for the Claim-12 polarity
+    // advisory. Must match `TX_PATTERN` in rtl/measure/top_pipe_mirror_xor.v
+    // exactly: source string "The quick brown fox jumps over t" (32 ASCII
+    // chars, 256 bits). Byte ordering is natural string order; bit 0 within
+    // each byte is consumed first by the FPGA rotation (LSB-first per byte).
+    const FPGA_TX_PATTERN: [u8; 32] = [
+        b'T', b'h', b'e', b' ', b'q', b'u', b'i', b'c',
+        b'k', b' ', b'b', b'r', b'o', b'w', b'n', b' ',
+        b'f', b'o', b'x', b' ', b'j', b'u', b'm', b'p',
+        b's', b' ', b'o', b'v', b'e', b'r', b' ', b't',
+    ];
+    // Read bit `pos` (0..256) from FPGA_TX_PATTERN, LSB-first per byte.
+    let fpga_tx_bit = |pos: u32| -> u8 {
+        let p = (pos & 255) as usize;
+        (FPGA_TX_PATTERN[p >> 3] >> (p & 7)) & 1
+    };
     let mut fpga_data_mode: bool = false;
     let mut fpga_tx_pos: u32 = 0;
     let mut _edges_claim12_mispredict_no_edge_observed: u32 = 0;   // model: no edge; observed: edge
@@ -1472,6 +1508,12 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     // (next to where wire_at_slot is computed). Linear, not ring — stop logging at 256.
     let mut slot_wire_log: [u8; 32] = [0; 32];
     let mut slot_wire_log_count: u32 = 0;
+    // First-256 FPGA-decoded bits: parallel to slot_wire_log but captures the
+    // post-XOR fpga_bit (1 ^ last_driven_bit ^ wire_at_slot) at each enclave-slot
+    // crossing. Host verifies bit-exact match against the 256-bit FPGA TX pattern
+    // across all 256 rotations. Linear, not ring — stop logging at 256.
+    let mut fpga_decoded_log: [u8; 32] = [0; 32];
+    let mut fpga_decoded_log_count: u32 = 0;
     // Phase 2c bridge-side decode (Claim 12 inverse):
     //   wire_state    = bridge's running view of the wire level (1=HIGH, 0=LOW),
     //                   updated AFTER each accepted edge with that edge's polarity
@@ -1784,6 +1826,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             fpga_tx_pos = 0;
             slot_wire_log = [0; 32];
             slot_wire_log_count = 0;
+            fpga_decoded_log = [0; 32];
+            fpga_decoded_log_count = 0;
             // Count edge for stats but skip CDR update — the anchor is a phase reference,
             // not a slot-duration measurement. Falls through to rising_total/falling_total
             // increment below.
@@ -1812,12 +1856,28 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             if slot_cyc < 8 {
                 accept_for_cdr = false;
             } else {
-                // Step through any slot boundaries this edge crossed. Round to nearest:
-                // an edge slightly past a boundary (small remainder) AND an edge slightly
-                // before the next boundary (large remainder) both get attributed to that
-                // boundary, mirroring real-world edge timing jitter.
-                let new_slots = (cumulative_cyc_since_anchor + slot_cyc / 2) / slot_cyc;
-                let slots_crossed = new_slots.saturating_sub(slots_since_anchor);
+                // Step through any slot boundaries this edge crossed. PER-EDGE math
+                // (same reasoning as the pos_in_slot fix above): cumulative arithmetic
+                // integrates ppm-level CDR drift indefinitely, eventually mis-attributing
+                // slot counts. own_cyc is the rise-to-rise interval, which is ≈N*slot_cyc
+                // for N slots crossed (50% duty cycle on the wire → 2 slots per rising-only
+                // period; sparse data → larger N). Round to nearest. Mid-slot glitches
+                // (own_cyc < slot_cyc/2) naturally round to 0 → no slot_phase toggle.
+                // Sanity cap at SLOTS_CROSSED_MAX: own_cyc_u is u32 (up to 4 G cycles),
+                // which divided by ~46 k slot_cyc gives ~87 k — iterating that many
+                // toggles per edge stalls the inner loop. Real data has runs <16 slots;
+                // 32 leaves headroom and prevents runaway from huge own_cyc spurs at
+                // startup or after long silent gaps.
+                const SLOTS_CROSSED_MAX: u64 = 32;
+                let raw_slots_crossed = ((own_cyc_u as u64) + slot_cyc / 2) / slot_cyc;
+                let slots_crossed = raw_slots_crossed.min(SLOTS_CROSSED_MAX);
+                if raw_slots_crossed > SLOTS_CROSSED_MAX {
+                    _edges_slots_crossed_capped = _edges_slots_crossed_capped.saturating_add(1);
+                }
+                if raw_slots_crossed > _max_observed_slots_crossed as u64 {
+                    _max_observed_slots_crossed = raw_slots_crossed.min(u32::MAX as u64) as u32;
+                }
+                let new_slots = slots_since_anchor.wrapping_add(slots_crossed);
                 // Wire state for slots crossed by this edge: all earlier boundary
                 // crossings share the PRIOR wire_state (no edge happened at those
                 // boundaries — wire stayed put); only the LAST crossing aligns with
@@ -1873,7 +1933,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                         // FPGA model: rotation happens AT host→enclave transition (per
                         // top_pipe_mirror_xor.v: rotate when prev_slot_owner==1 &&
                         // slot_owner==0). Advance our model of the FPGA's TX bit position.
-                        fpga_tx_pos = fpga_tx_pos.wrapping_add(1) & 31;
+                        fpga_tx_pos = fpga_tx_pos.wrapping_add(1) & 255;
                         // FPGA model: if bridge drove 1 in the just-ended host slot, FPGA
                         // sampled wire_in==1 at slot_phase==2 of that host slot and latched
                         // data_mode<=1. From the FPGA Verilog the new data_mode is in
@@ -1889,6 +1949,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                         decode_buffer = (decode_buffer >> 1)
                             | (((fpga_bit & 1) as u32) << 31);
                         decode_count = decode_count.saturating_add(1);
+                        // Capture first 256 decoded bits for bit-exact verify against
+                        // the 256-bit FPGA TX_PATTERN. Linear (not ring): freezes at
+                        // 256 — same convention as slot_wire_log.
+                        if fpga_decoded_log_count < 256 {
+                            let byte_idx = (fpga_decoded_log_count >> 3) as usize;
+                            let bit_in_byte = fpga_decoded_log_count & 7;
+                            if fpga_bit != 0 {
+                                fpga_decoded_log[byte_idx] |= 1 << bit_in_byte;
+                            }
+                            fpga_decoded_log_count += 1;
+                        }
                     }
                 }
                 slots_since_anchor = new_slots;
@@ -1896,7 +1967,14 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                 // How close is the edge to the nearest slot boundary? Edges near a
                 // boundary represent legitimate slot transitions; edges in the middle
                 // of a slot are spurious (SM1 tristate-glitches from drift).
-                let pos_in_slot = cumulative_cyc_since_anchor % slot_cyc;
+                // Use per-edge own_cyc (rise-to-rise interval) modulo slot_cyc, NOT
+                // cumulative-since-anchor — cumulative integrates ppm-level CDR error
+                // indefinitely, eventually drifting off every real slot boundary and
+                // cascade-rejecting all real edges (which suppresses the re-anchor that
+                // would restore alignment). Per-edge modulo is a fresh measurement each
+                // edge: 1-slot edge → own_cyc ≈ slot_cyc → ≈0; N-slot sparse edge →
+                // own_cyc ≈ N*slot_cyc → ≈0; mid-slot glitch → ≈ slot_cyc/2.
+                let pos_in_slot = (own_cyc_u as u64) % slot_cyc;
                 let near_boundary = pos_in_slot < slot_cyc / 4 || pos_in_slot > 3 * slot_cyc / 4;
                 if slots_crossed == 0 || !near_boundary {
                     _edges_rejected_mid_slot += 1;
@@ -1926,7 +2004,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                     //     Edge iff e != current_tx_bit; rising iff e==0 (host went low→high).
                     let (claim12_expect_edge, claim12_expect_rising) = if slot_phase == 0 {
                         let f_new: u8 = if fpga_data_mode {
-                            ((FPGA_TX_PATTERN >> (fpga_tx_pos & 31)) & 1) as u8
+                            fpga_tx_bit(fpga_tx_pos)
                         } else { 0 };
                         if f_new == 0 {
                             (true, last_driven_bit == 0)
@@ -1938,7 +2016,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                         // enclave just ended (rotation happens on host→enclave, not
                         // enclave→host).
                         let f_prev: u8 = if fpga_data_mode {
-                            ((FPGA_TX_PATTERN >> (fpga_tx_pos & 31)) & 1) as u8
+                            fpga_tx_bit(fpga_tx_pos)
                         } else { 0 };
                         let e = 1 ^ f_prev ^ last_driven_bit;
                         let b = current_tx_bit;
@@ -2412,6 +2490,10 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         mirror_claim12_mispredict_wrong_polarity: _edges_claim12_mispredict_wrong_polarity,
         slot_wire_log,
         slot_wire_log_count,
+        fpga_decoded_log,
+        fpga_decoded_log_count,
+        edges_slots_crossed_capped: _edges_slots_crossed_capped,
+        max_observed_slots_crossed: _max_observed_slots_crossed,
     }
 }
 
@@ -3733,6 +3815,16 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // Raw wire-state-per-slot log (32 bytes = 256 bits) + count (u32).
                 payload.extend_from_slice(&s.slot_wire_log);
                 payload.extend_from_slice(&s.slot_wire_log_count.to_le_bytes());
+                // FPGA-decoded-bits log (32 bytes = 256 bits) + count (u32). First 256
+                // decoded enclave-slot bits for bit-exact verify against the 256-bit
+                // FPGA TX_PATTERN. Older host parsers stop after slot_wire_log_count.
+                payload.extend_from_slice(&s.fpga_decoded_log);
+                payload.extend_from_slice(&s.fpga_decoded_log_count.to_le_bytes());
+                // slots_crossed clamp diagnostic (2 × u32): how often the SLOTS_CROSSED_MAX
+                // clamp fired (each event = slot_phase parity off by truncated count) and
+                // the largest single-edge slots_crossed observed (pre-clamp).
+                payload.extend_from_slice(&s.edges_slots_crossed_capped.to_le_bytes());
+                payload.extend_from_slice(&s.max_observed_slots_crossed.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3904,6 +3996,16 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // Raw wire-state-per-slot log (32 bytes = 256 bits) + count (u32).
                 payload.extend_from_slice(&s.slot_wire_log);
                 payload.extend_from_slice(&s.slot_wire_log_count.to_le_bytes());
+                // FPGA-decoded-bits log (32 bytes = 256 bits) + count (u32). First 256
+                // decoded enclave-slot bits for bit-exact verify against the 256-bit
+                // FPGA TX_PATTERN. Older host parsers stop after slot_wire_log_count.
+                payload.extend_from_slice(&s.fpga_decoded_log);
+                payload.extend_from_slice(&s.fpga_decoded_log_count.to_le_bytes());
+                // slots_crossed clamp diagnostic (2 × u32): how often the SLOTS_CROSSED_MAX
+                // clamp fired (each event = slot_phase parity off by truncated count) and
+                // the largest single-edge slots_crossed observed (pre-clamp).
+                payload.extend_from_slice(&s.edges_slots_crossed_capped.to_le_bytes());
+                payload.extend_from_slice(&s.max_observed_slots_crossed.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

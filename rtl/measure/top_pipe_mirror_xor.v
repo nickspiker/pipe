@@ -82,7 +82,7 @@ module top_pipe_mirror_xor #(
     parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench): 1 XOR + 4 buffers. Drives BOTH the blake-clock divider and (downstream of that) the enclave-clock divider — cascaded power-of-2 dividers, no comparators.
     parameter integer ENCLAVE_DIV_LOG2 = 7,       // First-stage divider: ring_raw → enclave_clk = ring / 2^N. Measured on silicon: ring_raw ≈ 381 MHz → enclave_clk ≈ 2.98 MHz at /128. Target range 1-5 MHz: fast enough for BLAKE3 (Phase D Fmax 125 MHz — 40× margin) and any in-enclave compute, slow enough that the 25 MHz crystal-clocked 3-FF synchronisers in the OLED frequency counter (and any other clk-domain crossing) sample cleanly (~8.4× oversample). Pure binary-counter bit-tap (no comparator/subtractor).
     parameter integer WIRE_DIV_LOG2 = 8,          // Second-stage divider: enclave_clk → wire_clk = enclave / 2^N. Measured: 2.98 MHz / 256 = 11.6 kHz (within the 10-40 kHz target range). Slot rate (wire_clk/4) ≈ 2.9 kHz, slot ≈ 345 µs. Independent counter from the enclave divider.
-    parameter [31:0]  TX_PATTERN  = 32'hDEADBEEF  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Non-symmetric so bridge-side decode quality can be distinguished from accidental phase-shift artefacts: any rotation of DEADBEEF is recognisable, and bit errors show up as deviations from those rotations (unlike a symmetric pattern like AAAAAAAA, where every bit-shift maps back to itself). IDLE mode (pre-handshake) always sends 0 regardless of this parameter.
+    parameter [255:0] TX_PATTERN  = 256'h74207265766f2073706d756a20786f66206e776f7262206b6369757120656854  // FPGA TX bits, LSB-first. Source string "The quick brown fox jumps over t" (32 ASCII chars = 256 bits). Byte 0 'T' (G#54) lives in bits [7:0], so the first bit on the wire is the LSB of 'T' (0). Used in DATA mode only (gated by data_mode flag). 256-bit non-repeating-within-32 pattern lets the bridge verify bit-exact decode across all 256 rotations: a successful 256/256 match proves Claims 7+12 at the hardware-demo level. IDLE mode (pre-handshake) always sends 0 regardless of this parameter.
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
     output wire oled_scl,
@@ -263,7 +263,7 @@ module top_pipe_mirror_xor #(
     localparam integer IDLE_CLEAR_SLOTS = 4096;
     localparam integer IDLE_CLEAR_W     = $clog2(IDLE_CLEAR_SLOTS);
 
-    reg [31:0]              fpga_tx_reg = TX_PATTERN;
+    reg [255:0]             fpga_tx_reg = TX_PATTERN;
     reg                     data_mode = 1'b0;     // Claim 7b: 0 = IDLE (force own_data=0), 1 = DATA (use fpga_tx_reg[0])
     wire                    effective_fpga_tx_bit = data_mode ? fpga_tx_reg[0] : 1'b0;
     reg                     bridge_last_decoded = 1'b0;        // sampled mid-host-slot; idle host = 0
@@ -316,7 +316,7 @@ module top_pipe_mirror_xor #(
         // effective_fpga_tx_bit gating decides whether the rotated bit reaches
         // the wire or gets masked to 0 (idle).
         if (prev_slot_owner == 1'b1 && slot_owner == 1'b0) begin
-            fpga_tx_reg <= {fpga_tx_reg[0], fpga_tx_reg[31:1]};
+            fpga_tx_reg <= {fpga_tx_reg[0], fpga_tx_reg[255:1]};
         end
     end
 
