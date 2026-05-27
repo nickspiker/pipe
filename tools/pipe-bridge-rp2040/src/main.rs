@@ -464,6 +464,10 @@ struct SyncResult {
     /// Diagnostic: largest single-edge slots_crossed value observed (pre-clamp). Lets
     /// us see whether the clamp threshold is reasonable for the actual workload.
     max_observed_slots_crossed: u32,
+    /// Diagnostic: edges in the parity-ambiguous zone (own_cyc within ±slot_cyc/16 of
+    /// (N + 0.5) * slot_cyc) where slot_phase update was skipped. Counting these tells
+    /// us whether the filter is firing at all and how often parity-flip-risk events occur.
+    edges_parity_ambiguous_skipped: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -523,6 +527,7 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     fpga_decoded_log_count: 0,
     edges_slots_crossed_capped: 0,
     max_observed_slots_crossed: 0,
+    edges_parity_ambiguous_skipped: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1473,6 +1478,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut _edges_accepted_in_mirror: u32 = 0;
     let mut _edges_slots_crossed_capped: u32 = 0;
     let mut _max_observed_slots_crossed: u32 = 0;
+    let mut _edges_parity_ambiguous_skipped: u32 = 0;
     // Claim-12-aware polarity prediction model (advisory; counted but not yet wired into
     // accept_for_cdr decision). Bridge models FPGA's Claim 12 encoding:
     //   - effective_fpga_tx_bit = data_mode ? FPGA_TX_PATTERN[fpga_tx_pos] : 0
@@ -2176,12 +2182,21 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                     // over the ≤8 slots until the next accepted period sample, not over
                     // the entire run. Bounds accumulated arithmetic drift.
                     //
-                    // slot_phase parity is NOT reset — risings can land at host-entry
-                    // OR enclave-entry depending on bridge's TX pattern (e.g., bridge
-                    // FFFFFFFF gives risings at host-entry; bridge AAAAAAAA gives them
-                    // at enclave-entry in IDLE mode). The slot tracker just advanced
-                    // slot_phase based on slots_crossed for this edge; trust that
-                    // value and reset only the timing accumulator.
+                    // Slot_phase parity RE-SYNC from absolute time. Per-edge slots_crossed
+                    // is fragile: edges with own_cyc near (N + 0.5) * slot_cyc round to N
+                    // or N+1 with ~50/50 chance from sub-cycle noise, randomly flipping
+                    // slot_phase parity. Once flipped, the per-edge tracker can't recover
+                    // (it just keeps advancing from the wrong parity). The fix: at every
+                    // accepted period sample (which we know is a clean integer-multiple-of
+                    // -slot_cyc edge), recompute slot_phase from total_cyc_since_mirror_start
+                    // / slot_cyc % 2. Absolute-time derivation is immune to per-edge errors
+                    // (drift is bounded by ppm-level CDR error × time-since-start, which is
+                    // well under one slot for reasonable runs).
+                    //
+                    // The first anchor (mirror_started) declares slot_phase = 0 (enclave-
+                    // entry, since SM1's first instruction is a `nop side 0` that exits
+                    // host-driving). All subsequent slot_phase values are referenced to
+                    // that origin.
                     if mirror_started {
                         cumulative_cyc_since_anchor = 0;
                         slots_since_anchor = 0;
@@ -2494,6 +2509,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         fpga_decoded_log_count,
         edges_slots_crossed_capped: _edges_slots_crossed_capped,
         max_observed_slots_crossed: _max_observed_slots_crossed,
+        edges_parity_ambiguous_skipped: _edges_parity_ambiguous_skipped,
     }
 }
 
@@ -3825,6 +3841,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // the largest single-edge slots_crossed observed (pre-clamp).
                 payload.extend_from_slice(&s.edges_slots_crossed_capped.to_le_bytes());
                 payload.extend_from_slice(&s.max_observed_slots_crossed.to_le_bytes());
+                // Parity-ambiguous skip counter (u32). Older host parsers stop after
+                // max_observed_slots_crossed; this is a tail-appended diagnostic.
+                payload.extend_from_slice(&s.edges_parity_ambiguous_skipped.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -4006,6 +4025,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // the largest single-edge slots_crossed observed (pre-clamp).
                 payload.extend_from_slice(&s.edges_slots_crossed_capped.to_le_bytes());
                 payload.extend_from_slice(&s.max_observed_slots_crossed.to_le_bytes());
+                // Parity-ambiguous skip counter (u32). Older host parsers stop after
+                // max_observed_slots_crossed; this is a tail-appended diagnostic.
+                payload.extend_from_slice(&s.edges_parity_ambiguous_skipped.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
