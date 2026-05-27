@@ -1943,27 +1943,42 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             }
             let period_slot = (interval_fp_period >> frac_bits) as i32;
             if period_slot >= 16 {
-                let half_period = period_slot / 2;
-                // cascade_mode=0 (single-period data): symmetric window, drop "in space".
-                // cascade_mode=1 (multi-period data, LFSR with long runs): allow n=1..4.
-                let n_periods: i32 = if cascade_mode == 0 {
-                    if period_now >= period_slot - half_period
-                        && period_now < period_slot + half_period
-                    {
-                        1
-                    } else {
-                        _multi_slot_skipped_track += 1;
-                        // Fall through to per-polarity logic below — that path still
-                        // runs and reports diagnostics. The period tracker just doesn't
-                        // update on this glitchy period sample.
-                        0
-                    }
-                } else if period_now < period_slot + half_period { 1 }
-                  else if period_now < 2 * period_slot + half_period { 2 }
-                  else if period_now < 3 * period_slot + half_period { 3 }
-                  else if period_now < 4 * period_slot + half_period { 4 }
-                  else { _multi_slot_skipped_track += 1; 0 };
-                if n_periods >= 1 {
+                // Narrow-window multi-N CDR (replaces the old cascade_mode windowing).
+                // Reference the SEED period (acquisition value, fixed) for the integer-N
+                // matching — NOT the live `period_slot`. Referencing the live value lets
+                // the N=N+1 fixed points drift with the loop: if slot_cyc has slewed to
+                // 1/N of true, period_now looks like a perfect N×current_slot_cyc match
+                // → CDR locks to the wrong harmonic (the cascade-promotion bug that
+                // plagued cascade_mode=1). Seed is fixed, so only the TRUE multiple
+                // matches; everything else gets rejected. Tight ±2% window accepts
+                // legitimate ring-osc drift (<300 ppm over a 1-sec test = 1.7 cyc on a
+                // 5768-cyc seed; 2% window = ~115 cyc, 68× headroom for real drift)
+                // but rejects anything off by a slot or more.
+                //
+                // Coverage N=1..8: rise-to-rise = 1 FPGA period for AAAA-on-both-sides,
+                // 2 periods for IDLE+AAAA (the most-common-edge case), up to 8 periods
+                // for sparse data. cascade_mode parameter is now effectively unused —
+                // this approach subsumes both cascade_mode=0 (forced N=1) and
+                // cascade_mode=1 (try N=1..4 with wide windows) with stricter matching.
+                let _ = cascade_mode;  // intentionally ignored
+                // NB: `acquisition_slot_cyc_period` is poorly named — it's already a
+                // full PERIOD (rise-to-rise = LOW seed + HIGH seed in cyc), not a slot.
+                // No ×2 needed.
+                let seed_period_cyc = acquisition_slot_cyc_period as i32;
+                let narrow_window = (seed_period_cyc / 50).max(4);
+                let n_periods: i32 = if seed_period_cyc > 0 {
+                    ((period_now + seed_period_cyc / 2) / seed_period_cyc).max(1).min(8)
+                } else { 0 };
+                let expected_seed = n_periods * seed_period_cyc;
+                let seed_phase_err = period_now - expected_seed;
+                let accept = n_periods >= 1 && seed_phase_err.abs() < narrow_window;
+                if !accept {
+                    _multi_slot_skipped_track += 1;
+                }
+                if accept {
+                    // Phase error for slewing the LIVE interval_fp_period: use the live
+                    // period_slot (not seed) so we track real drift toward the live value.
+                    // Acceptance was already gated by the seed-anchored check above.
                     let expected = n_periods * period_slot;
                     let phase_err_period = period_now - expected;
                     let shift = frac_bits as i32 - p_shift as i32;
