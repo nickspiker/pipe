@@ -88,11 +88,13 @@ module top_pipe_mirror_xor #(
     output wire oled_sda,
     inout  wire pipe_pad,                         // bidirectional wire to the bridge (E16)
     output reg  led,
-    // Per-side TX mirrors for audible diagnostic (one piezo each, single-ended to GND).
-    // Each pin is silent (driven 0) during the OTHER side's slot, so you can listen to
-    // just one TX at a time without cross-contamination.
-    output wire piezo_host_tx,                    // bridge's drive sampled at wire_in_sync, only during host slots (p42, M4)
-    output wire piezo_enclave_tx                  // FPGA's enclave_drive_value, only during enclave slots (p46, N4)
+    // FPGA's own enclave TX mirror as an H-bridge pair driving a single piezo
+    // (piezo between the two pins, not piezo-to-GND): doubles the swing across the
+    // piezo from 3.3 V to 6.6 V peak-to-peak. Continuously holds the latched enclave
+    // value through host slots ("interpolate" = no audio gap between enclave updates,
+    // just a stair-step at the FPGA-cycle rate).
+    output wire piezo_enclave_p,                  // in-phase   (p42, M4)
+    output wire piezo_enclave_n                   // anti-phase (p46, N4)
 );
 
     localparam integer CELL_W      = `GLYPH_CELL_W;
@@ -257,12 +259,22 @@ module top_pipe_mirror_xor #(
     wire enclave_drive_value = 1'b1 ^ effective_fpga_tx_bit ^ bridge_last_decoded;
     wire wire_drive_en = ~slot_owner;
 
-    // Per-side TX piezo mirrors. Each pin reflects ONLY its side's drive (silent during
-    // the other side's slot) so a single-ended piezo on each gives a clean per-side
-    // audible signal. At slow-rate slot ~230 µs, slot rate ~2.2 kHz, toggle audio rate
-    // ~1 kHz — well into the audible range.
-    assign piezo_host_tx    = (slot_owner == 1'b1) ? wire_in_sync       : 1'b0;
-    assign piezo_enclave_tx = (slot_owner == 1'b0) ? enclave_drive_value : 1'b0;
+    // FPGA enclave-TX piezo H-bridge. Latch enclave_drive_value during enclave slots
+    // and HOLD it through the following host slot (= continuous "interpolate"; no audio
+    // gap between enclave updates, just a stair-step at the FPGA-cycle rate). The two
+    // output pins are anti-phase so the piezo (wired BETWEEN p42 M4 and p46 N4, NOT
+    // pin-to-GND) sees 2× the swing — 6.6 V peak-to-peak instead of 3.3 V. LPF sets
+    // DRIVE=4 (the lowest LVCMOS33 value; ECP5 LVCMOS33 doesn't go below — for ~2 mA
+    // add a series resistor with the piezo). At slow-rate slot ~230 µs the toggle is
+    // up to ~2.2 kHz, well in the audible range.
+    reg piezo_value = 1'b0;
+    always @(posedge enclave_clk) begin
+        if (slot_owner == 1'b0) begin
+            piezo_value <= enclave_drive_value;
+        end
+    end
+    assign piezo_enclave_p =  piezo_value;
+    assign piezo_enclave_n = ~piezo_value;
 
     always @(posedge enclave_clk) begin
         prev_slot_owner <= slot_owner;

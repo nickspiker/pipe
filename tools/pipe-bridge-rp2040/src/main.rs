@@ -968,6 +968,12 @@ const PIO_EDGE_PROG: [u16; 12] = [
 ];
 const PIO_EDGE_SM: usize = 0;
 const PIO_EDGE_GPIO: u8 = 0; // GP0
+// Bridge-side TX piezo mirror as H-bridge pair (piezo between the two pins, not pin-
+// to-GND): doubles the audio swing across the piezo from 3.3 V to 6.6 V. Latched on
+// host slot entry, held through enclave slots so the audio is continuous (a stair-
+// step at the FPGA-cycle rate, not a chopped per-slot toggle).
+const PIEZO_TX_P_GPIO: u8 = 10; // in-phase   leg
+const PIEZO_TX_N_GPIO: u8 = 11; // anti-phase leg
 
 /// One-shot load of the program into PIO0 SM0's instruction memory and register setup.
 /// Safe to call repeatedly — disables the SM first.
@@ -1392,6 +1398,29 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     // The `iter` counter is now edge-indexed, not poll-indexed.
     pio_edge_init();
     let initial = pio_edge_start();
+
+    // TX piezo H-bridge pair (GP10 in-phase, GP11 anti-phase). Configure as SIO outputs
+    // once; latched on each host-slot entry in the slots_crossed loop and HELD through
+    // enclave slots. Use lowest-drive pad setting (2 mA on RP2040 is `Drive2mA`) to keep
+    // the piezo quiet by default; the user can increase if more volume wanted.
+    {
+        use embassy_rp::pac::{IO_BANK0, PADS_BANK0, SIO};
+        use embassy_rp::pac::io::vals::{Oeover, Outover};
+        for pin in [PIEZO_TX_P_GPIO, PIEZO_TX_N_GPIO] {
+            PADS_BANK0.gpio(pin as usize).modify(|w| {
+                w.set_od(false);
+                w.set_ie(false);
+                w.set_drive(embassy_rp::pac::pads::vals::Drive::_2MA);
+            });
+            IO_BANK0.gpio(pin as usize).ctrl().write(|w| {
+                w.set_funcsel(5); // SIO
+                w.set_outover(Outover::NORMAL);
+                w.set_oeover(Oeover::NORMAL);
+            });
+            SIO.gpio_oe(0).value_set().write_value(1 << pin);
+            SIO.gpio_out(0).value_clr().write_value(1 << pin);
+        }
+    }
 
     // Mirror-XOR slot-aware drive: pre-configure SM1 with the 2-instruction program
     // and side-set on PINDIRS. The SM isn't enabled here — pio_tx_mirror_start fires
@@ -1824,6 +1853,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                         if tx_bits_remaining == 0 {
                             tx_shift_reg = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
                             tx_bits_remaining = 32;
+                        }
+                        // Piezo H-bridge update: in-phase = current_tx_bit, anti-phase
+                        // = its inverse. Held through next enclave slot (no update there)
+                        // so audio is continuous.
+                        let sio = embassy_rp::pac::SIO;
+                        if current_tx_bit != 0 {
+                            sio.gpio_out(0).value_set().write_value(1 << PIEZO_TX_P_GPIO);
+                            sio.gpio_out(0).value_clr().write_value(1 << PIEZO_TX_N_GPIO);
+                        } else {
+                            sio.gpio_out(0).value_clr().write_value(1 << PIEZO_TX_P_GPIO);
+                            sio.gpio_out(0).value_set().write_value(1 << PIEZO_TX_N_GPIO);
                         }
                     } else {
                         // Entering enclave: the bit bridge WAS driving in the prior host

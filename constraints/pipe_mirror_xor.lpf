@@ -22,11 +22,12 @@ IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=DOWN;
 LOCATE COMP "led" SITE "T6";
 IOBUF PORT "led" IO_TYPE=LVCMOS33;
 
-# Per-side TX piezo mirror outputs (identified via pin_id scanner). Single-ended
-# piezo each, one terminal to pin / one to GND. DRIVE=8 (default) for moderate
-# volume; can drop to 4 if quieter wanted, raise to 16 if louder.
-LOCATE COMP "piezo_host_tx" SITE "M4";
-IOBUF PORT "piezo_host_tx" IO_TYPE=LVCMOS33 DRIVE=8;
+# FPGA enclave-TX piezo H-bridge pair. Piezo wired BETWEEN the two pins (not pin-
+# to-GND) — anti-phase = 2× swing. DRIVE=4 is the lowest LVCMOS33 setting on ECP5
+# (no 2 mA option for LVCMOS33). For even quieter, add a series resistor (e.g.,
+# 1-10 kΩ) inline with the piezo.
+LOCATE COMP "piezo_enclave_p" SITE "M4";
+IOBUF PORT "piezo_enclave_p" IO_TYPE=LVCMOS33 DRIVE=4;
 
-LOCATE COMP "piezo_enclave_tx" SITE "N4";
-IOBUF PORT "piezo_enclave_tx" IO_TYPE=LVCMOS33 DRIVE=8;
+LOCATE COMP "piezo_enclave_n" SITE "N4";
+IOBUF PORT "piezo_enclave_n" IO_TYPE=LVCMOS33 DRIVE=4;
