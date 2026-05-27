@@ -79,8 +79,9 @@
 
 module top_pipe_mirror_xor #(
     parameter integer CLK_DIV     = 7,            // 25 MHz / 7 → ~3.5 MHz CE → ~28 kHz SCL
-    parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench)
-    parameter integer RING_DIV    = 20480,        // mod-N divider on the ring → enclave_clk (10× slower than slotted_oled baseline to give bridge per-edge timing budget ~10× more margin against slot_phase parity drift, SM1 startup race, and FPGA mid-host-slot sample timing skew; slot ~230 µs ≈ 2.2 kHz toggle). Production target is 22 kHz but proving correctness at 10× slower first per nick's "slow is the security property" guidance.
+    parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench): 1 XOR + 4 buffers. Drives BOTH the blake-clock divider and (downstream of that) the enclave-clock divider — cascaded power-of-2 dividers, no comparators.
+    parameter integer BLAKE_DIV_LOG2   = 6,       // First-stage divider: ring_raw → blake_clk = ring / 2^BLAKE_DIV_LOG2. At 365 MHz ring, 2^6 = /64 → ~5.7 MHz (well below the 125 MHz BLAKE3 silicon Fmax per Phase D, plenty of margin for future BLAKE3 wiring). Pure binary-counter bit-tap (no subtractor / no comparator). 6 is small enough to keep the counter shallow but big enough to keep blake_clk in a comfortable range.
+    parameter integer ENCLAVE_DIV_LOG2 = 8,       // Second-stage divider: blake_clk → enclave_clk = blake / 2^ENCLAVE_DIV_LOG2. From ~5.7 MHz blake_clk, 2^8 = /256 → ~22 kHz enclave_clk. Slot rate (enclave_clk/4) ≈ 5.5 kHz, slot ≈ 180 µs. Pure binary-counter bit-tap. Independent counter from the blake divider — they're cascaded but each is its own state machine.
     parameter [31:0]  TX_PATTERN  = 32'hDEADBEEF  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Non-symmetric so bridge-side decode quality can be distinguished from accidental phase-shift artefacts: any rotation of DEADBEEF is recognisable, and bit errors show up as deviations from those rotations (unlike a symmetric pattern like AAAAAAAA, where every bit-shift maps back to itself). IDLE mode (pre-handshake) always sends 0 regardless of this parameter.
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
@@ -187,21 +188,35 @@ module top_pipe_mirror_xor #(
     wire ring_raw;
     (* keep *) DCCA dcca_ring_raw (.CLKI(ring_q[0]), .CE(1'b1), .CLKO(ring_raw));
 
-    localparam integer DIV_HALF = (RING_DIV >> 1);
-    localparam integer DIV_W    = ($clog2(DIV_HALF) > 0) ? $clog2(DIV_HALF) : 1;
-    reg [DIV_W-1:0] ring_div_cnt = 0;
-    reg             ring_div_out = 0;
-    always @(posedge ring_raw) begin
-        if (ring_div_cnt == (DIV_HALF - 1)) begin
-            ring_div_cnt <= 0;
-            ring_div_out <= ~ring_div_out;
-        end else begin
-            ring_div_cnt <= ring_div_cnt + 1'b1;
-        end
-    end
+    // -------------------------------------------------------------------------
+    // Two cascaded power-of-2 dividers, pure binary bit-tap (no comparator /
+    // no subtractor — saves LUTs vs. a mod-N counter). Each counter free-runs
+    // on its input clock; the top bit toggles at input/2^width, which IS the
+    // output clock. Each output goes through a DCCA buffer so it can drive
+    // multiple FFs cleanly per Phase D's "ring fanout needs DCCA" lesson.
+    //
+    //   stage 1: ring_raw → blake_clk      (= ring / 2^BLAKE_DIV_LOG2 → ~5.7 MHz)
+    //   stage 2: blake_clk → enclave_clk   (= blake / 2^ENCLAVE_DIV_LOG2 → ~22 kHz)
+    //
+    // Independence: stage 2 counter is clocked by blake_clk, not by ring_raw.
+    // No comparator, no reset, just a free-running counter whose MSB is the
+    // output. Stages are cascaded for the protocol clock but blake_clk is
+    // independently usable (when BLAKE3 lands it'll clock off blake_clk
+    // directly without touching the enclave divider).
+    // -------------------------------------------------------------------------
+    reg [BLAKE_DIV_LOG2-1:0] blake_div_cnt = 0;
+    always @(posedge ring_raw) blake_div_cnt <= blake_div_cnt + 1'b1;
+    wire blake_clk;
+    (* keep *) DCCA dcca_blake_clk (
+        .CLKI(blake_div_cnt[BLAKE_DIV_LOG2-1]), .CE(1'b1), .CLKO(blake_clk)
+    );
 
+    reg [ENCLAVE_DIV_LOG2-1:0] enclave_div_cnt = 0;
+    always @(posedge blake_clk) enclave_div_cnt <= enclave_div_cnt + 1'b1;
     wire enclave_clk;
-    (* keep *) DCCA dcca_enclave_clk (.CLKI(ring_div_out), .CE(1'b1), .CLKO(enclave_clk));
+    (* keep *) DCCA dcca_enclave_clk (
+        .CLKI(enclave_div_cnt[ENCLAVE_DIV_LOG2-1]), .CE(1'b1), .CLKO(enclave_clk)
+    );
 
     // -------------------------------------------------------------------------
     // Slot-phase / slot-owner machinery — unchanged from slotted_oled.
