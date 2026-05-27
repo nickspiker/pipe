@@ -341,48 +341,72 @@ module top_pipe_mirror_xor #(
     );
 
     // -------------------------------------------------------------------------
-    // Frequency counter (genlocked) — unchanged from random.
+    // Frequency counters — TWO parallel: enclave_clk (line 2) + blake_clk (line 3).
+    // Same genlocked pattern as random/slotted_oled, but cloned for blake_clk so the
+    // OLED shows both rate-divider taps. Each toggles a register on its own clock,
+    // 3-FF synchronises into clk domain, counts the synced edges between frame_pulses,
+    // multiplies by FREQ_MAGIC, BCDs the result, then a digit-write FSM streams the
+    // digits into the strings array for its assigned line.
     // -------------------------------------------------------------------------
     reg         frame_pulse = 1'b0;
-    reg  [31:0] freq_hz     = 32'd0;
-    reg         freq_valid  = 1'b0;
 
-    reg meas_toggle = 1'b0;
-    always @(posedge enclave_clk) meas_toggle <= ~meas_toggle;
-    reg [2:0] toggle_sync = 3'b0;
-    always @(posedge clk) toggle_sync <= {toggle_sync[1:0], meas_toggle};
-    wire meas_edge = toggle_sync[2] ^ toggle_sync[1];
+    // Enclave-clk counter
+    reg  [31:0] freq_hz_en  = 32'd0;
+    reg         freq_valid_en = 1'b0;
+    reg meas_toggle_en = 1'b0;
+    always @(posedge enclave_clk) meas_toggle_en <= ~meas_toggle_en;
+    reg [2:0] toggle_sync_en = 3'b0;
+    always @(posedge clk) toggle_sync_en <= {toggle_sync_en[1:0], meas_toggle_en};
+    wire meas_edge_en = toggle_sync_en[2] ^ toggle_sync_en[1];
+
+    // Blake-clk counter (~5.7 MHz — same divider into clk domain works because
+    // 25 MHz crystal > 2 × 5.7 MHz, Nyquist OK; 3-FF synchroniser handles the
+    // metastability margin).
+    reg  [31:0] freq_hz_bl  = 32'd0;
+    reg         freq_valid_bl = 1'b0;
+    reg meas_toggle_bl = 1'b0;
+    always @(posedge blake_clk) meas_toggle_bl <= ~meas_toggle_bl;
+    reg [2:0] toggle_sync_bl = 3'b0;
+    always @(posedge clk) toggle_sync_bl <= {toggle_sync_bl[1:0], meas_toggle_bl};
+    wire meas_edge_bl = toggle_sync_bl[2] ^ toggle_sync_bl[1];
 
     localparam integer FREQ_MAGIC = 100;
-    reg [23:0] edge_cnt = 24'd0;
+    reg [23:0] edge_cnt_en = 24'd0;
+    reg [23:0] edge_cnt_bl = 24'd0;
     always @(posedge clk) begin
-        freq_valid <= 1'b0;
+        freq_valid_en <= 1'b0;
+        freq_valid_bl <= 1'b0;
         if (frame_pulse) begin
-            freq_hz    <= edge_cnt * FREQ_MAGIC;
-            edge_cnt   <= meas_edge ? 24'd1 : 24'd0;
-            freq_valid <= 1'b1;
-        end else if (meas_edge) begin
-            edge_cnt <= edge_cnt + 24'd1;
+            freq_hz_en    <= edge_cnt_en * FREQ_MAGIC;
+            edge_cnt_en   <= meas_edge_en ? 24'd1 : 24'd0;
+            freq_valid_en <= 1'b1;
+            freq_hz_bl    <= edge_cnt_bl * FREQ_MAGIC;
+            edge_cnt_bl   <= meas_edge_bl ? 24'd1 : 24'd0;
+            freq_valid_bl <= 1'b1;
+        end else begin
+            if (meas_edge_en) edge_cnt_en <= edge_cnt_en + 24'd1;
+            if (meas_edge_bl) edge_cnt_bl <= edge_cnt_bl + 24'd1;
         end
     end
 
     // -------------------------------------------------------------------------
-    // Binary → BCD.
+    // Binary → BCD — one per counter.
     // -------------------------------------------------------------------------
     localparam integer BCD_DIGITS = 8;
     localparam integer BIN_W      = 24;
-    wire [BCD_DIGITS*4-1:0] bcd;
-    wire                    bcd_done;
-    bin_to_bcd #(
-        .BIN_W      (BIN_W),
-        .BCD_DIGITS (BCD_DIGITS)
-    ) b2b (
-        .clk     (clk),
-        .reset_n (1'b1),
-        .start   (freq_valid),
-        .bin     (freq_hz[BIN_W-1:0]),
-        .bcd     (bcd),
-        .done    (bcd_done)
+    wire [BCD_DIGITS*4-1:0] bcd_en;
+    wire                    bcd_done_en;
+    bin_to_bcd #(.BIN_W(BIN_W), .BCD_DIGITS(BCD_DIGITS)) b2b_en (
+        .clk(clk), .reset_n(1'b1),
+        .start(freq_valid_en), .bin(freq_hz_en[BIN_W-1:0]),
+        .bcd(bcd_en), .done(bcd_done_en)
+    );
+    wire [BCD_DIGITS*4-1:0] bcd_bl;
+    wire                    bcd_done_bl;
+    bin_to_bcd #(.BIN_W(BIN_W), .BCD_DIGITS(BCD_DIGITS)) b2b_bl (
+        .clk(clk), .reset_n(1'b1),
+        .start(freq_valid_bl), .bin(freq_hz_bl[BIN_W-1:0]),
+        .bcd(bcd_bl), .done(bcd_done_bl)
     );
 
     // -------------------------------------------------------------------------
@@ -416,8 +440,11 @@ module top_pipe_mirror_xor #(
     integer si;
 
     localparam integer LINE2_BASE       = 2 * MAX_CHARS_PER_LINE;
-    localparam integer LINE2_DIGIT_BASE = LINE2_BASE + 5;
+    localparam integer LINE2_DIGIT_BASE = LINE2_BASE + 4;
     localparam integer LINE2_DYN_LEN    = 9;
+    localparam integer LINE3_BASE       = 3 * MAX_CHARS_PER_LINE;
+    localparam integer LINE3_DIGIT_BASE = LINE3_BASE + 4;
+    localparam integer LINE3_DYN_LEN    = 9;
 
     initial begin
         for (si = 0; si < STR_LEN; si = si + 1) strings[si] = 8'h00;
@@ -425,72 +452,131 @@ module top_pipe_mirror_xor #(
         strings[24] = "M"; strings[25] = "I"; strings[26] = "R"; strings[27] = "R";
         strings[28] = "O"; strings[29] = "R"; strings[30] = "-"; strings[31] = "X";
         strings[32] = "O"; strings[33] = "R";
-        strings[LINE2_BASE + 0] = "C";
-        strings[LINE2_BASE + 1] = "L";
-        strings[LINE2_BASE + 2] = "K";
-        strings[LINE2_BASE + 3] = ":";
-        strings[LINE2_BASE + 4] = " ";
-        strings[LINE2_BASE + 5] = "0";
-        strings[LINE2_BASE + 6] = ",";
+        // Line 2: "EN: X,XXX,XXX Hz" — enclave_clk (protocol slot rate × 4)
+        strings[LINE2_BASE + 0] = "E";
+        strings[LINE2_BASE + 1] = "N";
+        strings[LINE2_BASE + 2] = ":";
+        strings[LINE2_BASE + 3] = " ";
+        strings[LINE2_BASE + 4] = "0";
+        strings[LINE2_BASE + 5] = ",";
+        strings[LINE2_BASE + 6] = "0";
         strings[LINE2_BASE + 7] = "0";
         strings[LINE2_BASE + 8] = "0";
-        strings[LINE2_BASE + 9] = "0";
-        strings[LINE2_BASE +10] = ",";
+        strings[LINE2_BASE + 9] = ",";
+        strings[LINE2_BASE +10] = "0";
         strings[LINE2_BASE +11] = "0";
         strings[LINE2_BASE +12] = "0";
-        strings[LINE2_BASE +13] = "0";
-        strings[LINE2_BASE +14] = " ";
-        strings[LINE2_BASE +15] = "H";
-        strings[LINE2_BASE +16] = "z";
+        strings[LINE2_BASE +13] = " ";
+        strings[LINE2_BASE +14] = "H";
+        strings[LINE2_BASE +15] = "z";
+        // Line 3: "BL: X,XXX,XXX Hz" — blake_clk (= ring / 2^BLAKE_DIV_LOG2, future BLAKE3 src)
+        strings[LINE3_BASE + 0] = "B";
+        strings[LINE3_BASE + 1] = "L";
+        strings[LINE3_BASE + 2] = ":";
+        strings[LINE3_BASE + 3] = " ";
+        strings[LINE3_BASE + 4] = "0";
+        strings[LINE3_BASE + 5] = ",";
+        strings[LINE3_BASE + 6] = "0";
+        strings[LINE3_BASE + 7] = "0";
+        strings[LINE3_BASE + 8] = "0";
+        strings[LINE3_BASE + 9] = ",";
+        strings[LINE3_BASE +10] = "0";
+        strings[LINE3_BASE +11] = "0";
+        strings[LINE3_BASE +12] = "0";
+        strings[LINE3_BASE +13] = " ";
+        strings[LINE3_BASE +14] = "H";
+        strings[LINE3_BASE +15] = "z";
     end
 
-    reg [3:0] digit_write_idx = 4'd0;
-    reg       seen_nonzero    = 1'b0;
+    // -------------------------------------------------------------------------
+    // Digit-write FSMs — one per line. Each independently streams 9 chars
+    // (4 digits, comma, 3 digits, comma, last digit) from its BCD into its
+    // line's strings[] cells. re_render_req fires when EITHER finishes (a
+    // single OR — the renderer will get the latest of both).
+    // -------------------------------------------------------------------------
     reg       re_render_req   = 1'b0;
 
-    reg [3:0] sel_digit;
-    reg       sel_is_comma;
-    reg       sel_is_digit;
-    reg       sel_is_last;
-    always @* begin
-        sel_is_comma = 1'b0;
-        sel_is_digit = 1'b0;
-        sel_is_last  = 1'b0;
-        sel_digit    = 4'd0;
-        case (digit_write_idx)
-            4'd1: begin sel_is_digit = 1'b1; sel_digit = bcd[27:24]; end
-            4'd2: sel_is_comma = 1'b1;
-            4'd3: begin sel_is_digit = 1'b1; sel_digit = bcd[23:20]; end
-            4'd4: begin sel_is_digit = 1'b1; sel_digit = bcd[19:16]; end
-            4'd5: begin sel_is_digit = 1'b1; sel_digit = bcd[15:12]; end
-            4'd6: sel_is_comma = 1'b1;
-            4'd7: begin sel_is_digit = 1'b1; sel_digit = bcd[11:8]; end
-            4'd8: begin sel_is_digit = 1'b1; sel_digit = bcd[7:4]; end
-            4'd9: begin sel_is_digit = 1'b1; sel_digit = bcd[3:0]; sel_is_last = 1'b1; end
-            default: ;
-        endcase
-    end
+    function automatic [7:0] digit_char_for;
+        input [3:0]  widx;
+        input [31:0] bcd_in;
+        input        seen_nz;
+        reg          is_comma, is_digit, is_last;
+        reg [3:0]    d;
+        reg          show;
+        begin
+            is_comma = 1'b0; is_digit = 1'b0; is_last = 1'b0; d = 4'd0;
+            case (widx)
+                4'd1: begin is_digit = 1'b1; d = bcd_in[27:24]; end
+                4'd2: is_comma = 1'b1;
+                4'd3: begin is_digit = 1'b1; d = bcd_in[23:20]; end
+                4'd4: begin is_digit = 1'b1; d = bcd_in[19:16]; end
+                4'd5: begin is_digit = 1'b1; d = bcd_in[15:12]; end
+                4'd6: is_comma = 1'b1;
+                4'd7: begin is_digit = 1'b1; d = bcd_in[11:8]; end
+                4'd8: begin is_digit = 1'b1; d = bcd_in[7:4]; end
+                4'd9: begin is_digit = 1'b1; d = bcd_in[3:0]; is_last = 1'b1; end
+                default: ;
+            endcase
+            show = is_digit && (seen_nz || d != 4'd0 || is_last);
+            digit_char_for = is_comma ? (seen_nz ? 8'h2C : 8'h20)
+                            : show    ? (8'h30 + {4'b0, d})
+                                        : 8'h20;
+        end
+    endfunction
 
-    wire show_digit = sel_is_digit && (seen_nonzero || sel_digit != 4'd0 || sel_is_last);
-    wire [7:0] sel_char = sel_is_comma ? (seen_nonzero ? 8'h2C : 8'h20)
-                       : show_digit   ? (8'h30 + {4'b0, sel_digit})
-                                       : 8'h20;
-
+    // Enclave-clk line FSM (line 2)
+    reg [3:0] digit_write_idx_en = 4'd0;
+    reg       seen_nonzero_en    = 1'b0;
+    wire [7:0] sel_char_en = digit_char_for(digit_write_idx_en, {{8{1'b0}}, bcd_en}, seen_nonzero_en);
+    wire       show_digit_en = (digit_write_idx_en == 4'd1 || digit_write_idx_en == 4'd3
+                              || digit_write_idx_en == 4'd4 || digit_write_idx_en == 4'd5
+                              || digit_write_idx_en == 4'd7 || digit_write_idx_en == 4'd8
+                              || digit_write_idx_en == 4'd9)
+                              && sel_char_en >= 8'h30;
     always @(posedge clk) begin
-        re_render_req <= 1'b0;
-        if (bcd_done) begin
-            digit_write_idx <= 4'd1;
-            seen_nonzero    <= 1'b0;
-        end else if (digit_write_idx != 4'd0) begin
-            strings[LINE2_DIGIT_BASE + (digit_write_idx - 1)] <= sel_char;
-            if (show_digit) seen_nonzero <= 1'b1;
-            if (digit_write_idx == LINE2_DYN_LEN[3:0]) begin
-                digit_write_idx <= 4'd0;
-                re_render_req   <= 1'b1;
+        if (bcd_done_en) begin
+            digit_write_idx_en <= 4'd1;
+            seen_nonzero_en    <= 1'b0;
+        end else if (digit_write_idx_en != 4'd0) begin
+            strings[LINE2_DIGIT_BASE + (digit_write_idx_en - 1)] <= sel_char_en;
+            if (show_digit_en) seen_nonzero_en <= 1'b1;
+            if (digit_write_idx_en == LINE2_DYN_LEN[3:0]) begin
+                digit_write_idx_en <= 4'd0;
             end else begin
-                digit_write_idx <= digit_write_idx + 4'd1;
+                digit_write_idx_en <= digit_write_idx_en + 4'd1;
             end
         end
+    end
+
+    // Blake-clk line FSM (line 3)
+    reg [3:0] digit_write_idx_bl = 4'd0;
+    reg       seen_nonzero_bl    = 1'b0;
+    wire [7:0] sel_char_bl = digit_char_for(digit_write_idx_bl, {{8{1'b0}}, bcd_bl}, seen_nonzero_bl);
+    wire       show_digit_bl = (digit_write_idx_bl == 4'd1 || digit_write_idx_bl == 4'd3
+                              || digit_write_idx_bl == 4'd4 || digit_write_idx_bl == 4'd5
+                              || digit_write_idx_bl == 4'd7 || digit_write_idx_bl == 4'd8
+                              || digit_write_idx_bl == 4'd9)
+                              && sel_char_bl >= 8'h30;
+    always @(posedge clk) begin
+        if (bcd_done_bl) begin
+            digit_write_idx_bl <= 4'd1;
+            seen_nonzero_bl    <= 1'b0;
+        end else if (digit_write_idx_bl != 4'd0) begin
+            strings[LINE3_DIGIT_BASE + (digit_write_idx_bl - 1)] <= sel_char_bl;
+            if (show_digit_bl) seen_nonzero_bl <= 1'b1;
+            if (digit_write_idx_bl == LINE3_DYN_LEN[3:0]) begin
+                digit_write_idx_bl <= 4'd0;
+            end else begin
+                digit_write_idx_bl <= digit_write_idx_bl + 4'd1;
+            end
+        end
+    end
+
+    // Re-render trigger: pulse when EITHER FSM finishes writing its line
+    always @(posedge clk) begin
+        re_render_req <= 1'b0;
+        if (digit_write_idx_en == LINE2_DYN_LEN[3:0] || digit_write_idx_bl == LINE3_DYN_LEN[3:0])
+            re_render_req <= 1'b1;
     end
 
     function [6:0] line_baseline(input [1:0] ln);
