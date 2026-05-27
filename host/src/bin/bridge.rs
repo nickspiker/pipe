@@ -1228,14 +1228,15 @@ fn cmd_wire_sync(port_path: &str, args: &[String]) -> Result<(), String> {
         let pct = 100.0 * popcount as f64 / 32.0;
         println!("  FPGA decode: {} enclave slots; last 32 bits = G#{:08X} (popcount {} = {:.1}% ones)",
             r.fpga_decoded_count, buf, popcount, pct);
-        // Rotation-matching helper: if TX_PATTERN was AAAAAAAA, any 32-bit window
-        // that captured a full cycle decodes to a rotation of 0xAAAAAAAA. Show all
-        // 32 rotations of the FPGA-bitstream default so the user can spot a match.
-        // (Compact: just flag whether buf matches any rotation of AAAAAAAA.)
-        let target: u32 = 0xAAAA_AAAA;
-        let matches_default = (0..32).any(|k| buf == target.rotate_left(k));
-        if matches_default {
-            println!("    → matches a rotation of 0xAAAAAAAA (FPGA bitstream default TX_PATTERN)");
+        // Rotation-matching helper: if TX_PATTERN matches a known FPGA bitstream
+        // default, any 32-bit window that captured a full cycle decodes to a rotation
+        // of that pattern. Check both the symmetric AAAAAAAA (legacy default) and
+        // the non-symmetric DEADBEEF (current default — bit-shift distinguishable).
+        let matches_rot = |target: u32| (0..32).any(|k| buf == target.rotate_left(k));
+        if matches_rot(0xDEAD_BEEF) {
+            println!("    → matches a rotation of 0xDEADBEEF (FPGA bitstream default TX_PATTERN)");
+        } else if matches_rot(0xAAAA_AAAA) {
+            println!("    → matches a rotation of 0xAAAAAAAA (legacy FPGA TX_PATTERN; symmetric — masks phase-shift artefacts)");
         }
     }
     if r.period_sample_count > 0 {

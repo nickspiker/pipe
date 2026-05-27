@@ -81,7 +81,7 @@ module top_pipe_mirror_xor #(
     parameter integer CLK_DIV     = 7,            // 25 MHz / 7 → ~3.5 MHz CE → ~28 kHz SCL
     parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench)
     parameter integer RING_DIV    = 2048,         // mod-N divider on the ring → enclave_clk (matches slotted_oled 8× slowdown)
-    parameter [31:0]  TX_PATTERN  = 32'hAAAAAAAA  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Default = AAAAAAAA so post-handshake the wire pattern visibly differs from idle (50% transition density vs idle's 100%), making the handshake transition observable from bridge wire stats. IDLE mode (pre-handshake) always sends 0 regardless of this parameter, preserving wire_sync's clean-toggle acquisition target. For full bidirectional data exchange demo, set this to whatever payload the FPGA should transmit; bridge decodes it from its slot-aware position once it tracks data-mode wire pattern (Phase 2c).
+    parameter [31:0]  TX_PATTERN  = 32'hDEADBEEF  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Non-symmetric so bridge-side decode quality can be distinguished from accidental phase-shift artefacts: any rotation of DEADBEEF is recognisable, and bit errors show up as deviations from those rotations (unlike a symmetric pattern like AAAAAAAA, where every bit-shift maps back to itself). IDLE mode (pre-handshake) always sends 0 regardless of this parameter.
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
     output wire oled_scl,
