@@ -412,6 +412,17 @@ struct SyncResult {
     /// ~22 kHz × ~750 ms wall time, expect tens of thousands; pre-handshake bits are
     /// all 0 (FPGA in IDLE), post-handshake bits carry TX_PATTERN content.
     fpga_decoded_count: u32,
+    /// Mirror-mode edge filter accounting (0 in wire_sync). Each post-acquisition edge
+    /// hits exactly one of these three counters, so the sum equals the number of edges
+    /// processed by the slot-phase filter. Use the ratios to diagnose decode quality
+    /// regressions: a healthy lock has accepted >> rejected; high mid-slot count means
+    /// CDR phase drifted away from FPGA slot boundaries; high wrong-polarity count
+    /// means the bridge's predicted polarity (slot_phase + last_driven_bit + current
+    /// _tx_bit) doesn't match the wire (= slot_phase parity is off, or tx_shift_reg
+    /// drifted out of lockstep with SM1's OSR consumption).
+    mirror_edges_accepted: u32,
+    mirror_edges_rejected_mid_slot: u32,
+    mirror_edges_rejected_wrong_polarity: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -459,6 +470,9 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     period_ema_slow_fp: 0,
     fpga_decoded_buffer: 0,
     fpga_decoded_count: 0,
+    mirror_edges_accepted: 0,
+    mirror_edges_rejected_mid_slot: 0,
+    mirror_edges_rejected_wrong_polarity: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -2200,6 +2214,9 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         },
         fpga_decoded_buffer: decode_buffer,
         fpga_decoded_count: decode_count,
+        mirror_edges_accepted: _edges_accepted_in_mirror,
+        mirror_edges_rejected_mid_slot: _edges_rejected_mid_slot,
+        mirror_edges_rejected_wrong_polarity: _edges_rejected_wrong_polarity,
     }
 }
 
@@ -3509,6 +3526,12 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // slots that contributed. Both are 0 outside mirror mode.
                 payload.extend_from_slice(&s.fpga_decoded_buffer.to_le_bytes());
                 payload.extend_from_slice(&s.fpga_decoded_count.to_le_bytes());
+                // Mirror-mode filter counters appendix — 3 × u32 for accepted, mid-slot
+                // rejected, wrong-polarity rejected. All 0 in wire_sync; useful for
+                // diagnosing decode regressions vs. filter false-rejection rates.
+                payload.extend_from_slice(&s.mirror_edges_accepted.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_edges_rejected_mid_slot.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_edges_rejected_wrong_polarity.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3668,6 +3691,12 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // per Claim 12 inverse, u32 enclave-slot count. Both 0 in wire_sync.
                 payload.extend_from_slice(&s.fpga_decoded_buffer.to_le_bytes());
                 payload.extend_from_slice(&s.fpga_decoded_count.to_le_bytes());
+                // Mirror-mode filter counters appendix — 3 × u32 for accepted, mid-slot
+                // rejected, wrong-polarity rejected. See SyncResult doc; matches the
+                // wire_sync appendix layout.
+                payload.extend_from_slice(&s.mirror_edges_accepted.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_edges_rejected_mid_slot.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_edges_rejected_wrong_polarity.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

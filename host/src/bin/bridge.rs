@@ -763,6 +763,13 @@ struct SyncResultParsed {
     fpga_decoded_buffer: u32,
     /// Total enclave-slot crossings that decoded a bit (mirror mode only; 0 in wire_sync).
     fpga_decoded_count: u32,
+    /// Mirror-mode edge filter counters. Sum = post-acquisition edges processed by the
+    /// filter. Healthy: accepted >> rejected. Diagnostic for decode regressions —
+    /// high mid_slot means CDR phase drifted; high wrong_polarity means slot_phase
+    /// parity or tx_shift_reg got out of lockstep with SM1.
+    mirror_edges_accepted: u32,
+    mirror_edges_rejected_mid_slot: u32,
+    mirror_edges_rejected_wrong_polarity: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -951,6 +958,13 @@ fn run_wire_sync_full(
     let (fpga_decoded_buffer, fpga_decoded_count) = if data.len() >= decode_off + 8 {
         (g32(decode_off), g32(decode_off + 4))
     } else { (0, 0) };
+    // Mirror-mode filter counters appendix (3 × u32). Same backward-compat rule —
+    // older firmware that doesn't surface these returns a shorter payload → all 0.
+    let filter_off = decode_off + 8;
+    let (mirror_edges_accepted, mirror_edges_rejected_mid_slot, mirror_edges_rejected_wrong_polarity) =
+        if data.len() >= filter_off + 12 {
+            (g32(filter_off), g32(filter_off + 4), g32(filter_off + 8))
+        } else { (0, 0, 0) };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -994,6 +1008,9 @@ fn run_wire_sync_full(
         period_ema_slow_fp,
         fpga_decoded_buffer,
         fpga_decoded_count,
+        mirror_edges_accepted,
+        mirror_edges_rejected_mid_slot,
+        mirror_edges_rejected_wrong_polarity,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1915,6 +1932,13 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
     let (fpga_decoded_buffer, fpga_decoded_count) = if data.len() >= decode_off + 8 {
         (g32(decode_off), g32(decode_off + 4))
     } else { (0, 0) };
+    // Mirror-mode filter counters appendix (3 × u32). Backward-compat: older firmware
+    // returns shorter payload → all 0.
+    let filter_off = decode_off + 8;
+    let (mirror_edges_accepted, mirror_edges_rejected_mid_slot, mirror_edges_rejected_wrong_polarity) =
+        if data.len() >= filter_off + 12 {
+            (g32(filter_off), g32(filter_off + 4), g32(filter_off + 8))
+        } else { (0, 0, 0) };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -2001,6 +2025,22 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
                 fpga_decoded_buffer.rotate_left(24),
                 fpga_decoded_buffer);
         }
+    }
+    // Mirror-mode edge filter accounting. Sum = post-acquisition edges processed.
+    // Healthy lock: accepted ≫ rejected. Diagnostic for decode regressions.
+    let filter_total = mirror_edges_accepted
+        + mirror_edges_rejected_mid_slot
+        + mirror_edges_rejected_wrong_polarity;
+    if filter_total > 0 {
+        let pct = |n: u32| 100.0 * n as f64 / filter_total as f64;
+        println!();
+        println!("  MIRROR filter: {} edges processed", filter_total);
+        println!("    accepted:                  {:>6} ({:.1}%)",
+            mirror_edges_accepted, pct(mirror_edges_accepted));
+        println!("    rejected (mid-slot):       {:>6} ({:.1}%) — edge fell outside the ±¼-slot acceptance window around predicted boundaries (CDR phase drifted)",
+            mirror_edges_rejected_mid_slot, pct(mirror_edges_rejected_mid_slot));
+        println!("    rejected (wrong polarity): {:>6} ({:.1}%) — edge polarity didn't match slot_phase + last/current TX bit prediction (slot_phase parity or tx_shift_reg out of lockstep with SM1)",
+            mirror_edges_rejected_wrong_polarity, pct(mirror_edges_rejected_wrong_polarity));
     }
     print_period_hist(&period_hist, period_seed_cyc);
 
