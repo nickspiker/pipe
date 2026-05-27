@@ -423,6 +423,20 @@ struct SyncResult {
     mirror_edges_accepted: u32,
     mirror_edges_rejected_mid_slot: u32,
     mirror_edges_rejected_wrong_polarity: u32,
+    /// Claim-12-aware polarity prediction stats (ADVISORY; not yet wired into
+    /// accept_for_cdr). Bridge models FPGA's TX bit position + data_mode state
+    /// per Claim 12, predicts which slot boundaries SHOULD produce a transition
+    /// and in which direction, and compares to the observed edge. If `claim12_match`
+    /// dominates over the two mispredict counters, the model is correct and can
+    /// replace the old slotted_oled-tuned polarity check in `wrong_polarity` above.
+    /// Mispredict categories:
+    ///   `_no_edge_observed`: model says no edge expected, but an edge was observed
+    ///                        (= our model says wire would have stayed the same; reality
+    ///                        produced an edge; either model wrong or a glitch)
+    ///   `_wrong_polarity`:   model predicted an edge but in the opposite direction
+    mirror_claim12_match: u32,
+    mirror_claim12_mispredict_no_edge_observed: u32,
+    mirror_claim12_mispredict_wrong_polarity: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -473,6 +487,9 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     mirror_edges_accepted: 0,
     mirror_edges_rejected_mid_slot: 0,
     mirror_edges_rejected_wrong_polarity: 0,
+    mirror_claim12_match: 0,
+    mirror_claim12_mispredict_no_edge_observed: 0,
+    mirror_claim12_mispredict_wrong_polarity: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1392,6 +1409,21 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut _edges_rejected_mid_slot: u32 = 0;
     let mut _edges_rejected_wrong_polarity: u32 = 0;
     let mut _edges_accepted_in_mirror: u32 = 0;
+    // Claim-12-aware polarity prediction model (advisory; counted but not yet wired into
+    // accept_for_cdr decision). Bridge models FPGA's Claim 12 encoding:
+    //   - effective_fpga_tx_bit = data_mode ? FPGA_TX_PATTERN[fpga_tx_pos] : 0
+    //   - enclave wire value    = 1 ^ effective_fpga_tx_bit ^ bridge_last_decoded
+    //   - host wire value       = bridge's current drive
+    // Compare the predicted transition (would happen at this slot boundary? if so, what
+    // polarity?) against the observed edge. If new model is right, _edges_claim12_mispredict
+    // should be near zero and far less than _edges_rejected_wrong_polarity (the old
+    // slotted_oled-tuned check). That signals the new model can safely replace the old.
+    const FPGA_TX_PATTERN: u32 = 0xDEADBEEF;
+    let mut fpga_data_mode: bool = false;
+    let mut fpga_tx_pos: u32 = 0;
+    let mut _edges_claim12_mispredict_no_edge_observed: u32 = 0;   // model: no edge; observed: edge
+    let mut _edges_claim12_mispredict_wrong_polarity: u32 = 0;     // model: edge with polarity X; observed: opposite
+    let mut _edges_claim12_match: u32 = 0;                         // model and observation agree on polarity
     // Phase 2c bridge-side decode (Claim 12 inverse):
     //   wire_state    = bridge's running view of the wire level (1=HIGH, 0=LOW),
     //                   updated AFTER each accepted edge with that edge's polarity
@@ -1700,6 +1732,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             tx_bits_remaining = 32;
             current_tx_bit = 0;
             last_driven_bit = 0;
+            fpga_data_mode = false;
+            fpga_tx_pos = 0;
             // Count edge for stats but skip CDR update — the anchor is a phase reference,
             // not a slot-duration measurement. Falls through to rising_total/falling_total
             // increment below.
@@ -1766,6 +1800,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                         // slot is now `last_driven_bit` (used by both the polarity-filter
                         // below and our decode below).
                         last_driven_bit = current_tx_bit;
+                        // FPGA model: rotation happens AT host→enclave transition (per
+                        // top_pipe_mirror_xor.v: rotate when prev_slot_owner==1 &&
+                        // slot_owner==0). Advance our model of the FPGA's TX bit position.
+                        fpga_tx_pos = fpga_tx_pos.wrapping_add(1) & 31;
+                        // FPGA model: if bridge drove 1 in the just-ended host slot, FPGA
+                        // sampled wire_in==1 at slot_phase==2 of that host slot and latched
+                        // data_mode<=1. From the FPGA Verilog the new data_mode is in
+                        // effect starting THIS enclave slot we're entering now.
+                        if last_driven_bit == 1 {
+                            fpga_data_mode = true;
+                        }
                         // Phase 2c decode: derive the FPGA's TX bit for this enclave slot
                         // from observed wire state. enclave_drive = 1 ^ fpga_bit ^
                         // bridge_last_decoded; bridge knows it drove `last_driven_bit` in
@@ -1787,22 +1832,63 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                     _edges_rejected_mid_slot += 1;
                     accept_for_cdr = false;
                 } else {
-                    // Slot boundary crossed. Predict expected edge polarity based on
-                    // slot phase and which bit bridge drove/is driving:
-                    //   Just entered enclave (slot_phase=0): expect RISING iff
-                    //     last_driven_bit==0 (line was LOW going in → FPGA pulls HIGH).
-                    //   Just entered host (slot_phase=1): expect FALLING iff
-                    //     current_tx_bit==0 (line was HIGH from FPGA → bridge pulls LOW).
+                    // OLD polarity prediction (slotted_oled-stub-tuned). Still ADVISORY
+                    // (counted but not gating acceptance) so we can compare against the
+                    // NEW Claim-12-aware prediction below.
                     let expect_rising_here = slot_phase == 0 && last_driven_bit == 0;
                     let expect_falling_here = slot_phase == 1 && current_tx_bit == 0;
-                    let polarity_ok = (rising && expect_rising_here)
-                                   || (!rising && expect_falling_here);
-                    if !polarity_ok {
+                    let old_polarity_ok = (rising && expect_rising_here)
+                                       || (!rising && expect_falling_here);
+                    if !old_polarity_ok {
                         _edges_rejected_wrong_polarity += 1;
-                        accept_for_cdr = false;
-                    } else {
-                        _edges_accepted_in_mirror += 1;
                     }
+
+                    // NEW Claim-12-aware polarity prediction. ADVISORY for now: count how
+                    // often it agrees with observation. If agreement rate is high, we
+                    // know the model is right and can wire it into accept_for_cdr next.
+                    //
+                    // Two boundary kinds:
+                    //   host→enclave (slot_phase=0 here): wire transitions if FPGA's
+                    //     effective bit at this enclave == 0. Polarity = rising iff
+                    //     last_driven_bit==0 (bridge drove 0 → enclave brings wire up to 1).
+                    //   enclave→host (slot_phase=1 here): enclave value was
+                    //     e = 1 ^ fpga_prev ^ last_driven_bit; host value = current_tx_bit.
+                    //     Edge iff e != current_tx_bit; rising iff e==0 (host went low→high).
+                    let (claim12_expect_edge, claim12_expect_rising) = if slot_phase == 0 {
+                        let f_new: u8 = if fpga_data_mode {
+                            ((FPGA_TX_PATTERN >> (fpga_tx_pos & 31)) & 1) as u8
+                        } else { 0 };
+                        if f_new == 0 {
+                            (true, last_driven_bit == 0)
+                        } else {
+                            (false, false)
+                        }
+                    } else {
+                        // For slot_phase==1, fpga_tx_pos points to the bit FPGA used in the
+                        // enclave just ended (rotation happens on host→enclave, not
+                        // enclave→host).
+                        let f_prev: u8 = if fpga_data_mode {
+                            ((FPGA_TX_PATTERN >> (fpga_tx_pos & 31)) & 1) as u8
+                        } else { 0 };
+                        let e = 1 ^ f_prev ^ last_driven_bit;
+                        let b = current_tx_bit;
+                        if e != b {
+                            (true, e == 0)
+                        } else {
+                            (false, false)
+                        }
+                    };
+                    if claim12_expect_edge {
+                        if rising == claim12_expect_rising {
+                            _edges_claim12_match += 1;
+                        } else {
+                            _edges_claim12_mispredict_wrong_polarity += 1;
+                        }
+                    } else {
+                        _edges_claim12_mispredict_no_edge_observed += 1;
+                    }
+
+                    _edges_accepted_in_mirror += 1;
                 }
             }
         }
@@ -2217,6 +2303,9 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         mirror_edges_accepted: _edges_accepted_in_mirror,
         mirror_edges_rejected_mid_slot: _edges_rejected_mid_slot,
         mirror_edges_rejected_wrong_polarity: _edges_rejected_wrong_polarity,
+        mirror_claim12_match: _edges_claim12_match,
+        mirror_claim12_mispredict_no_edge_observed: _edges_claim12_mispredict_no_edge_observed,
+        mirror_claim12_mispredict_wrong_polarity: _edges_claim12_mispredict_wrong_polarity,
     }
 }
 
@@ -3532,6 +3621,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.mirror_edges_accepted.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_edges_rejected_mid_slot.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_edges_rejected_wrong_polarity.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_claim12_match.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_claim12_mispredict_no_edge_observed.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_claim12_mispredict_wrong_polarity.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -3697,6 +3789,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&s.mirror_edges_accepted.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_edges_rejected_mid_slot.to_le_bytes());
                 payload.extend_from_slice(&s.mirror_edges_rejected_wrong_polarity.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_claim12_match.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_claim12_mispredict_no_edge_observed.to_le_bytes());
+                payload.extend_from_slice(&s.mirror_claim12_mispredict_wrong_polarity.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

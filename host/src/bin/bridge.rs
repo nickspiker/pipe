@@ -770,6 +770,14 @@ struct SyncResultParsed {
     mirror_edges_accepted: u32,
     mirror_edges_rejected_mid_slot: u32,
     mirror_edges_rejected_wrong_polarity: u32,
+    /// Claim-12-aware polarity prediction model: how often the new model's
+    /// prediction matched (or didn't match) the observed edge. ADVISORY: the
+    /// firmware counts but doesn't yet use this prediction for accept_for_cdr.
+    /// If `claim12_match` dominates over the two mispredict counters, the new
+    /// model is correct and can replace the old slotted_oled-tuned check.
+    mirror_claim12_match: u32,
+    mirror_claim12_mispredict_no_edge_observed: u32,
+    mirror_claim12_mispredict_wrong_polarity: u32,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -965,6 +973,12 @@ fn run_wire_sync_full(
         if data.len() >= filter_off + 12 {
             (g32(filter_off), g32(filter_off + 4), g32(filter_off + 8))
         } else { (0, 0, 0) };
+    // Claim-12-aware polarity model advisory counters (3 × u32).
+    let claim12_off = filter_off + 12;
+    let (mirror_claim12_match, mirror_claim12_mispredict_no_edge_observed, mirror_claim12_mispredict_wrong_polarity) =
+        if data.len() >= claim12_off + 12 {
+            (g32(claim12_off), g32(claim12_off + 4), g32(claim12_off + 8))
+        } else { (0, 0, 0) };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -1011,6 +1025,9 @@ fn run_wire_sync_full(
         mirror_edges_accepted,
         mirror_edges_rejected_mid_slot,
         mirror_edges_rejected_wrong_polarity,
+        mirror_claim12_match,
+        mirror_claim12_mispredict_no_edge_observed,
+        mirror_claim12_mispredict_wrong_polarity,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1939,6 +1956,12 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         if data.len() >= filter_off + 12 {
             (g32(filter_off), g32(filter_off + 4), g32(filter_off + 8))
         } else { (0, 0, 0) };
+    // Claim-12-aware polarity advisory counters (3 × u32).
+    let claim12_off = filter_off + 12;
+    let (mirror_claim12_match, mirror_claim12_mispredict_no_edge, mirror_claim12_mispredict_wrong_polarity) =
+        if data.len() >= claim12_off + 12 {
+            (g32(claim12_off), g32(claim12_off + 4), g32(claim12_off + 8))
+        } else { (0, 0, 0) };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -2041,6 +2064,28 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
             mirror_edges_rejected_mid_slot, pct(mirror_edges_rejected_mid_slot));
         println!("    rejected (wrong polarity): {:>6} ({:.1}%) — edge polarity didn't match slot_phase + last/current TX bit prediction (slot_phase parity or tx_shift_reg out of lockstep with SM1)",
             mirror_edges_rejected_wrong_polarity, pct(mirror_edges_rejected_wrong_polarity));
+    }
+    // Claim-12-aware polarity prediction (ADVISORY — counted only, not yet wired into
+    // accept_for_cdr). If `match` dominates over `mispredict_*`, the new model is right
+    // and can replace the old prediction.
+    let claim12_total = mirror_claim12_match + mirror_claim12_mispredict_no_edge + mirror_claim12_mispredict_wrong_polarity;
+    if claim12_total > 0 {
+        let pct = |n: u32| 100.0 * n as f64 / claim12_total as f64;
+        println!();
+        println!("  CLAIM 12 polarity prediction (advisory): {} edges evaluated", claim12_total);
+        println!("    matched observation:       {:>6} ({:.1}%) — model predicted edge with correct polarity",
+            mirror_claim12_match, pct(mirror_claim12_match));
+        println!("    mispredict (no edge):      {:>6} ({:.1}%) — model predicted no edge but observed one (model says wire would have stayed same)",
+            mirror_claim12_mispredict_no_edge, pct(mirror_claim12_mispredict_no_edge));
+        println!("    mispredict (polarity):     {:>6} ({:.1}%) — model predicted edge but wrong direction",
+            mirror_claim12_mispredict_wrong_polarity, pct(mirror_claim12_mispredict_wrong_polarity));
+        if mirror_claim12_match * 4 > claim12_total * 3 {
+            println!("    → model agreement >75% — Claim-12-aware prediction is correct; can replace old slotted_oled-tuned check");
+        } else if mirror_claim12_match > mirror_claim12_mispredict_no_edge + mirror_claim12_mispredict_wrong_polarity {
+            println!("    → model agreement >50% — better than old model but needs work before going live");
+        } else {
+            println!("    → model agreement <50% — Claim 12 prediction is WRONG; check fpga_tx_pos tracking, data_mode detection, or FPGA_TX_PATTERN constant");
+        }
     }
     print_period_hist(&period_hist, period_seed_cyc);
 
