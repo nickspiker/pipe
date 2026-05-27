@@ -80,7 +80,7 @@
 module top_pipe_mirror_xor #(
     parameter integer CLK_DIV     = 7,            // 25 MHz / 7 → ~3.5 MHz CE → ~28 kHz SCL
     parameter integer RING_STAGES = 5,            // ring-osc stages (production matches DUT bench)
-    parameter integer RING_DIV    = 2048,         // mod-N divider on the ring → enclave_clk (matches slotted_oled 8× slowdown)
+    parameter integer RING_DIV    = 20480,        // mod-N divider on the ring → enclave_clk (10× slower than slotted_oled baseline to give bridge per-edge timing budget ~10× more margin against slot_phase parity drift, SM1 startup race, and FPGA mid-host-slot sample timing skew; slot ~230 µs ≈ 2.2 kHz toggle). Production target is 22 kHz but proving correctness at 10× slower first per nick's "slow is the security property" guidance.
     parameter [31:0]  TX_PATTERN  = 32'hDEADBEEF  // FPGA TX bits, LSB-first. Used in DATA mode only (gated by data_mode flag). Non-symmetric so bridge-side decode quality can be distinguished from accidental phase-shift artefacts: any rotation of DEADBEEF is recognisable, and bit errors show up as deviations from those rotations (unlike a symmetric pattern like AAAAAAAA, where every bit-shift maps back to itself). IDLE mode (pre-handshake) always sends 0 regardless of this parameter.
 )(
     input  wire clk,                              // 25 MHz external crystal (P6)
