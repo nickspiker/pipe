@@ -87,7 +87,12 @@ module top_pipe_mirror_xor #(
     output wire oled_scl,
     output wire oled_sda,
     inout  wire pipe_pad,                         // bidirectional wire to the bridge (E16)
-    output reg  led
+    output reg  led,
+    // Per-side TX mirrors for audible diagnostic (one piezo each, single-ended to GND).
+    // Each pin is silent (driven 0) during the OTHER side's slot, so you can listen to
+    // just one TX at a time without cross-contamination.
+    output wire piezo_host_tx,                    // bridge's drive sampled at wire_in_sync, only during host slots (p42, M4)
+    output wire piezo_enclave_tx                  // FPGA's enclave_drive_value, only during enclave slots (p46, N4)
 );
 
     localparam integer CELL_W      = `GLYPH_CELL_W;
@@ -251,6 +256,13 @@ module top_pipe_mirror_xor #(
     wire wire_in_sync;                            // wire_in from wire_io's 2-FF synchroniser
     wire enclave_drive_value = 1'b1 ^ effective_fpga_tx_bit ^ bridge_last_decoded;
     wire wire_drive_en = ~slot_owner;
+
+    // Per-side TX piezo mirrors. Each pin reflects ONLY its side's drive (silent during
+    // the other side's slot) so a single-ended piezo on each gives a clean per-side
+    // audible signal. At slow-rate slot ~230 µs, slot rate ~2.2 kHz, toggle audio rate
+    // ~1 kHz — well into the audible range.
+    assign piezo_host_tx    = (slot_owner == 1'b1) ? wire_in_sync       : 1'b0;
+    assign piezo_enclave_tx = (slot_owner == 1'b0) ? enclave_drive_value : 1'b0;
 
     always @(posedge enclave_clk) begin
         prev_slot_owner <= slot_owner;
