@@ -468,6 +468,33 @@ struct SyncResult {
     /// (N + 0.5) * slot_cyc) where slot_phase update was skipped. Counting these tells
     /// us whether the filter is firing at all and how often parity-flip-risk events occur.
     edges_parity_ambiguous_skipped: u32,
+    /// Raw inter-edge own_cyc_u values for the first up-to-256 edges after `mirror_started`
+    /// (or after acquisition_done if not mirror mode). Each entry is the PIO measurement
+    /// in sys_clk cycles (2 × (0xFFFFFFFF - X)) for that edge. Host plots histogram and
+    /// computes own_cyc / slot_cyc ratios to verify the slot tracker's model of the wire.
+    raw_own_cyc_log: [u32; 256],
+    /// Number of entries actually written into raw_own_cyc_log (clamps at 256).
+    raw_own_cyc_count: u32,
+    /// Snapshot of slot_cyc estimate (interval_fp_period >> 1 >> frac_bits) at the moment
+    /// raw_own_cyc capture started. Host divides log entries by this to get fractional slots.
+    raw_own_cyc_slot_cyc: u32,
+    /// Ring buffer of the LAST 256 decoded enclave-slot bits. Written at position
+    /// `decode_count % 256` each slot; at end of run, the oldest bit in the ring is at
+    /// position `decode_count % 256` (= the write position for the NEXT bit, which
+    /// holds the bit from 256 slots ago). Host linearises into slot-index order using
+    /// `fpga_decoded_count` to compute the wrap point. Demonstrates sustained bit-clean
+    /// decode: if first-256 AND last-256 both match pattern rotations with rotation
+    /// delta = (fpga_decoded_count - 256), there's NO drift over the run window.
+    fpga_decoded_late_log: [u8; 32],
+    /// LATE raw own_cyc ring buffer: most recent 256 edge intervals (post-acquisition,
+    /// post-mirror-started, BEFORE deglitch). Written at position
+    /// `total_edges_seen % 256`. Host linearises and computes histogram + stats to
+    /// compare against the FIRST 256 raw own_cyc capture — drift / artifact diagnosis
+    /// over the run window. If late edges have more sub-slot glitches than early ones,
+    /// the wire physics is changing; if they look identical but decode is bad, the
+    /// slot tracker math is the slip source.
+    late_raw_own_cyc_log: [u32; 256],
+    late_raw_own_cyc_count: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -528,6 +555,12 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     edges_slots_crossed_capped: 0,
     max_observed_slots_crossed: 0,
     edges_parity_ambiguous_skipped: 0,
+    raw_own_cyc_log: [0; 256],
+    raw_own_cyc_count: 0,
+    raw_own_cyc_slot_cyc: 0,
+    fpga_decoded_late_log: [0; 32],
+    late_raw_own_cyc_log: [0; 256],
+    late_raw_own_cyc_count: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -1211,9 +1244,15 @@ fn pio_tx_start() {
     // leaves PADS_BANK0.gpio[N].od at its boot default (which is typically 1 = output
     // disabled) — PAD.OD has priority over peripheral OE per RP2040 datasheet 2.19,
     // so without this the SM runs but the pin stays floating.
+    // Schmitt explicitly TRUE: silicon default per RP2040 reset value but we set it
+    // anyway because the 400Ω series + weak pulldown wire is noisy enough that any
+    // accidental clear (e.g. from embassy's Flex::set_as_input) would cause RC ringing
+    // to register as spurious edges (sub-100ns slivers + quarter-slot splits seen in
+    // raw_own_cyc histogram).
     PADS_BANK0.gpio(PIO_EDGE_GPIO as usize).modify(|w| {
-        w.set_od(false);   // enable output driver
-        w.set_ie(true);    // keep input enabled so PIO RX can still read the pad
+        w.set_od(false);       // enable output driver
+        w.set_ie(true);        // keep input enabled so PIO RX can still read the pad
+        w.set_schmitt(true);   // hysteresis deglitch on RX path
     });
 
     // Switch GP0 to PIO0 funcsel and FORCE output enabled (Oeover::ENABLE bypasses
@@ -1342,9 +1381,13 @@ fn pio_tx_mirror_start(clkdiv_int: u16, clkdiv_frac: u8) {
     });
 
     // PAD: enable driver (od=0), keep input enabled (ie=1) so PIO RX can still sample GP0.
+    // Schmitt TRUE: silicon hysteresis deglitches the RX path against RC ringing on
+    // wire transitions (see raw_own_cyc histogram: sub-100ns slivers and quarter-slot
+    // splits before this was set explicitly).
     PADS_BANK0.gpio(PIO_EDGE_GPIO as usize).modify(|w| {
         w.set_od(false);
         w.set_ie(true);
+        w.set_schmitt(true);
     });
 
     // GP0 → PIO0 funcsel. CRITICAL: Oeover::NORMAL (not ENABLE) so PINDIRS controls OE.
@@ -1520,6 +1563,28 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     // across all 256 rotations. Linear, not ring — stop logging at 256.
     let mut fpga_decoded_log: [u8; 32] = [0; 32];
     let mut fpga_decoded_log_count: u32 = 0;
+    // Ring buffer of LAST 256 decoded bits (writes at decode_count % 256).
+    let mut fpga_decoded_late_log: [u8; 32] = [0; 32];
+    // LATE raw own_cyc ring buffer + edge counter for late-vs-early artifact comparison.
+    let mut late_raw_own_cyc_log: [u32; 256] = [0; 256];
+    let mut late_raw_own_cyc_count: u32 = 0;
+    // Raw inter-edge own_cyc_u capture. First 256 edges after mirror_started, untouched
+    // by any decode logic. Host plots histogram and computes own_cyc / slot_cyc to verify
+    // the slot tracker's model against the actual wire.
+    let mut raw_own_cyc_log: [u32; 256] = [0; 256];
+    let mut raw_own_cyc_count: u32 = 0;
+    let mut raw_own_cyc_slot_cyc: u32 = 0;
+    // Deglitch accumulator. Edges with own_cyc < slot_cyc/3 are wire-handoff glitches
+    // (FPGA tristate → bridge drive transitions when both sides want the same logic
+    // level briefly droop the wire below Schmitt threshold, producing 1-2 spurious
+    // edges around the real slot boundary). Glitch own_cyc accumulates here and folds
+    // into the next real edge's own_cyc so the slot tracker sees the true boundary
+    // interval. `glitches_since_real` counts skipped edges to correct polarity on the
+    // next accepted edge (each skipped transition flips wire polarity, so an odd skip
+    // count means the next edge polarity is INVERTED from iter parity).
+    let mut pending_glitch_cyc: u32 = 0;
+    let mut glitches_since_real: u32 = 0;
+    let mut _edges_deglitched_skipped: u32 = 0;
     // Phase 2c bridge-side decode (Claim 12 inverse):
     //   wire_state    = bridge's running view of the wire level (1=HIGH, 0=LOW),
     //                   updated AFTER each accepted edge with that edge's polarity
@@ -1834,6 +1899,12 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             slot_wire_log_count = 0;
             fpga_decoded_log = [0; 32];
             fpga_decoded_log_count = 0;
+            fpga_decoded_late_log = [0; 32];
+            late_raw_own_cyc_log = [0; 256];
+            late_raw_own_cyc_count = 0;
+            raw_own_cyc_log = [0; 256];
+            raw_own_cyc_count = 0;
+            raw_own_cyc_slot_cyc = ((interval_fp_period as u64 >> 1) >> frac_bits) as u32;
             // Count edge for stats but skip CDR update — the anchor is a phase reference,
             // not a slot-duration measurement. Falls through to rising_total/falling_total
             // increment below.
@@ -1851,7 +1922,60 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         //      slot when bridge drives 1, or falling edge during enclave with
         //      last_driven_bit=1 — neither should produce a transition).
         let mut accept_for_cdr = true;
+        // Track polarity. iter is incremented per edge, but glitches are skipped from
+        // slot tracker view — every skipped transition flips physical wire polarity,
+        // so we compensate the iter-derived polarity by XORing with the parity of
+        // glitches_since_real on the eventual accepted edge.
+        let mut rising = rising;
         if mirror_started {
+            // Raw capture: first 256 own_cyc_u values after mirror_started, BEFORE any
+            // slot tracker math. This is the ground truth — if these values don't form
+            // tight clusters at N*slot_cyc, the decode math can't work, no matter how
+            // clever the filter.
+            if raw_own_cyc_count < 256 {
+                raw_own_cyc_log[raw_own_cyc_count as usize] = own_cyc_u;
+                raw_own_cyc_count += 1;
+            }
+            // LATE raw own_cyc ring buffer: writes at late_count % 256, overwrites oldest.
+            // At end of run, ring holds the most recent 256 edges' raw own_cyc values.
+            let late_ring_pos = (late_raw_own_cyc_count & 255) as usize;
+            late_raw_own_cyc_log[late_ring_pos] = own_cyc_u;
+            late_raw_own_cyc_count = late_raw_own_cyc_count.wrapping_add(1);
+            // Deglitch: edges arriving < slot_cyc/3 after the previous edge are wire
+            // handoff/ringing artifacts. Accumulate their own_cyc and fold into the
+            // next REAL edge. See raw_own_cyc histogram analysis: 0.25-slot splits +
+            // sub-100ns slivers exist even with Schmitt enabled because the wire
+            // droops > 200mV during FPGA-tristate↔bridge-drive handoff when both
+            // sides want HIGH.
+            let slot_cyc_for_filter = (interval_fp_period as u64 >> 1) >> frac_bits;
+            if slot_cyc_for_filter >= 8 {
+                // Threshold = slot_cyc/2. Any edge arriving < half a slot after the
+                // previous is a glitch (real edges are >=1 slot apart). Tightens from
+                // previous slot_cyc/3 which let through the wider 0.32-0.5-slot splits.
+                let glitch_threshold = (slot_cyc_for_filter as u32) / 2;
+                if own_cyc_u < glitch_threshold {
+                    pending_glitch_cyc = pending_glitch_cyc.saturating_add(own_cyc_u);
+                    glitches_since_real = glitches_since_real.wrapping_add(1);
+                    _edges_deglitched_skipped =
+                        _edges_deglitched_skipped.saturating_add(1);
+                    // Skip the rest of the per-edge processing — no slot tracker
+                    // update, no wire log, no decode. Polarity correction will apply
+                    // on the next accepted edge.
+                    continue;
+                }
+            }
+            // Real edge: fold accumulated glitch cyc into own_cyc. Polarity needs NO
+            // correction — `rising` was derived from `iter`, which incremented for
+            // every glitch (we just skipped the slot tracker work). So iter's parity
+            // already matches the physical wire polarity at this edge.
+            let combined_own_cyc_u = own_cyc_u.saturating_add(pending_glitch_cyc);
+            pending_glitch_cyc = 0;
+            glitches_since_real = 0;
+            // SHADOW own_cyc_u and own_cyc with the combined value for the rest of
+            // the loop. Use `let` to rebind — slot tracker math below operates on
+            // the corrected interval.
+            let own_cyc_u = combined_own_cyc_u;
+            let own_cyc: i32 = own_cyc_u as i32;
             cumulative_cyc_since_anchor =
                 cumulative_cyc_since_anchor.wrapping_add(own_cyc_u as u64);
             // Slot duration in sys_clk cycles. Use the PERIOD tracker (rise-to-rise =
@@ -1862,24 +1986,38 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             if slot_cyc < 8 {
                 accept_for_cdr = false;
             } else {
-                // Step through any slot boundaries this edge crossed. PER-EDGE math
-                // (same reasoning as the pos_in_slot fix above): cumulative arithmetic
-                // integrates ppm-level CDR drift indefinitely, eventually mis-attributing
-                // slot counts. own_cyc is the rise-to-rise interval, which is ≈N*slot_cyc
-                // for N slots crossed (50% duty cycle on the wire → 2 slots per rising-only
-                // period; sparse data → larger N). Round to nearest. Mid-slot glitches
-                // (own_cyc < slot_cyc/2) naturally round to 0 → no slot_phase toggle.
-                // Sanity cap at SLOTS_CROSSED_MAX: own_cyc_u is u32 (up to 4 G cycles),
-                // which divided by ~46 k slot_cyc gives ~87 k — iterating that many
-                // toggles per edge stalls the inner loop. Real data has runs <16 slots;
-                // 32 leaves headroom and prevents runaway from huge own_cyc spurs at
-                // startup or after long silent gaps.
-                const SLOTS_CROSSED_MAX: u64 = 32;
-                let raw_slots_crossed = ((own_cyc_u as u64) + slot_cyc / 2) / slot_cyc;
-                let slots_crossed = raw_slots_crossed.min(SLOTS_CROSSED_MAX);
-                if raw_slots_crossed > SLOTS_CROSSED_MAX {
-                    _edges_slots_crossed_capped = _edges_slots_crossed_capped.saturating_add(1);
+                // Architecture A: derive slot count from CUMULATIVE TIME, not per-edge.
+                // The slot count is the integer part of (cumulative / slot_cyc), rounded
+                // to nearest. Free-running RX slot clock; drift is bounded by slot_cyc
+                // accuracy, NOT by per-edge phase noise.
+                //
+                // PHASE SNAP: rising edges MUST occur at slot boundaries (a wire LOW→HIGH
+                // transition can only happen at a slot boundary by protocol design). So
+                // if this is a rising edge, snap cumulative_cyc_since_anchor to the nearest
+                // expected boundary time. Eats any accumulated drift in one step. Only
+                // applied when the phase error is small (< slot_cyc/4) — larger errors
+                // indicate the edge isn't really a slot boundary (e.g. unanchored startup,
+                // or a glitch that survived deglitch).
+                //
+                // Combined with NO cap on slots_crossed: silent gaps (all-1s or all-0s
+                // from FPGA) can be arbitrarily long. When an edge finally arrives, it
+                // gives us the post-gap wire state, and the per-slot decode loop fills in
+                // all intermediate slots with the pre-gap wire state. Cap = u32::MAX/2
+                // just for sanity (real workloads are bounded by clock-watchdog limits).
+                let target_slot_idx = (cumulative_cyc_since_anchor + slot_cyc / 2) / slot_cyc;
+                // Phase snap (tolerance-bounded): edges arriving WITHIN slot_cyc/4 of an
+                // expected slot boundary are treated as real boundary events — snap
+                // cumulative to the boundary time, eating accumulated drift. Edges further
+                // off than slot_cyc/4 are probably NOT boundary events (glitch survivors,
+                // misanchored startup, etc.) — leave cumulative alone for those.
+                let nearest_boundary_time = target_slot_idx.saturating_mul(slot_cyc);
+                let phase_err = (cumulative_cyc_since_anchor as i64)
+                    - (nearest_boundary_time as i64);
+                if phase_err.unsigned_abs() < slot_cyc / 4 {
+                    cumulative_cyc_since_anchor = nearest_boundary_time;
                 }
+                let raw_slots_crossed = target_slot_idx.saturating_sub(slots_since_anchor as u64);
+                let slots_crossed = raw_slots_crossed.min(u32::MAX as u64 / 2);
                 if raw_slots_crossed > _max_observed_slots_crossed as u64 {
                     _max_observed_slots_crossed = raw_slots_crossed.min(u32::MAX as u64) as u32;
                 }
@@ -1965,6 +2103,20 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                                 fpga_decoded_log[byte_idx] |= 1 << bit_in_byte;
                             }
                             fpga_decoded_log_count += 1;
+                        }
+                        // Ring buffer of last 256 decoded bits — writes at decode_count
+                        // % 256. Overwrites the oldest bit so the buffer always holds
+                        // the most recent 256. decode_count was incremented BEFORE this
+                        // capture, so the ring position is (decode_count - 1) % 256.
+                        let ring_pos = ((decode_count.wrapping_sub(1)) & 255) as usize;
+                        let late_byte_idx = ring_pos >> 3;
+                        let late_bit_in_byte = (ring_pos & 7) as u32;
+                        // Clear-then-set so old bits get overwritten cleanly.
+                        fpga_decoded_late_log[late_byte_idx] &=
+                            !(1u8 << late_bit_in_byte);
+                        if fpga_bit != 0 {
+                            fpga_decoded_late_log[late_byte_idx] |=
+                                1u8 << late_bit_in_byte;
                         }
                     }
                 }
@@ -2315,9 +2467,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // filter ACCEPTED this edge (interval_fp moved as a real measurement). Reject
         // events shouldn't move SM1's rate.
         if mirror_started && accept_for_cdr {
-            // Per-edge SM1 clkdiv refresh from the PERIOD tracker (see initial
-            // pio_tx_mirror_start for rationale). clkdiv = period / 2 (slot in
-            // sys_clk). Period is updated on every accepted rising edge above.
+            // Per-edge SM1 clkdiv refresh from the PERIOD tracker.
             let interval_fp_slot = interval_fp_period >> 1;
             let (ci, cf) = interval_fp_to_clkdiv(interval_fp_slot, frac_bits);
             embassy_rp::pac::PIO0.sm(PIO_TX_SM).clkdiv().write(|w| {
@@ -2510,6 +2660,12 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         edges_slots_crossed_capped: _edges_slots_crossed_capped,
         max_observed_slots_crossed: _max_observed_slots_crossed,
         edges_parity_ambiguous_skipped: _edges_parity_ambiguous_skipped,
+        raw_own_cyc_log,
+        raw_own_cyc_count,
+        raw_own_cyc_slot_cyc,
+        fpga_decoded_late_log,
+        late_raw_own_cyc_log,
+        late_raw_own_cyc_count,
     }
 }
 
@@ -3130,7 +3286,7 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
     // dispatch() silently drops responses that don't fit, so undersizing this
     // surfaces as a mysterious host-side timeout (not an error code).
     let mut in_buf = [0u8; 256];
-    let mut out_buf = [0u8; 2048];
+    let mut out_buf = [0u8; 4096];
     const MAX_PACKET: usize = 64;
     let mut acc_len = 0usize;
     loop {
@@ -3844,6 +4000,21 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // Parity-ambiguous skip counter (u32). Older host parsers stop after
                 // max_observed_slots_crossed; this is a tail-appended diagnostic.
                 payload.extend_from_slice(&s.edges_parity_ambiguous_skipped.to_le_bytes());
+                // Raw own_cyc capture appendix: u32 slot_cyc snapshot, u32 count, then
+                // 256 × u32 own_cyc_u values. Host plots histogram + ratios to verify
+                // the slot tracker's model of the actual wire timing.
+                payload.extend_from_slice(&s.raw_own_cyc_slot_cyc.to_le_bytes());
+                payload.extend_from_slice(&s.raw_own_cyc_count.to_le_bytes());
+                for v in s.raw_own_cyc_log.iter() {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                // Late-bits sliding window (32 bytes = ring of LAST 256 decoded bits).
+                payload.extend_from_slice(&s.fpga_decoded_late_log);
+                // LATE raw own_cyc ring: u32 count + 256 × u32 log.
+                payload.extend_from_slice(&s.late_raw_own_cyc_count.to_le_bytes());
+                for v in s.late_raw_own_cyc_log.iter() {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -4028,6 +4199,21 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 // Parity-ambiguous skip counter (u32). Older host parsers stop after
                 // max_observed_slots_crossed; this is a tail-appended diagnostic.
                 payload.extend_from_slice(&s.edges_parity_ambiguous_skipped.to_le_bytes());
+                // Raw own_cyc capture appendix: u32 slot_cyc snapshot, u32 count, then
+                // 256 × u32 own_cyc_u values. Host plots histogram + ratios to verify
+                // the slot tracker's model of the actual wire timing.
+                payload.extend_from_slice(&s.raw_own_cyc_slot_cyc.to_le_bytes());
+                payload.extend_from_slice(&s.raw_own_cyc_count.to_le_bytes());
+                for v in s.raw_own_cyc_log.iter() {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                // Late-bits sliding window (32 bytes = ring of LAST 256 decoded bits).
+                payload.extend_from_slice(&s.fpga_decoded_late_log);
+                // LATE raw own_cyc ring: u32 count + 256 × u32 log.
+                payload.extend_from_slice(&s.late_raw_own_cyc_count.to_le_bytes());
+                for v in s.late_raw_own_cyc_log.iter() {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

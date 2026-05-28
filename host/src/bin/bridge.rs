@@ -862,6 +862,22 @@ struct SyncResultParsed {
     /// Diagnostic: edges in the parity-ambiguous zone where slot_phase update was
     /// skipped. Each is a potential parity flip avoided.
     edges_parity_ambiguous_skipped: u32,
+    /// Raw own_cyc capture: snapshot of slot_cyc at capture start, count of entries
+    /// written into raw_own_cyc_log, and the log itself. Each entry is a single edge's
+    /// PIO-measured inter-edge interval (2 × !X cycles). Captured for the first 256
+    /// edges after mirror_started. Ground truth for slot tracker analysis.
+    raw_own_cyc_slot_cyc: u32,
+    raw_own_cyc_count: u32,
+    raw_own_cyc_log: Vec<u32>,
+    /// Ring buffer of LAST 256 decoded enclave-slot bits. Bit at ring position
+    /// `K % 256` corresponds to slot index K. Combined with `fpga_decoded_count`,
+    /// host linearises to get the most recent 256 bits in slot order.
+    fpga_decoded_late_log: [u8; 32],
+    /// Most recent 256 edge intervals' raw own_cyc values (ring buffer).
+    /// late_raw_own_cyc_count = total edges seen post-mirror-start; ring at
+    /// position (late_raw_own_cyc_count - 1) % 256 holds the most recent edge.
+    late_raw_own_cyc_count: u32,
+    late_raw_own_cyc_log: Vec<u32>,
     fall_to_rise_offset_sum: i64,
     rise_to_fall_offset_sum: i64,
     rising_hist: Vec<u16>,
@@ -1088,6 +1104,35 @@ fn run_wire_sync_full(
     let edges_parity_ambiguous_skipped = if data.len() >= parity_off + 4 {
         g32(parity_off)
     } else { 0 };
+    // Raw own_cyc capture (u32 slot_cyc, u32 count, 256 × u32 log). Older firmware → empty.
+    let raw_off = parity_off + 4;
+    let (raw_own_cyc_slot_cyc, raw_own_cyc_count, raw_own_cyc_log) =
+        if data.len() >= raw_off + 8 + 256 * 4 {
+            let sc = g32(raw_off);
+            let cnt = g32(raw_off + 4);
+            let mut log = Vec::with_capacity(256);
+            for i in 0..256 {
+                log.push(g32(raw_off + 8 + i * 4));
+            }
+            (sc, cnt, log)
+        } else { (0, 0, Vec::new()) };
+    // Late-bits sliding window (32 bytes, ring buffer of last 256 decoded bits).
+    let late_off = raw_off + 8 + 256 * 4;
+    let fpga_decoded_late_log: [u8; 32] = if data.len() >= late_off + 32 {
+        let mut log = [0u8; 32];
+        log.copy_from_slice(&data[late_off..late_off + 32]);
+        log
+    } else { [0u8; 32] };
+    let late_raw_off = late_off + 32;
+    let (late_raw_own_cyc_count, late_raw_own_cyc_log): (u32, Vec<u32>) =
+        if data.len() >= late_raw_off + 4 + 256 * 4 {
+            let cnt = g32(late_raw_off);
+            let mut log = Vec::with_capacity(256);
+            for i in 0..256 {
+                log.push(g32(late_raw_off + 4 + i * 4));
+            }
+            (cnt, log)
+        } else { (0, Vec::new()) };
     Ok(SyncResultParsed {
         elapsed_us: g32(0) as u64,
         total_iter: g32(4) as u64,
@@ -1144,6 +1189,12 @@ fn run_wire_sync_full(
         edges_slots_crossed_capped,
         max_observed_slots_crossed,
         edges_parity_ambiguous_skipped,
+        raw_own_cyc_slot_cyc,
+        raw_own_cyc_count,
+        raw_own_cyc_log,
+        fpga_decoded_late_log,
+        late_raw_own_cyc_count,
+        late_raw_own_cyc_log,
         fall_to_rise_offset_sum: gi64(104),
         rise_to_fall_offset_sum: gi64(112),
         rising_hist,
@@ -1977,6 +2028,32 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         .unwrap_or(0)
         .min(1);
 
+    // IDLE-clear preamble: drive TX=0 for ~2 seconds before the real run. This forces
+    // the FPGA's silent_slot_cnt to saturate (4096 slots @ ~2.7 kHz ≈ 1.5 s), dropping
+    // data_mode back to IDLE so the FPGA is in a known state for our handshake. Without
+    // this, ~50% of runs fail to lock because the FPGA was already in DATA mode from a
+    // previous run, and the all-1s TX pattern doesn't re-trigger anything.
+    // Skip the preamble for TX=0 itself (the user IS doing the IDLE-clear).
+    if tx_pattern != 0 {
+        eprintln!("→ IDLE-clear preamble (TX=0, ~2 s)");
+        let mut preamble_params = Vec::with_capacity(20);
+        let preamble_max_iter: u32 = 1 << 22;  // ~2 s wall time
+        let zero_pattern: u32 = 0;
+        preamble_params.extend_from_slice(&preamble_max_iter.to_le_bytes());
+        preamble_params.extend_from_slice(&frac_bits.to_le_bytes());
+        preamble_params.extend_from_slice(&p_shift.to_le_bytes());
+        preamble_params.extend_from_slice(&zero_pattern.to_le_bytes());
+        preamble_params.extend_from_slice(&cascade_mode.to_le_bytes());
+        let _ = send_cmd(
+            port_path,
+            "wire_mirror",
+            43,
+            vec![("data".to_string(), VsfType::v(b'b', preamble_params))],
+        )?;
+        // Brief settle so the bridge's USB/CPU state is quiescent before the real run.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
     let mut params = Vec::with_capacity(20);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
@@ -2106,6 +2183,35 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
     let edges_parity_ambiguous_skipped: u32 = if data.len() >= parity_off + 4 {
         g32(parity_off)
     } else { 0 };
+    // Raw own_cyc capture (u32 slot_cyc, u32 count, 256 × u32 log).
+    let raw_off = parity_off + 4;
+    let (raw_own_cyc_slot_cyc, raw_own_cyc_count, raw_own_cyc_log): (u32, u32, Vec<u32>) =
+        if data.len() >= raw_off + 8 + 256 * 4 {
+            let sc = g32(raw_off);
+            let cnt = g32(raw_off + 4);
+            let mut log = Vec::with_capacity(256);
+            for i in 0..256 {
+                log.push(g32(raw_off + 8 + i * 4));
+            }
+            (sc, cnt, log)
+        } else { (0, 0, Vec::new()) };
+    // Late-bits sliding window (32 bytes, ring of last 256 decoded bits).
+    let late_off = raw_off + 8 + 256 * 4;
+    let fpga_decoded_late_log: [u8; 32] = if data.len() >= late_off + 32 {
+        let mut log = [0u8; 32];
+        log.copy_from_slice(&data[late_off..late_off + 32]);
+        log
+    } else { [0u8; 32] };
+    let late_raw_off = late_off + 32;
+    let (late_raw_own_cyc_count, late_raw_own_cyc_log): (u32, Vec<u32>) =
+        if data.len() >= late_raw_off + 4 + 256 * 4 {
+            let cnt = g32(late_raw_off);
+            let mut log = Vec::with_capacity(256);
+            for i in 0..256 {
+                log.push(g32(late_raw_off + 4 + i * 4));
+            }
+            (cnt, log)
+        } else { (0, Vec::new()) };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -2321,6 +2427,166 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
                 println!("    → ≥64 consecutive bits bit-clean: Claims 7+12 hardware-proven (slot tracker drifts beyond this but protocol works)");
             }
         }
+        // Late-bits sliding window verification: ring buffer of LAST 256 decoded bits.
+        // Linearise by reading positions [decode_count % 256, decode_count % 256 + 1, ...]
+        // mod 256 — that puts the OLDEST bit (slot index decode_count - 256) first.
+        if fpga_decoded_count >= 256 {
+            let total_slots = fpga_decoded_count as usize;
+            let late_start_slot = total_slots - 256;
+            let ring_start = total_slots & 255;
+            let mut late_linear = [0u8; 32];
+            for i in 0..256 {
+                let ring_pos = (ring_start + i) & 255;
+                let src_byte = fpga_decoded_late_log[ring_pos >> 3];
+                let src_bit = (src_byte >> (ring_pos & 7)) & 1;
+                if src_bit != 0 {
+                    late_linear[i >> 3] |= 1 << (i & 7);
+                }
+            }
+            let mut best_late_rot = 0usize;
+            let mut best_late_match = 0usize;
+            for rot in 0..256 {
+                let m: usize = (0..256)
+                    .filter(|&i| bit_at(&late_linear, i) == bit_at(&FPGA_TX_PATTERN_256, (i + rot) & 255))
+                    .count();
+                if m > best_late_match { best_late_match = m; best_late_rot = rot; }
+            }
+            println!();
+            println!("  LATE DECODE LOG: last 256 enclave-slot bits (slot {}..{} of {} total)",
+                late_start_slot, total_slots, total_slots);
+            if best_late_match == 256 {
+                println!("    PASS: bit-clean at rotation +{}", best_late_rot);
+            } else {
+                let pct = 100.0 * best_late_match as f64 / 256.0;
+                println!("    best rotation: +{}   match: {}/256 ({:.1}%)", best_late_rot, best_late_match, pct);
+            }
+            let expected_late_rot = (best_rot + late_start_slot) & 255;
+            let rot_delta_correct = best_late_rot == expected_late_rot;
+            if best_match >= 250 && best_late_match >= 250 {
+                if rot_delta_correct {
+                    println!("    → SUSTAINED BIT-CLEAN over {} slots: first-256 + last-256 BOTH match, rotation delta = {} (= late_start_slot mod 256)",
+                        total_slots, late_start_slot & 255);
+                    println!("    → Claims 7+12 hardware-proven for sustained operation");
+                } else {
+                    println!("    → both windows match individually but rotation delta is OFF: first @ +{}, late @ +{}, expected late @ +{} (= +{} mod 256). Slot tracker drifted in between.",
+                        best_rot, best_late_rot, expected_late_rot, best_rot + late_start_slot);
+                }
+            }
+        }
+    }
+    // Raw own_cyc capture: the ground truth. If the histogram doesn't show tight peaks
+    // at integer multiples of slot_cyc, the slot tracker's model is wrong and no amount
+    // of filter tweaking will fix it.
+    let raw_n = raw_own_cyc_count.min(raw_own_cyc_log.len() as u32) as usize;
+    if raw_n > 0 {
+        println!();
+        println!("  RAW own_cyc capture: {} edges, slot_cyc snapshot = {} cyc",
+            raw_n, raw_own_cyc_slot_cyc);
+        let log = &raw_own_cyc_log[..raw_n];
+        let sc = raw_own_cyc_slot_cyc as f64;
+        // Min / max / mean
+        let min = *log.iter().min().unwrap();
+        let max = *log.iter().max().unwrap();
+        let sum: u64 = log.iter().map(|&v| v as u64).sum();
+        let mean = sum as f64 / raw_n as f64;
+        println!("    own_cyc: min={} max={} mean={:.1}", min, max, mean);
+        if sc > 0.0 {
+            println!("    in slots: min={:.4} max={:.4} mean={:.4}",
+                min as f64 / sc, max as f64 / sc, mean / sc);
+            // Histogram by integer slot bucket (0, 1, 2, ..., 7+) and fractional offset
+            // from nearest integer slot. The fractional offset is the smoking gun:
+            // if values cluster near .0/.5/.0/.5, slot_cyc is half its true value;
+            // if they cluster near .0/.0/.0, slot tracker is right;
+            // if they drift across [0, 1), slot_cyc is wrong by a slowly accumulating
+            // amount (which IS clock drift, but at our budgets shouldn't happen).
+            let mut int_bins = [0u32; 9];
+            let mut frac_bins = [0u32; 10]; // 0.0..0.1, 0.1..0.2, ..., 0.9..1.0
+            for &v in log {
+                let ratio = v as f64 / sc;
+                let int_part = ratio.floor() as usize;
+                int_bins[int_part.min(8)] += 1;
+                let frac = ratio - ratio.floor();
+                let fb = ((frac * 10.0) as usize).min(9);
+                frac_bins[fb] += 1;
+            }
+            println!("    integer-slot bins: 0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7:{} 8+:{}",
+                int_bins[0], int_bins[1], int_bins[2], int_bins[3], int_bins[4],
+                int_bins[5], int_bins[6], int_bins[7], int_bins[8]);
+            println!("    fractional-offset bins (distance from .0):");
+            // Reshape into "how close to a slot boundary?" — 0.0 = on it, 0.5 = worst.
+            // distance = min(frac, 1.0 - frac).
+            let mut dist_bins = [0u32; 6]; // 0.00-0.05, 0.05-0.15, 0.15-0.25, 0.25-0.35, 0.35-0.45, 0.45-0.50
+            for &v in log {
+                let ratio = v as f64 / sc;
+                let frac = ratio - ratio.floor();
+                let d = frac.min(1.0 - frac);
+                let b = if d < 0.05 { 0 }
+                        else if d < 0.15 { 1 }
+                        else if d < 0.25 { 2 }
+                        else if d < 0.35 { 3 }
+                        else if d < 0.45 { 4 }
+                        else { 5 };
+                dist_bins[b] += 1;
+            }
+            println!("      0.00-0.05 (on boundary): {}", dist_bins[0]);
+            println!("      0.05-0.15:               {}", dist_bins[1]);
+            println!("      0.15-0.25:               {}", dist_bins[2]);
+            println!("      0.25-0.35:               {}", dist_bins[3]);
+            println!("      0.35-0.45:               {}", dist_bins[4]);
+            println!("      0.45-0.50 (AMBIGUOUS):   {} ← these are the parity-flip risk", dist_bins[5]);
+            // First 32 raw values + ratios so we can eyeball the sequence.
+            println!("    first 32 edges (own_cyc / slot_cyc → ratio):");
+            for i in 0..raw_n.min(32) {
+                let v = log[i];
+                let r = v as f64 / sc;
+                println!("      [{:3}] {:7} / {} = {:.4}", i, v, raw_own_cyc_slot_cyc, r);
+            }
+        } else {
+            println!("    (slot_cyc=0, ratios unavailable)");
+        }
+    }
+    // LATE raw own_cyc histogram — compares against the EARLY histogram. If late
+    // shows MORE sub-slot glitches or quarter-splits, the wire physics has drifted
+    // (e.g., RC heating, FPGA clock drift, data-mode-dependent artifacts). If late
+    // looks identical to early but decode is bad, the slot tracker math is slipping.
+    if late_raw_own_cyc_count > 0 && raw_own_cyc_slot_cyc > 0 {
+        let n = 256usize;
+        let log = &late_raw_own_cyc_log[..n.min(late_raw_own_cyc_log.len())];
+        let sc = raw_own_cyc_slot_cyc as f64;
+        let min = *log.iter().min().unwrap();
+        let max = *log.iter().max().unwrap();
+        let sum: u64 = log.iter().map(|&v| v as u64).sum();
+        let mean = sum as f64 / log.len() as f64;
+        println!();
+        println!("  LATE raw own_cyc capture: ring of last 256 edges (total edges seen post-mirror = {})",
+            late_raw_own_cyc_count);
+        println!("    own_cyc: min={} max={} mean={:.1}", min, max, mean);
+        println!("    in slots: min={:.4} max={:.4} mean={:.4}",
+            min as f64 / sc, max as f64 / sc, mean / sc);
+        let mut int_bins = [0u32; 9];
+        for &v in log {
+            let ratio = v as f64 / sc;
+            int_bins[ratio.floor() as usize] = int_bins[ratio.floor() as usize].saturating_add(1);
+        }
+        println!("    integer-slot bins: 0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7:{} 8+:{}",
+            int_bins[0], int_bins[1], int_bins[2], int_bins[3], int_bins[4],
+            int_bins[5], int_bins[6], int_bins[7], int_bins[8]);
+        let mut dist_bins = [0u32; 6];
+        for &v in log {
+            let ratio = v as f64 / sc;
+            let frac = ratio - ratio.floor();
+            let d = frac.min(1.0 - frac);
+            let b = if d < 0.05 { 0 } else if d < 0.15 { 1 } else if d < 0.25 { 2 }
+                    else if d < 0.35 { 3 } else if d < 0.45 { 4 } else { 5 };
+            dist_bins[b] += 1;
+        }
+        println!("    fractional-offset (distance from .0):");
+        println!("      0.00-0.05 (on boundary): {}", dist_bins[0]);
+        println!("      0.05-0.15:               {}", dist_bins[1]);
+        println!("      0.15-0.25:               {}", dist_bins[2]);
+        println!("      0.25-0.35:               {}", dist_bins[3]);
+        println!("      0.35-0.45:               {}", dist_bins[4]);
+        println!("      0.45-0.50 (AMBIGUOUS):   {}", dist_bins[5]);
     }
     // Mirror-mode edge filter accounting. Sum = post-acquisition edges processed.
     // Healthy lock: accepted ≫ rejected. Diagnostic for decode regressions.
