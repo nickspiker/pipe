@@ -111,6 +111,8 @@ fn main() -> ExitCode {
         "uptime" => cmd_uptime(&port_path),
         "random" => cmd_random(&port_path, cmd_args),
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
+        "wire_count_decode" => cmd_wire_count_decode(&port_path, cmd_args),
+        "wire_count_watch" => cmd_wire_count_watch(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
         "wire_bits" => cmd_wire_bits(&port_path, cmd_args),
@@ -547,6 +549,255 @@ fn cmd_wire_trace(port_path: &str, args: &[String]) -> Result<(), String> {
         byte_idx += bytes_per_row;
     }
     Ok(())
+}
+
+/// Capture one wire_trace block and decode any counter transmissions in it.
+/// Returns the (period_est_samples, list_of_decoded_counts). Used by both the
+/// single-shot `wire_count_decode` and the live-watching `wire_count_watch`.
+fn capture_and_decode_counter(
+    port_path: &str,
+    samples_req: u32,
+    period_ns: u32,
+    verbose: bool,
+) -> Result<(f64, Vec<u32>), String> {
+    let mut params = Vec::with_capacity(8);
+    params.extend_from_slice(&samples_req.to_le_bytes());
+    params.extend_from_slice(&period_ns.to_le_bytes());
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_trace",
+        7,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+    if data.len() < 8 {
+        return Err(format!("trace response too short: {} bytes", data.len()));
+    }
+    let captured = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let elapsed_us = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
+    let expected_bytes = (captured + 7) >> 3;
+    if data.len() < 8 + expected_bytes {
+        return Err(format!("trace truncated"));
+    }
+    let bits = &data[8..8 + expected_bytes];
+    let samples: Vec<u8> = (0..captured)
+        .map(|i| (bits[i >> 3] >> (i & 7)) & 1)
+        .collect();
+    let actual_period_ns = if captured > 0 {
+        (elapsed_us as f64 * 1000.0) / captured as f64
+    } else {
+        0.0
+    };
+    if verbose {
+        println!(
+            "wire_count_decode: {} samples / {} µs (sample period = {:.0} ns)",
+            captured, elapsed_us, actual_period_ns
+        );
+    }
+
+    let edges: Vec<usize> = (1..samples.len())
+        .filter(|&i| samples[i] != samples[i - 1])
+        .collect();
+    if edges.len() < 20 {
+        return Ok((0.0, vec![]));
+    }
+
+    // ROBUST period estimation: combine median (outlier-resistant) with a P
+    // controller for tracking convergence. The median gives an immediate
+    // unbiased estimate even when some edges are sync prefixes or stretched-
+    // TX-bit intervals (= outliers). The P controller then refines by snapping
+    // phase to each accepted edge — but bounded so TX-phase drift can't pull
+    // it off true.
+    let intervals: Vec<usize> = edges.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut sorted_intervals = intervals.clone();
+    sorted_intervals.sort_unstable();
+    // True median.
+    let median = sorted_intervals[sorted_intervals.len() / 2] as f64;
+    // P-loop with TIGHT outlier rejection: anything > 25% off from median is
+    // a non-idle interval (TX bit-pair / sync / glitch). Skip those entirely.
+    let k_p: f64 = 0.05;
+    let mut period_est = median;
+    let mut phase_ref = edges[0] as f64;
+    let (mut accepted, mut rejected) = (0usize, 0usize);
+    for &edge in &edges[1..] {
+        let actual = edge as f64;
+        let predicted = phase_ref + period_est;
+        let error = actual - predicted;
+        if error.abs() > 0.25 * median {
+            rejected += 1;
+            // Snap phase forward but DO NOT update period — coast through the
+            // outlier interval so the next valid edge re-anchors.
+            phase_ref = actual;
+        } else {
+            period_est += k_p * error;
+            phase_ref = actual;
+            accepted += 1;
+        }
+    }
+    if verbose {
+        println!(
+            "  period: median = {:.3}, P-loop refined = {:.3} samples ({:.1} ns); edges {} accepted, {} rejected",
+            median, period_est, period_est * actual_period_ns, accepted, rejected
+        );
+    }
+
+    // Find syncs (LOW runs > 1.5 × period_est).
+    let sync_threshold = (period_est * 1.5) as usize;
+    let mut syncs: Vec<usize> = Vec::new();
+    let mut i = 1;
+    while i < samples.len() {
+        if samples[i] == 0 && samples[i - 1] == 1 {
+            let mut j = i;
+            while j < samples.len() && samples[j] == 0 {
+                j += 1;
+            }
+            if j - i > sync_threshold && j < samples.len() {
+                syncs.push(j);
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Decode each sync into a 32-bit count.
+    let mut counts: Vec<u32> = Vec::new();
+    for &sync_end in &syncs {
+        let mut count: u32 = 0;
+        let mut decoded = 0u32;
+        for n in 0..32u32 {
+            let off = ((2.0 * n as f64 + 1.5) * period_est).round() as usize;
+            let idx = sync_end + off;
+            if idx >= samples.len() {
+                break;
+            }
+            if samples[idx] != 0 {
+                count |= 1u32 << n;
+            }
+            decoded += 1;
+        }
+        if decoded == 32 {
+            counts.push(count);
+        }
+    }
+    Ok((period_est, counts))
+}
+
+/// `wire_count_decode [SAMPLES [PERIOD_NS]]` — single-shot decode + verbose output.
+fn cmd_wire_count_decode(port_path: &str, args: &[String]) -> Result<(), String> {
+    const TRACE_MAX_SAMPLES: u32 = 8192;
+    let samples_req: u32 = args.first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SAMPLES: {e}")))
+        .transpose()?
+        .unwrap_or(TRACE_MAX_SAMPLES)
+        .clamp(1, TRACE_MAX_SAMPLES);
+    let period_ns: u32 = args.get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad PERIOD_NS: {e}")))
+        .transpose()?
+        .unwrap_or(10_000);
+    let (period_est, counts) = capture_and_decode_counter(port_path, samples_req, period_ns, true)?;
+    if counts.is_empty() {
+        println!("  no syncs decoded — FPGA may be idling, or capture missed the TX window");
+    } else {
+        for (i, c) in counts.iter().enumerate() {
+            println!("  sync #{}: count = {} (G#{:08X})", i, c, c);
+        }
+    }
+    let _ = period_est;
+    Ok(())
+}
+
+/// `wire_count_watch [PERIOD_NS]` — continuously captures and decodes counter
+/// transmissions, displaying the latest count in the terminal (in-place update).
+/// First sync per capture is the real transmission; subsequent syncs in the same
+/// capture are filtered as false positives (post-TX idle phase quirks).
+fn cmd_wire_count_watch(port_path: &str, args: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    const TRACE_MAX_SAMPLES: u32 = 8192;
+    let period_ns: u32 = args.first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad PERIOD_NS: {e}")))
+        .transpose()?
+        .unwrap_or(10_000);
+
+    println!("wire_count_watch: listening for FPGA counter (Ctrl-C to stop)");
+    println!("  sample period ≈ {} ns, window ≈ {:.1} ms per capture",
+        period_ns, (TRACE_MAX_SAMPLES * period_ns) as f64 / 1_000_000.0);
+    println!();
+
+    let mut last_count: Option<u32> = None;
+    let mut last_count_time = std::time::Instant::now();
+    let mut attempts = 0u64;
+    let mut hits = 0u64;
+    let mut rejected_garbage = 0u64;
+    let start = std::time::Instant::now();
+
+    loop {
+        attempts += 1;
+        let result = capture_and_decode_counter(port_path, TRACE_MAX_SAMPLES, period_ns, false);
+        match result {
+            Ok((_period, counts)) => {
+                // Filter the syncs: real TX has a count value consistent with
+                // the 1-Hz tick (delta from last ≈ elapsed seconds). False
+                // syncs often decode as 0 or jump wildly. We pick the BEST
+                // candidate from the capture — the one with the smallest
+                // sensible delta to the last known count.
+                let elapsed_s = start.elapsed().as_secs_f64();
+                let expected_delta_s = last_count_time.elapsed().as_secs_f64();
+                let best = counts.iter().copied().filter(|&c| {
+                    // Reject 0 (almost always false positive after real TX).
+                    if c == 0 { return false; }
+                    // Reject obvious high-bit corruption: if last_count is small
+                    // and the new count has bits set in the top 16 that imply a
+                    // delta inconsistent with elapsed time, reject.
+                    if let Some(last) = last_count {
+                        let delta = c.wrapping_sub(last);
+                        // Allow up to 3x expected delta (transmission misses are common).
+                        let max_plausible = (expected_delta_s * 3.0).max(5.0) as u32;
+                        if delta > max_plausible || delta == 0 {
+                            return false;
+                        }
+                    }
+                    true
+                }).next();
+                if let Some(count) = best {
+                    hits += 1;
+                    let new_marker = match last_count {
+                        Some(last) => {
+                            let delta = count.wrapping_sub(last);
+                            if delta == 1 { " ✓ (+1)".to_string() }
+                            else if delta < 10 { format!(" (+{delta})") }
+                            else { format!(" (+{delta}, multi-sec)") }
+                        }
+                        None => " (first)".to_string(),
+                    };
+                    println!("[{:6.1}s] count: {:>10} (G#{:08X})  [{}/{} hits, {} rejected]{}",
+                        elapsed_s, count, count, hits, attempts, rejected_garbage, new_marker);
+                    std::io::stdout().flush().ok();
+                    last_count = Some(count);
+                    last_count_time = std::time::Instant::now();
+                } else if !counts.is_empty() {
+                    rejected_garbage += counts.len() as u64;
+                }
+            }
+            Err(_) => {
+                // Transient — usually a stale USB frame. Pause briefly + retry.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// `wire_stats [SAMPLES]` — runs a tight bit-bang at the bridge's native loop rate over the requested sample budget, then reports duty cycle, average frequency, and per-state pulse-width stats (mean ± stddev, min, max). No buffer is held on the device — sample count caps wall-clock time only.
