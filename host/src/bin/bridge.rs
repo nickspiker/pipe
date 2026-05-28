@@ -113,6 +113,7 @@ fn main() -> ExitCode {
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
         "wire_count_decode" => cmd_wire_count_decode(&port_path, cmd_args),
         "wire_count_watch" => cmd_wire_count_watch(&port_path, cmd_args),
+        "wire_pattern_decode" => cmd_wire_pattern_decode(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
         "wire_bits" => cmd_wire_bits(&port_path, cmd_args),
@@ -716,6 +717,146 @@ fn cmd_wire_count_decode(port_path: &str, args: &[String]) -> Result<(), String>
         }
     }
     let _ = period_est;
+    Ok(())
+}
+
+/// `wire_pattern_decode [SAMPLES [PERIOD_NS]]` — capture + decode top_pipe_pattern.v
+/// transmission. Each wire_clk = 1 slot. Even slots = enclave (= pattern bit),
+/// odd slots = host (always 1). Decoder:
+///   1. Locate edges, lock wire_clk_period via median + P-loop (same as counter).
+///   2. Convert sample stream → slot stream by classifying each wire_clk region
+///      via midpoint sampling at known offsets from a phase anchor.
+///   3. Try both possible alignments (even slots = enclave OR odd slots = enclave).
+///      The correct alignment has odd slots ≈ all 1s (= host slots driven HIGH).
+///   4. Extract 256 pattern bits LSB-first, compare to expected "The quick brown..."
+fn cmd_wire_pattern_decode(port_path: &str, args: &[String]) -> Result<(), String> {
+    const TRACE_MAX_SAMPLES: u32 = 8192;
+    let samples_req: u32 = args.first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SAMPLES: {e}")))
+        .transpose()?
+        .unwrap_or(TRACE_MAX_SAMPLES)
+        .clamp(1, TRACE_MAX_SAMPLES);
+    let period_ns: u32 = args.get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad PERIOD_NS: {e}")))
+        .transpose()?
+        .unwrap_or(10_000);
+
+    // Capture raw samples.
+    let mut params = Vec::with_capacity(8);
+    params.extend_from_slice(&samples_req.to_le_bytes());
+    params.extend_from_slice(&period_ns.to_le_bytes());
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_trace",
+        7,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() { return Err("no response".into()); }
+    let section = parse_resp(&resp)?;
+    let data = section.get("data").map_err(|e| format!("missing data: {e}"))?
+        .first().and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()), _ => None
+        }).ok_or("data field not binary")?;
+    if data.len() < 8 { return Err("trace too short".into()); }
+    let captured = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let elapsed_us = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
+    let expected_bytes = (captured + 7) >> 3;
+    if data.len() < 8 + expected_bytes { return Err("trace truncated".into()); }
+    let bits_data = &data[8..8 + expected_bytes];
+    let samples: Vec<u8> = (0..captured).map(|i| (bits_data[i >> 3] >> (i & 7)) & 1).collect();
+    let actual_period_ns = if captured > 0 { (elapsed_us as f64 * 1000.0) / captured as f64 } else { 0.0 };
+    println!("wire_pattern_decode: {} samples / {} µs ({:.0} ns/sample)", captured, elapsed_us, actual_period_ns);
+
+    // Find edges + lock wire_clk via median + P-loop (same as counter decoder).
+    let edges: Vec<usize> = (1..samples.len()).filter(|&i| samples[i] != samples[i-1]).collect();
+    if edges.len() < 20 { return Err(format!("only {} edges", edges.len())); }
+    let mut intervals: Vec<usize> = edges.windows(2).map(|w| w[1] - w[0]).collect();
+    intervals.sort_unstable();
+    let median = intervals[intervals.len() / 2] as f64;
+    let k_p = 0.05f64;
+    let mut period_est = median;
+    let mut phase_ref = edges[0] as f64;
+    for &edge in &edges[1..] {
+        let actual = edge as f64;
+        let error = actual - (phase_ref + period_est);
+        if error.abs() <= 0.25 * median {
+            period_est += k_p * error;
+        }
+        phase_ref = actual;
+    }
+    println!("  wire_clk_period = {:.3} samples ({:.1} ns)", period_est, period_est * actual_period_ns);
+
+    const EXPECTED: &[u8; 32] = b"The quick brown fox jumps over t";
+
+    // Brute-force phase + slot-alignment search. Try every fractional offset
+    // within one wire_clk period (8 sub-positions) and both slot parities,
+    // pick the combination that gives the best bit-match against the expected
+    // pattern (any 32-byte rotation). This is more robust than guessing phase
+    // from the first edge.
+    let phase0_base = edges[0] as f64;
+    let mut best: Option<(usize, usize, f64, Vec<u8>)> = None; // (rot, bits_match, phase_used, bytes)
+
+    for phase_frac_idx in 0..16 {
+        let phase_offset = phase0_base + (phase_frac_idx as f64) * period_est / 16.0;
+        let num_slots = ((samples.len() as f64 - phase_offset) / period_est) as usize;
+        if num_slots < 64 { continue; }
+        let max_slots = num_slots.min(4096);
+        let mut slot_bits: Vec<u8> = Vec::with_capacity(max_slots);
+        for n in 0..max_slots {
+            let mid_pos = (phase_offset + (n as f64 + 0.5) * period_est) as usize;
+            if mid_pos >= samples.len() { break; }
+            slot_bits.push(samples[mid_pos]);
+        }
+        for enclave_offset in 0..2usize {
+            let pattern_bits: Vec<u8> = (enclave_offset..slot_bits.len()).step_by(2)
+                .map(|n| slot_bits[n]).collect();
+            let n_full_bytes = pattern_bits.len() / 8;
+            if n_full_bytes < 4 { continue; }
+            let mut pattern_bytes: Vec<u8> = Vec::with_capacity(n_full_bytes);
+            for byte_idx in 0..n_full_bytes {
+                let mut b = 0u8;
+                for bit in 0..8 {
+                    if pattern_bits[byte_idx * 8 + bit] == 1 { b |= 1 << bit; }
+                }
+                pattern_bytes.push(b);
+            }
+            let n_check = pattern_bytes.len().min(32);
+            for rot in 0..32 {
+                let bits_match: usize = pattern_bytes.iter().take(n_check).enumerate()
+                    .map(|(i, &b)| (!(b ^ EXPECTED[(i + rot) & 31])).count_ones() as usize)
+                    .sum();
+                if best.as_ref().map_or(true, |b| bits_match > b.1) {
+                    best = Some((rot, bits_match, phase_offset, pattern_bytes.clone()));
+                }
+            }
+        }
+    }
+
+    let (best_rot, best_bits, phase_used, best_bytes) =
+        best.ok_or("no valid alignment found")?;
+    println!("  best phase offset: sample {:.2} ({:.3} fractional slot from first edge)",
+        phase_used, (phase_used - phase0_base) / period_est);
+    println!("  picked: bit match {}/{} (= {:.1}%)",
+        best_bits, best_bytes.len().min(32) * 8,
+        100.0 * best_bits as f64 / (best_bytes.len().min(32) * 8).max(1) as f64);
+    println!();
+    println!("  decoded:  {}", best_bytes.iter().take(32).map(|b| format!("{b:02X}")).collect::<String>());
+    println!("  expected: {}", EXPECTED.iter().map(|b| format!("{b:02X}")).collect::<String>());
+    println!("  best rotation +{}", best_rot);
+
+    // Bit match across full available window.
+    let n_check = best_bytes.len();
+    let mut total_match = 0usize;
+    let mut total_bits = 0usize;
+    for byte_idx in 0..n_check {
+        let exp = EXPECTED[(byte_idx + best_rot) & 31];
+        let got = best_bytes[byte_idx];
+        total_match += (!(exp ^ got)).count_ones() as usize;
+        total_bits += 8;
+    }
+    println!("  bit match across {} bytes: {}/{} ({:.1}%)",
+        n_check, total_match, total_bits, 100.0 * total_match as f64 / total_bits as f64);
+
     Ok(())
 }
 

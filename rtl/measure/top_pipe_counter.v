@@ -88,26 +88,34 @@ module top_pipe_counter (
     );
 
     // -------------------------------------------------------------------------
-    // Counter transmitter FSM
+    // Counter transmitter FSM — PATTERN MODE
+    //   Every "second" (= IDLE_TICKS wire_clks), transmits a 32-bit count value.
+    //   The count payload is filled with pattern data: the low byte cycles
+    //   through the 32 ASCII chars of "The quick brown fox jumps over t",
+    //   so consecutive transmissions reveal the FPGA's known reference pattern.
+    //   Counter advances per TX. Bridge confirms decoded count low-bytes ==
+    //   "T", "h", "e", " ", "q", "u", ... in order.
     // -------------------------------------------------------------------------
-    //   wire_clk frequency ≈ 11.6 kHz → 1 second ≈ 11600 wire_clks.
-    //   1-second tick: increment counter, kick off a transmission.
-    //   Transmission length: 2 (sync) + 32×2 (data) = 66 wire_clks ≈ 5.7 ms.
-    //   So most of each second is IDLE (continuous alternating clock).
-    // -------------------------------------------------------------------------
-    parameter integer IDLE_TICKS  = 11600;  // 1 second between TX (1 Hz count tick)
+    parameter integer IDLE_TICKS  = 11600;  // 1 second between TX (1 Hz tick)
     parameter integer SYNC_TICKS  = 2;
     parameter integer DATA_BITS   = 32;
     parameter integer BIT_TICKS   = 2;
     parameter integer TX_LEN      = SYNC_TICKS + DATA_BITS * BIT_TICKS;  // = 66
 
-    reg [31:0]  count        = 32'd0;
+    // 256-bit pattern source. byte_idx is the position in the pattern (0..31).
+    // Pattern is "The quick brown fox jumps over t" — same as top_pipe_mirror_xor.
+    parameter [255:0] TX_PATTERN_REF =
+        256'h74207265766f2073706d756a20786f66206e776f7262206b6369757120656854;
+    reg [4:0]   byte_idx     = 5'd0;  // 0..31, cycles through pattern bytes
     reg [13:0]  idle_div     = 14'd0;
     reg         tx_active    = 1'b0;
     reg [9:0]   tx_phase     = 10'd0;
     reg [31:0]  tx_shift     = 32'd0;
     reg         idle_state   = 1'b0;     // alternates per wire_clk during idle
     reg         wire_out_reg = 1'b1;
+
+    // Extract pattern byte at position byte_idx (each byte = 8 bits of TX_PATTERN_REF).
+    wire [7:0] pattern_byte = TX_PATTERN_REF[8 * byte_idx +: 8];
 
     // Phase counter and idle state alternation
     always @(posedge wire_clk) begin
@@ -118,8 +126,12 @@ module top_pipe_counter (
                 idle_div <= 0;
                 tx_active <= 1'b1;
                 tx_phase <= 0;
-                tx_shift <= count;
-                count <= count + 1'b1;
+                // TX payload: high 24 bits = byte_idx as a marker (zero-padded),
+                // low 8 bits = the actual pattern byte. Lets us verify both:
+                //   - bit-exact byte match against expected pattern
+                //   - byte index increments monotonically
+                tx_shift <= {24'h0, pattern_byte};
+                byte_idx <= byte_idx + 1'b1;  // wraps mod 32 (5-bit reg)
             end else begin
                 idle_div <= idle_div + 1'b1;
             end
