@@ -495,6 +495,21 @@ struct SyncResult {
     /// slot tracker math is the slip source.
     late_raw_own_cyc_log: [u32; 256],
     late_raw_own_cyc_count: u32,
+    /// SM2 wire-sampler diagnostic: FIRST 256 bytes pushed by SM2 after the
+    /// synchronous SM1/SM2 enable. Each byte = 8 GP0 samples at slot midpoints
+    /// (bit order TBD by `in_shiftdir`; LSB-first within byte expected with right
+    /// shift). 256 bytes = 2048 slot samples ≈ 750 ms at slot rate ~2.7 kHz.
+    /// Host plots these against the known FPGA TX_PATTERN to (a) validate bit
+    /// order and (b) confirm sampler decode == edge-driven decode bit-identically.
+    raw_sm2_bytes_log: [u8; 256],
+    raw_sm2_bytes_count: u32,
+    /// Total slots consumed by the SM2 sampler decode loop. In sampler mode this
+    /// is the truth-source slot count. In edge mode it stays 0 (SM2 disabled).
+    sampler_slots_consumed: u32,
+    /// SM2 RX FIFO stall counter from FDEBUG. Non-zero = CPU loop fell behind
+    /// SM2's sample rate (>8 bytes = 64 slots ≈ 23 ms backlog). Should remain
+    /// at zero for healthy runs.
+    sm2_rx_stall: u32,
 }
 
 static mut SYNC_RESULT: SyncResult = SyncResult {
@@ -561,6 +576,10 @@ static mut SYNC_RESULT: SyncResult = SyncResult {
     fpga_decoded_late_log: [0; 32],
     late_raw_own_cyc_log: [0; 256],
     late_raw_own_cyc_count: 0,
+    raw_sm2_bytes_log: [0; 256],
+    raw_sm2_bytes_count: 0,
+    sampler_slots_consumed: 0,
+    sm2_rx_stall: 0,
 };
 
 /// max_iter budget. Setting non-zero arms a sync run; core 1 zeroes it after.
@@ -597,6 +616,11 @@ static SYNC_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::n
 /// (after CDR lock, enable SM1 on next rising edge with TX_MIRROR_PATTERN as
 /// the bit source). Set BEFORE SYNC_REQUEST goes non-zero.
 static SYNC_MIRROR_MODE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Sampler mode flag. 0 = edge-driven decode (existing path, default). 1 =
+/// PIO0 SM2 wire-sampler decode (new path — anchor enables SM2 alongside SM1,
+/// CPU consumes byte samples for bit-order calibration and eventually decode).
+/// Effective only when mirror mode is also 1.
+static SYNC_SAMPLER_MODE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 /// 32-bit TX pattern fed into SM1's FIFO in mirror mode. LSB-first as `out
 /// pins, 1` shifts the OSR right (set_out_shiftdir(true)). Pushed once per
 /// FIFO-not-full check inside fast_sync's edge loop.
@@ -1186,6 +1210,37 @@ const PIO_TX_MIRROR_NOP_SIDE0: u16 = 0xA042;    // nop side 0  (PINDIRS=0, trist
 const PIO_TX_MIRROR_OUT_SIDE1: u16 = 0x7001;    // out pins,1 side 1 (PINDIRS=1, drive)
 const PIO_TX_MIRROR_CLRDIR_INSTR: u16 = 0xE080; // set pindirs, 0 (one-shot pre-enable)
 
+// PIO0 SM2 — wire sampler, free-running RX clock at slot rate
+// ============================================================================
+// Two instructions sample GP0 at every slot midpoint, autopushing one bit per
+// slot into the RX FIFO. SM2 runs at clkdiv = slot_cyc/16 → 16 PIO cycles per
+// slot. The one-shot nop[7] (= 8 PIO cycles) at addr 12 phase-shifts the first
+// sample to t = slot_cyc/2 (= slot 0 midpoint). The wrap loop at addr 13 then
+// samples every 16 PIO cycles, all at midpoints.
+//
+//   addr 12: nop [7]            (8 PIO cycles, one-shot pre-roll = 0.5 slot)
+//   addr 13: in pins, 1 [15]    (16 PIO cycles, main loop, sample at cycle 0)
+//   wrap_top = wrap_bottom = 13 (single-instruction loop)
+//
+// PIO sm_enable for SM1 and SM2 is merged into a single CTRL.modify so both
+// SMs latch on the same sys_clk cycle — keeps their PIO clocks phase-locked
+// at the silicon-clock precision. Both clkdivs derive from the SAME period
+// EMA snapshot (SM1 = interval_fp_slot, SM2 = interval_fp_slot >> 4) so their
+// ratio is exactly 16.
+//
+// Encodings:
+//   nop = mov y, y = 0xA042. Delay 7 occupies bits [12:8] = 0b00111 → 0x0700.
+//                    No side-set on SM2; the full 5-bit delay/sideset field
+//                    is delay. nop [7] = 0xA042 | 0x0700 = 0xA742.
+//   in pins, 1 = opcode 010 IN, source 000 PINS, bits 00001 → 0x4001.
+//                 Delay 15 = 0b01111 in bits [12:8] = 0x0F00.
+//                 in pins, 1 [15] = 0x4001 | 0x0F00 = 0x4F01.
+const PIO_SAMPLE_SM: usize = 2;
+const PIO_SAMPLE_ADDR_PREROLL: usize = 12;
+const PIO_SAMPLE_ADDR_LOOP:    usize = 13;
+const PIO_SAMPLE_NOP_DELAY7:      u16 = 0xA742; // nop [7]            (one-shot)
+const PIO_SAMPLE_IN_PINS_DELAY15: u16 = 0x4F01; // in pins, 1 [15]    (main loop)
+
 fn pio_tx_init() {
     use embassy_rp::pac::PIO0;
     use embassy_rp::pac::pio::regs::{InstrMem, SmClkdiv, SmInstr};
@@ -1361,15 +1416,124 @@ fn pio_tx_mirror_init() {
     // CLKDIV is set per-run by pio_tx_mirror_start (seeded from acquisition).
 }
 
+/// Load PIO0 SM2 wire-sampler program (2 instructions at addr 12 + 13). Mirrors
+/// pio_tx_mirror_init: disables SM2, writes program, configures wrap/shiftctrl/
+/// pinctrl, leaves CLKDIV + sm_enable for pio_sample_arm + the synchronous-
+/// enable site in pio_tx_mirror_start.
+fn pio_sample_init() {
+    use embassy_rp::pac::PIO0;
+    use embassy_rp::pac::pio::regs::InstrMem;
+
+    // Disable SM2 first.
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_SAMPLE_SM));
+    });
+
+    // Load the 2-instruction program at addresses 12 and 13.
+    PIO0.instr_mem(PIO_SAMPLE_ADDR_PREROLL).write_value(InstrMem(PIO_SAMPLE_NOP_DELAY7 as u32));
+    PIO0.instr_mem(PIO_SAMPLE_ADDR_LOOP).write_value(InstrMem(PIO_SAMPLE_IN_PINS_DELAY15 as u32));
+
+    // Wrap: single-instruction loop on addr 13 (in pins, 1 [15]). Pre-roll at
+    // addr 12 (nop [7]) executes once before falling through into the loop.
+    PIO0.sm(PIO_SAMPLE_SM).execctrl().write(|w| {
+        w.set_wrap_bottom(PIO_SAMPLE_ADDR_LOOP as u8);
+        w.set_wrap_top(PIO_SAMPLE_ADDR_LOOP as u8);
+        w.set_jmp_pin(PIO_EDGE_GPIO); // unused but keep consistent
+    });
+
+    // Autopush every 8 input bits → one byte per FIFO entry. in_shiftdir=true
+    // = right (LSB enters at bit 7 of ISR via shift-right, autopushes when
+    // counter reaches 8 — gives a byte with the OLDEST sample at bit 0 after
+    // the bit-order calibration step). fjoin_rx=true = 8-deep RX FIFO.
+    PIO0.sm(PIO_SAMPLE_SM).shiftctrl().write(|w| {
+        w.set_autopush(true);
+        w.set_push_thresh(8);
+        w.set_in_shiftdir(true);
+        w.set_fjoin_rx(true);
+    });
+
+    // PINCTRL: in_base = GP0. SM2 only reads pins; out/set/sideset stay at zero.
+    PIO0.sm(PIO_SAMPLE_SM).pinctrl().write(|w| {
+        w.set_in_base(PIO_EDGE_GPIO);
+    });
+
+    // CLKDIV + sm_enable are set by pio_sample_arm + pio_tx_mirror_start later.
+}
+
+/// Arm SM2 for the next synchronous enable: writes CLKDIV (= slot_cyc/16 in
+/// sys_clk), pulses sm_restart + clkdiv_restart so the next sm_enable starts
+/// from a clean PC + clkdiv counter, drains any stale RX FIFO bytes, and
+/// injects `jmp PIO_SAMPLE_ADDR_PREROLL` into the SM's instruction register so
+/// the first executed instruction after enable is the nop[7] pre-roll. SM2
+/// stays DISABLED; the caller (pio_tx_mirror_start) enables it in the same
+/// CTRL.modify that enables SM1 — keeps both PIO clocks phase-locked.
+fn pio_sample_arm(clkdiv_int: u16, clkdiv_frac: u8) {
+    use embassy_rp::pac::PIO0;
+    use embassy_rp::pac::pio::regs::SmInstr;
+
+    // Set SM2 clkdiv from the SM1-clkdiv-divided-by-16 value the caller computed.
+    PIO0.sm(PIO_SAMPLE_SM).clkdiv().write(|w| {
+        w.set_int(clkdiv_int);
+        w.set_frac(clkdiv_frac);
+    });
+
+    // Restart SM2's PC + clkdiv counter. write-1-to-pulse fields per CTRL.
+    PIO0.ctrl().modify(|w| {
+        w.set_sm_restart(1 << PIO_SAMPLE_SM);
+        w.set_clkdiv_restart(1 << PIO_SAMPLE_SM);
+    });
+
+    // Drain any stale RX FIFO bytes left from a previous run.
+    while (PIO0.fstat().read().rxempty() & (1 << PIO_SAMPLE_SM)) == 0 {
+        let _ = PIO0.rxf(PIO_SAMPLE_SM).read();
+    }
+
+    // Force PC to the nop[7] pre-roll. sm_restart leaves PC stale per RP2040
+    // datasheet §3.4.6.1, and without this the SM would run from instr_mem[0..]
+    // (= SM0's RX edge program).
+    let jmp_to_preroll = (PIO_SAMPLE_ADDR_PREROLL as u32) & 0x1F;
+    PIO0.sm(PIO_SAMPLE_SM).instr().write_value(SmInstr(jmp_to_preroll));
+}
+
+/// Non-blocking read from SM2's RX FIFO. Returns the latest pushed word (one
+/// byte's worth of samples in the low 8 bits) or None if empty. Mirrors the
+/// pattern used elsewhere with rxempty + rxf.read.
+fn pio_sample_try_read() -> Option<u32> {
+    use embassy_rp::pac::PIO0;
+    if (PIO0.fstat().read().rxempty() & (1 << PIO_SAMPLE_SM)) != 0 {
+        return None;
+    }
+    Some(PIO0.rxf(PIO_SAMPLE_SM).read())
+}
+
+/// Non-blocking read from SM0's edge-timestamp RX FIFO. Returns the raw PIO X
+/// value (or None if FIFO empty). Companion to pio_edge_read_until for the
+/// sampler-mode polling loop, which can't block on edges (would miss SM2 byte
+/// arrivals during silent gaps).
+fn pio_edge_try_read() -> Option<u32> {
+    use embassy_rp::pac::PIO0;
+    if (PIO0.fstat().read().rxempty() & (1 << PIO_EDGE_SM)) != 0 {
+        return None;
+    }
+    Some(PIO0.rxf(PIO_EDGE_SM).read())
+}
+
 /// Start SM1 in mirror-XOR mode aligned to the rising edge that just happened
 /// (start of FPGA enclave slot). Sets CLKDIV, takes GP0 funcsel, pre-clears
 /// PINDIRS to 0 (tristate), injects `jmp PIO_TX_MIRROR_ADDR`, enables SM.
+///
+/// If `also_enable_sm2` is true, SM2 (wire sampler) is enabled in the same
+/// final CTRL.modify write that enables SM1 — both PIO clocks latch on the
+/// same sys_clk cycle, keeping them phase-locked. Caller must have called
+/// pio_sample_init + pio_sample_arm beforehand. Default false preserves the
+/// original edge-driven decode path byte-identically.
 ///
 /// Unlike pio_tx_start which uses Oeover::ENABLE (forces drive always),
 /// mirror mode uses Oeover::NORMAL so PIO PINDIRS controls OE — required for
 /// the side-set tristate-during-enclave-slot behaviour to actually take effect
 /// at the pad.
-fn pio_tx_mirror_start(clkdiv_int: u16, clkdiv_frac: u8) {
+fn pio_tx_mirror_start(clkdiv_int: u16, clkdiv_frac: u8, also_enable_sm2: bool) {
     use embassy_rp::pac::{IO_BANK0, PADS_BANK0, PIO0};
     use embassy_rp::pac::io::vals::{Oeover, Outover};
     use embassy_rp::pac::pio::regs::SmInstr;
@@ -1412,10 +1576,20 @@ fn pio_tx_mirror_start(clkdiv_int: u16, clkdiv_frac: u8) {
     let jmp_to_mirror = (PIO_TX_MIRROR_ADDR as u32) & 0x1F;
     PIO0.sm(PIO_TX_SM).instr().write_value(SmInstr(jmp_to_mirror));
 
+    // DIAGNOSTIC: enable SM1 first, SM2 second in separate writes. This puts
+    // some sub-slot phase offset between them but lets us rule out merged-
+    // enable as the cause of FPGA staying in IDLE mode. If decode still gives
+    // all-zero with separate enables, the problem is elsewhere.
     PIO0.ctrl().modify(|w| {
         let cur = w.sm_enable();
         w.set_sm_enable(cur | (1 << PIO_TX_SM));
     });
+    if also_enable_sm2 {
+        PIO0.ctrl().modify(|w| {
+            let cur = w.sm_enable();
+            w.set_sm_enable(cur | (1 << PIO_SAMPLE_SM));
+        });
+    }
 }
 
 /// Stop mirror-mode SM1 and hand GP0 back to SIO input (so the FPGA isn't fought).
@@ -1455,7 +1629,7 @@ fn interval_fp_to_clkdiv(interval_fp: u32, frac_bits: u32) -> (u16, u8) {
     (clkdiv_int, clkdiv_frac)
 }
 
-fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirror_mode: bool, tx_pattern: u32, cascade_mode: u32) -> SyncResult {
+fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirror_mode: bool, tx_pattern: u32, cascade_mode: u32, sampler_mode: bool) -> SyncResult {
     let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
     let start = embassy_time::Instant::now();
 
@@ -1499,6 +1673,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     if mirror_mode {
         pio_tx_mirror_init();
         TX_MIRROR_PATTERN.store(tx_pattern, PaOrdering::Relaxed);
+        if sampler_mode {
+            // Pre-load SM2 wire-sampler program. SM2 is armed + enabled later, at
+            // the anchor rising edge, in the same CTRL.modify as SM1's enable so
+            // both PIO clocks latch on the same sys_clk cycle (phase-locked at
+            // silicon-clock precision).
+            pio_sample_init();
+        }
     }
 
     // Mirror-mode slot-phase + TX-bit-aware edge filter. After SM1 anchors on a rising
@@ -1568,6 +1749,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     // LATE raw own_cyc ring buffer + edge counter for late-vs-early artifact comparison.
     let mut late_raw_own_cyc_log: [u32; 256] = [0; 256];
     let mut late_raw_own_cyc_count: u32 = 0;
+    // SM2 wire-sampler diagnostic capture (only active when sampler_mode = true).
+    // Captures the FIRST 256 bytes pushed by SM2 (= 2048 slot samples). Linear,
+    // not ring — freezes at 256. Also tracks total slots consumed and FIFO stalls.
+    let mut raw_sm2_bytes_log: [u8; 256] = [0; 256];
+    let mut raw_sm2_bytes_count: u32 = 0;
+    let mut sampler_slots_consumed: u32 = 0;
+    let mut sm2_rx_stall: u32 = 0;
+    // Sampler-mode slot index. Increments per bit consumed from SM2's byte stream.
+    // Slot 0 = the enclave slot containing the anchor rising edge (reference, no decode).
+    // Slot 1 = first host slot, Slot 2 = first enclave decode, etc.
+    let mut sampler_slot_index: u64 = 0;
     // Raw inter-edge own_cyc_u capture. First 256 edges after mirror_started, untouched
     // by any decode logic. Host plots histogram and computes own_cyc / slot_cyc to verify
     // the slot tracker's model against the actual wire.
@@ -1766,6 +1958,99 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             if pio_tx_try_push(pattern) {
                 tx_words_consumed = tx_words_consumed.saturating_add(1);
             }
+            // SM2 sampler byte drain (sampler_mode only). Each FIFO entry is one
+            // byte = 8 GP0 samples at slot midpoints. In this phase the bytes are
+            // CAPTURED for bit-order validation but NOT yet routed to decode —
+            // the existing edge-driven decode path is the source of truth for
+            // fpga_decoded_log etc. Once Test 1 confirms the bit order, the
+            // sampler decode loop will gate on sampler_mode and take over.
+            if sampler_mode {
+                while let Some(byte_word) = pio_sample_try_read() {
+                    sampler_slots_consumed = sampler_slots_consumed.saturating_add(8);
+                    // With in_shiftdir=right + autopush(threshold=8), the 8 samples
+                    // accumulate in the MSByte of the 32-bit ISR (bits 24..31): each
+                    // IN shifts new bit into MSB and shifts the rest right. At the
+                    // 8th IN, autopush fires with ISR = [b7 b6 b5 b4 b3 b2 b1 b0 0...0]
+                    // where b0..b7 are sample[0..7]. Read MSByte to get our byte.
+                    // Bit 0 (LSB) of the byte = sample[0] (oldest); bit 7 = sample[7].
+                    let byte = ((byte_word >> 24) & 0xff) as u8;
+                    if raw_sm2_bytes_count < 256 {
+                        raw_sm2_bytes_log[raw_sm2_bytes_count as usize] = byte;
+                        raw_sm2_bytes_count += 1;
+                    }
+                    // Per-bit decode: 8 slots consumed per byte. Each bit is the wire
+                    // state at one slot midpoint. The first ever bit (sampler_slot_index
+                    // == 0) is the anchor slot (enclave slot containing the rising edge
+                    // that triggered SM1/SM2 enable) — reference, no decode. From slot 1
+                    // onward, toggle slot_phase (matches existing edge-path convention:
+                    // first slot processed = host) and run the same per-slot decode as
+                    // the edge-driven path.
+                    for bit_idx in 0..8 {
+                        let wire_at_slot = ((byte >> bit_idx) & 1) as u8;
+                        let this_slot = sampler_slot_index;
+                        sampler_slot_index += 1;
+                        if this_slot == 0 {
+                            // Anchor reference — initialize wire_state to the sample so
+                            // future code that references it gets the right value, but
+                            // skip slot tracker + decode work.
+                            wire_state = wire_at_slot;
+                            continue;
+                        }
+                        slot_phase ^= 1;
+                        // Log raw wire-state for the first 256 slot boundaries.
+                        if slot_wire_log_count < 256 {
+                            let byte_idx = (slot_wire_log_count >> 3) as usize;
+                            let bit_in_byte = slot_wire_log_count & 7;
+                            if wire_at_slot != 0 {
+                                slot_wire_log[byte_idx] |= 1 << bit_in_byte;
+                            }
+                            slot_wire_log_count += 1;
+                        }
+                        if slot_phase == 1 {
+                            // Host slot: bridge starts driving the next TX bit. Mirror
+                            // SM1's OSR consumption (1 bit per host slot, LSB-first).
+                            current_tx_bit = (tx_shift_reg & 1) as u8;
+                            tx_shift_reg >>= 1;
+                            tx_bits_remaining = tx_bits_remaining.saturating_sub(1);
+                            if tx_bits_remaining == 0 {
+                                tx_shift_reg = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
+                                tx_bits_remaining = 32;
+                            }
+                        } else {
+                            // Enclave slot: bridge's just-ended host slot's bit becomes
+                            // bridge_last_decoded from FPGA's POV. Then decode FPGA bit
+                            // from the observed wire state via inverse mirror-XOR.
+                            last_driven_bit = current_tx_bit;
+                            fpga_tx_pos = fpga_tx_pos.wrapping_add(1) & 255;
+                            if last_driven_bit == 1 {
+                                fpga_data_mode = true;
+                            }
+                            let fpga_bit: u8 = 1 ^ last_driven_bit ^ wire_at_slot;
+                            decode_buffer = (decode_buffer >> 1)
+                                | (((fpga_bit & 1) as u32) << 31);
+                            decode_count = decode_count.saturating_add(1);
+                            if fpga_decoded_log_count < 256 {
+                                let byte_idx = (fpga_decoded_log_count >> 3) as usize;
+                                let bit_in_byte = fpga_decoded_log_count & 7;
+                                if fpga_bit != 0 {
+                                    fpga_decoded_log[byte_idx] |= 1 << bit_in_byte;
+                                }
+                                fpga_decoded_log_count += 1;
+                            }
+                            let ring_pos = ((decode_count.wrapping_sub(1)) & 255) as usize;
+                            let late_byte_idx = ring_pos >> 3;
+                            let late_bit_in_byte = (ring_pos & 7) as u32;
+                            fpga_decoded_late_log[late_byte_idx] &=
+                                !(1u8 << late_bit_in_byte);
+                            if fpga_bit != 0 {
+                                fpga_decoded_late_log[late_byte_idx] |=
+                                    1u8 << late_bit_in_byte;
+                            }
+                        }
+                        wire_state = wire_at_slot;
+                    }
+                }
+            }
         }
 
         // Polarity alternation: edge index N (1-based) is rising iff (N XOR initial)
@@ -1868,7 +2153,17 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             // (RC-asymmetry-noisy). Initial SM1 enable uses the period seed.
             let interval_fp_slot = interval_fp_period >> 1;
             let (ci, cf) = interval_fp_to_clkdiv(interval_fp_slot, frac_bits);
-            pio_tx_mirror_start(ci, cf);
+            // SM2 sampler: clkdiv = slot_cyc / 16 (each of the SM2 program's 16 PIO
+            // cycles per slot ticks at this rate). Derive from the SAME interval_fp_slot
+            // snapshot so SM1's and SM2's clkdivs are in an exact 16:1 ratio — keeps
+            // their PIO clocks frequency-locked through the run.
+            if sampler_mode {
+                let (ci2, cf2) = interval_fp_to_clkdiv(interval_fp_slot >> 4, frac_bits);
+                pio_sample_arm(ci2, cf2);
+            }
+            // pio_tx_mirror_start enables SM1 and (if also_enable_sm2) SM2 in the
+            // SAME CTRL.modify write — same sys_clk cycle latch.
+            pio_tx_mirror_start(ci, cf, sampler_mode);
             // Pre-fill FIFO with up to 8 copies of the TX pattern (fjoin_tx=true gives
             // 8-deep FIFO). Bridge SM1 consumes 1 OSR bit per host slot via autopull at
             // 32 → 1 word per 32 host slots ≈ 1 word per 90 µs at 348 kHz. 8 words =
@@ -1905,6 +2200,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             raw_own_cyc_log = [0; 256];
             raw_own_cyc_count = 0;
             raw_own_cyc_slot_cyc = ((interval_fp_period as u64 >> 1) >> frac_bits) as u32;
+            sampler_slot_index = 0;
             // Count edge for stats but skip CDR update — the anchor is a phase reference,
             // not a slot-duration measurement. Falls through to rising_total/falling_total
             // increment below.
@@ -2031,6 +2327,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                 // PRE-update value inside the loop preserves the "older slot saw
                 // prior wire state" invariant.
                 let new_wire_state: u8 = if rising { 1 } else { 0 };
+                // Edge-driven slot tracker + decode loop. Skipped entirely in sampler
+                // mode — the SM2 byte drain above handles slot tracking and decode
+                // independently. The cumulative + target_slot_idx + phase snap math
+                // above still runs (it's read-only diagnostic for sampler mode, and
+                // active feedback for edge mode), but the per-slot writes only happen
+                // here in edge mode.
+                if !sampler_mode {
                 for slot_idx in 0..slots_crossed {
                     slot_phase ^= 1;
                     let is_boundary_for_this_edge = slot_idx + 1 == slots_crossed;
@@ -2121,6 +2424,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                     }
                 }
                 slots_since_anchor = new_slots;
+                } // end if !sampler_mode
 
                 // How close is the edge to the nearest slot boundary? Edges near a
                 // boundary represent legitimate slot transitions; edges in the middle
@@ -2666,6 +2970,10 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         fpga_decoded_late_log,
         late_raw_own_cyc_log,
         late_raw_own_cyc_count,
+        raw_sm2_bytes_log,
+        raw_sm2_bytes_count,
+        sampler_slots_consumed,
+        sm2_rx_stall,
     }
 }
 
@@ -2967,7 +3275,8 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             let mirror_mode = SYNC_MIRROR_MODE.load(PaOrdering::Relaxed) != 0;
             let tx_pattern = TX_MIRROR_PATTERN.load(PaOrdering::Relaxed);
             let cascade_mode = SYNC_CASCADE_MODE.load(PaOrdering::Relaxed);
-            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req, p_shift_req, mirror_mode, tx_pattern, cascade_mode));
+            let sampler_mode = SYNC_SAMPLER_MODE.load(PaOrdering::Relaxed) != 0;
+            let result = cortex_m::interrupt::free(|_| fast_sync(sync_req, frac_req, settle_req, p_shift_req, mirror_mode, tx_pattern, cascade_mode, sampler_mode));
             let iters = result.total_iterations.max(1);
             unsafe {
                 SYNC_RESULT = result;
@@ -4015,6 +4324,13 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 for v in s.late_raw_own_cyc_log.iter() {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
+                // SM2 wire-sampler appendix: u32 count, 256 bytes of raw byte samples,
+                // u32 total slots consumed by sampler, u32 SM2 RX stall counter.
+                // All zero in non-sampler runs.
+                payload.extend_from_slice(&s.raw_sm2_bytes_count.to_le_bytes());
+                payload.extend_from_slice(&s.raw_sm2_bytes_log);
+                payload.extend_from_slice(&s.sampler_slots_consumed.to_le_bytes());
+                payload.extend_from_slice(&s.sm2_rx_stall.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }
@@ -4071,6 +4387,15 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             } else {
                 0
             }.min(1);
+            // Optional 6th u32 (bytes 20..24): sampler_mode. 0 = edge-driven (default).
+            // 1 = SM2 wire-sampler decode (architecture B per ancient-launching-lemur plan).
+            // Older host clients that don't send this u32 default to 0 = byte-identical
+            // existing behaviour.
+            let sampler_mode = if data_in.len() >= 24 {
+                u32::from_le_bytes([data_in[20], data_in[21], data_in[22], data_in[23]])
+            } else {
+                0
+            }.min(1);
             let max_iter = max_iter.min(SYNC_MAX_ITERATIONS).max(SYNC_ACQ_PER_POLARITY * 8);
             let frac_bits = frac_bits.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
             let p_shift = p_shift.min(24);
@@ -4082,6 +4407,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             SYNC_MIRROR_MODE.store(1, PaOrdering::Relaxed);
             TX_MIRROR_PATTERN.store(tx_pattern, PaOrdering::Relaxed);
             SYNC_CASCADE_MODE.store(cascade_mode, PaOrdering::Relaxed);
+            SYNC_SAMPLER_MODE.store(sampler_mode, PaOrdering::Relaxed);
             SYNC_REQUEST.store(max_iter, PaOrdering::Release);
 
             let deadline = Instant::now() + embassy_time::Duration::from_secs(120);
@@ -4092,10 +4418,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 cortex_m::asm::nop();
             }
 
-            // Clear mirror mode flag so subsequent wire_sync calls don't accidentally
-            // run with mirror enabled. The fast_sync function already called
-            // pio_tx_mirror_stop on its way out.
+            // Clear mirror + sampler mode flags so subsequent wire_sync calls don't
+            // accidentally run with them enabled. The fast_sync function already
+            // called pio_tx_mirror_stop on its way out.
             SYNC_MIRROR_MODE.store(0, PaOrdering::Relaxed);
+            SYNC_SAMPLER_MODE.store(0, PaOrdering::Relaxed);
 
             let iters = SYNC_RESPONSE.load(PaOrdering::Relaxed);
             if iters == 0 {
@@ -4214,6 +4541,13 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 for v in s.late_raw_own_cyc_log.iter() {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
+                // SM2 wire-sampler appendix: u32 count, 256 bytes of raw byte samples,
+                // u32 total slots consumed by sampler, u32 SM2 RX stall counter.
+                // All zero in non-sampler runs.
+                payload.extend_from_slice(&s.raw_sm2_bytes_count.to_le_bytes());
+                payload.extend_from_slice(&s.raw_sm2_bytes_log);
+                payload.extend_from_slice(&s.sampler_slots_consumed.to_le_bytes());
+                payload.extend_from_slice(&s.sm2_rx_stall.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             }
         }

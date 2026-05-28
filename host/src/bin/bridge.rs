@@ -2027,6 +2027,17 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         .transpose()?
         .unwrap_or(0)
         .min(1);
+    // sampler_mode: 0 = edge-driven decode (default, byte-identical baseline).
+    // 1 = PIO0 SM2 wire-sampler mode (architecture B per ancient-launching-lemur plan).
+    // Currently captures raw SM2 byte samples for bit-order validation; decode still
+    // comes from the edge-driven path in this phase. Once Test 1 confirms bit order,
+    // the sampler decode loop becomes active under this flag.
+    let sampler_mode: u32 = args
+        .get(5)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SAMPLER_MODE (0=edge-driven, 1=PIO SM2 sampler): {e}")))
+        .transpose()?
+        .unwrap_or(0)
+        .min(1);
 
     // IDLE-clear preamble: drive TX=0 for ~2 seconds before the real run. This forces
     // the FPGA's silent_slot_cnt to saturate (4096 slots @ ~2.7 kHz ≈ 1.5 s), dropping
@@ -2054,12 +2065,13 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    let mut params = Vec::with_capacity(20);
+    let mut params = Vec::with_capacity(24);
     params.extend_from_slice(&max_iter.to_le_bytes());
     params.extend_from_slice(&frac_bits.to_le_bytes());
     params.extend_from_slice(&p_shift.to_le_bytes());
     params.extend_from_slice(&tx_pattern.to_le_bytes());
     params.extend_from_slice(&cascade_mode.to_le_bytes());
+    params.extend_from_slice(&sampler_mode.to_le_bytes());
 
     let (resp, _rtt) = send_cmd(
         port_path,
@@ -2212,6 +2224,16 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
             }
             (cnt, log)
         } else { (0, Vec::new()) };
+    // SM2 wire-sampler appendix: u32 count, 256 bytes, u32 slots consumed, u32 stall.
+    let sm2_off = late_raw_off + 4 + 256 * 4;
+    let (sm2_bytes_count, sm2_bytes, sampler_slots_consumed, sm2_rx_stall): (u32, Vec<u8>, u32, u32) =
+        if data.len() >= sm2_off + 4 + 256 + 4 + 4 {
+            let cnt = g32(sm2_off);
+            let bytes = data[sm2_off + 4 .. sm2_off + 4 + 256].to_vec();
+            let consumed = g32(sm2_off + 4 + 256);
+            let stall = g32(sm2_off + 4 + 256 + 4);
+            (cnt, bytes, consumed, stall)
+        } else { (0, Vec::new(), 0, 0) };
 
     const NS_PER_CYC: f64 = 8.0;
     let status_str = match status {
@@ -2587,6 +2609,37 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
         println!("      0.25-0.35:               {}", dist_bins[3]);
         println!("      0.35-0.45:               {}", dist_bins[4]);
         println!("      0.45-0.50 (AMBIGUOUS):   {}", dist_bins[5]);
+    }
+    // SM2 wire-sampler diagnostic. In edge-mode runs (sampler_mode = 0) all fields
+    // are zero. In sampler-mode runs (sampler_mode = 1) the bridge captures the
+    // first 256 bytes pushed by SM2 = 2048 slot midpoint samples.
+    if sm2_bytes_count > 0 {
+        println!();
+        println!("  SM2 SAMPLER: {} bytes captured ({} slot samples)",
+            sm2_bytes_count, sm2_bytes_count * 8);
+        println!("    sampler_slots_consumed = {}, sm2_rx_stall = {}",
+            sampler_slots_consumed, sm2_rx_stall);
+        if sm2_rx_stall > 0 {
+            println!("    WARNING: SM2 RX FIFO stalled {} times — CPU fell behind", sm2_rx_stall);
+        }
+        // Hex dump of first 32 bytes (256 samples = 256 slots) for bit-order
+        // validation against the known wire pattern.
+        let n = sm2_bytes_count.min(32) as usize;
+        let hex: String = sm2_bytes[..n].iter()
+            .enumerate()
+            .map(|(i, &b)| if i % 4 == 0 && i > 0 { format!(" {b:02X}") } else { format!("{b:02X}") })
+            .collect();
+        println!("    first {} bytes (= {} slot samples): {}", n, n * 8, hex);
+        // Per-byte bit ratio: how many of 8 bits per byte are set. With a clean
+        // alternating wire (= idle FPGA clock at slot rate), every byte should
+        // popcount to 4. With FPGA in DATA mode + bridge driving constant 1s,
+        // bytes reflect FPGA's TX_PATTERN (combined with bridge=1 every host slot).
+        let total_bits: u32 = sm2_bytes[..sm2_bytes_count as usize].iter()
+            .map(|&b| b.count_ones())
+            .sum();
+        let total_samples = (sm2_bytes_count * 8) as f64;
+        println!("    total bits set: {} of {} samples ({:.1}% high)",
+            total_bits, sm2_bytes_count * 8, 100.0 * total_bits as f64 / total_samples);
     }
     // Mirror-mode edge filter accounting. Sum = post-acquisition edges processed.
     // Healthy lock: accepted ≫ rejected. Diagnostic for decode regressions.
