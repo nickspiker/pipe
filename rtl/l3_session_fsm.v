@@ -55,8 +55,14 @@
 //     [279:275] ring_health_cnt      (5 bits)
 //     [287:280] slot_burned_mask     (8 bits)
 //     [290:288] fsm_state            (3 bits)
-//     [322:291] session_counter      (32 bits)
-//     [511:323] reserved zero
+//     [354:291] session_counter      (64 bits)   ← Message B exchanges this session
+//     [418:355] boot_epoch           (64 bits)   ← enclave_clk count since POR
+//     [482:419] drop_counter         (64 bits)   ← DROP events (lifetime)
+//     [511:483] reserved zero        (29 bits)
+//
+//   All counters are 64-bit per user instruction (chain-state visibility +
+//   integrity even during health-check responses). The state block still
+//   has 29 bits of headroom for future additions.
 //
 // =============================================================================
 
@@ -113,12 +119,32 @@ module l3_session_fsm (
 
     // -------------------------------------------------------------------------
     // OLED + debug observability (NOT exposed on the wire)
+    //   wairua_disp     — current wairua hex (mode 4)
+    //   session_counter — Message B exchanges this session (64 bits; OLED shows low 32)
+    //   boot_epoch      — enclave_clk cycles since POR (64 bits; OLED shows low 32)
+    //   drop_counter    — DROP events lifetime (64 bits; OLED shows low 32)
+    //   h_req_finger    — first 32 bits of current H_req (chain-state fingerprint)
+    //   h_resp_finger   — first 32 bits of current H_resp
+    //   last_mode_perm  — 1 if last successful exchange was PERMANENT, 0 if SESSION
+    //   last_was_query  — 1 if last successful exchange matched Q_HEALTH_IDENT
+    //   session_valid_o — 1 if pads are derived and ready for Message B
+    //   fsm_state_debug — current FSM state (one of ST_*)
     // -------------------------------------------------------------------------
     output reg  [255:0] wairua_disp,
-    output reg  [31:0]  session_counter,
-    output reg  [4:0]   fsm_state_debug,
-    output reg          drop_counter_pulse // pulses 1 cycle on every DROP
+    output reg  [63:0]  session_counter,
+    output reg  [63:0]  boot_epoch,
+    output reg  [63:0]  drop_counter,
+    output wire [31:0]  h_req_finger,
+    output wire [31:0]  h_resp_finger,
+    output reg          last_mode_perm,
+    output reg          last_was_query,
+    output wire         session_valid_o,
+    output reg  [4:0]   fsm_state_debug
 );
+
+    assign h_req_finger    = h_req[255:224];   // top 32 bits as fingerprint
+    assign h_resp_finger   = h_resp[255:224];
+    assign session_valid_o = session_valid;
 
     // =========================================================================
     // BLAKE3 constants
@@ -203,15 +229,19 @@ module l3_session_fsm (
 
     // State block for q/health (Claim 9c clever embodiment).
     // 32 bytes packed into the high half of the BLAKE3 mblock, low-to-high
-    // bit ordering as documented at top of file.
+    // bit ordering as documented at top of file. All counters 64-bit for
+    // chain-state visibility and integrity even during health-check
+    // responses — host verifier can reconstruct exactly.
     wire [255:0] state_block = {
-        189'b0,                 // [255:67] reserved zero
-        session_counter,        // [66:35]  session_counter (32 bits)
-        fsm_state_in,           // [34:32]  fsm_state (3 bits)
-        slot_burned_mask_in,    // [31:24]  slot_burned_mask (8 bits)
-        ring_health_cnt_in,     // [23:19]  ring_health_cnt (5 bits)
-        ring_health_mask_in,    // [18:3]   ring_health_mask (16 bits)
-        chip_state_in           // [2:0]    chip_state (3 bits)
+        29'b0,                  // [255:227] reserved zero
+        drop_counter,           // [226:163] DROP events lifetime
+        boot_epoch,             // [162:99]  enclave_clk cycles since POR
+        session_counter,        // [98:35]   Message B exchanges this session
+        fsm_state_in,           // [34:32]   fsm_state (3 bits)
+        slot_burned_mask_in,    // [31:24]   slot_burned_mask (8 bits)
+        ring_health_cnt_in,     // [23:19]   ring_health_cnt (5 bits)
+        ring_health_mask_in,    // [18:3]    ring_health_mask (16 bits)
+        chip_state_in           // [2:0]     chip_state (3 bits)
     };
 
     // Active-key selector based on detected mode.
@@ -256,14 +286,20 @@ module l3_session_fsm (
             trng_start        <= 1'b0;
             wairua_gen_start  <= 1'b0;
             wairua_disp       <= 256'b0;
-            session_counter   <= 32'b0;
-            drop_counter_pulse <= 1'b0;
+            session_counter   <= 64'b0;
+            boot_epoch        <= 64'b0;
+            drop_counter      <= 64'b0;
+            last_mode_perm    <= 1'b0;
+            last_was_query    <= 1'b0;
         end else begin
             // Default one-cycle strobes
             b3_valid           <= 1'b0;
             trng_start         <= 1'b0;
             wairua_gen_start   <= 1'b0;
-            drop_counter_pulse <= 1'b0;
+
+            // Free-running enclave_clk counter for time-since-POR.
+            // 64 bits at 25 MHz = ~23,000 years; will never wrap in practice.
+            boot_epoch <= boot_epoch + 64'd1;
 
             case (state)
 
@@ -529,7 +565,9 @@ module l3_session_fsm (
 
                 ST_RATCHET_PREQ: begin
                     h_resp          <= resp_hash_reg;
-                    session_counter <= session_counter + 32'd1;
+                    session_counter <= session_counter + 64'd1;
+                    last_mode_perm  <= mode_permanent;
+                    last_was_query  <= is_query;
                     state           <= ST_IDLE;
                 end
 
@@ -552,7 +590,7 @@ module l3_session_fsm (
                     tx_buf2            <= 256'b0;
                     rx_bit_cnt         <= 9'b0;
                     tx_bit_cnt         <= 10'b0;
-                    drop_counter_pulse <= 1'b1;
+                    drop_counter       <= drop_counter + 64'd1;
                     state              <= ST_IDLE;
                 end
 
