@@ -45,19 +45,27 @@ module ring_scheduler #(
     output reg                 busy,
     output reg                 all_done,      // 1-cycle pulse: full schedule done
     output reg  [N_RINGS-1:0]  ring_health_mask, // bit i = ring i healthy
-    output reg  [4:0]          ring_health_cnt   // popcount of mask (0..16)
+    output reg  [4:0]          ring_health_cnt,  // popcount of mask (0..16)
+    // Diagnostic surface — per-ring failure reasons, valid after all_done
+    output reg  [N_RINGS-1:0]  ring_rct_fail,    // bit i = ring i tripped RCT
+    output reg  [N_RINGS-1:0]  ring_apt_fail,    // bit i = ring i tripped APT
+    output reg  [N_RINGS*7-1:0] ring_level_fail  // 7 bits per ring, K+1=7 levels
 );
 
     localparam integer IDX_W = (N_RINGS <= 1) ? 1 : $clog2(N_RINGS);
 
     // -------------------------------------------------------------------------
-    // Shared ring_health instance
+    // Shared ring_health instance. Caller (e.g., trng.v) is responsible for
+    // 2-FF synchronizing each ring input upstream of `ring_in`.
     // -------------------------------------------------------------------------
     reg  [IDX_W-1:0] ring_idx;
     wire             current_sample = ring_in[ring_idx];
     reg              rh_start;
     wire             rh_done;
     wire             rh_healthy;
+    wire             rh_rct_fail;
+    wire             rh_apt_fail;
+    wire [6:0]       rh_level_fail_mask;
 
     ring_health #(
         .W      (W),
@@ -67,12 +75,15 @@ module ring_scheduler #(
         .LVL_LO (LVL_LO),
         .LVL_HI (LVL_HI)
     ) rh (
-        .clk     (clk),
-        .reset_n (reset_n),
-        .start   (rh_start),
-        .sample  (current_sample),
-        .done    (rh_done),
-        .healthy (rh_healthy)
+        .clk             (clk),
+        .reset_n         (reset_n),
+        .start           (rh_start),
+        .sample          (current_sample),
+        .done            (rh_done),
+        .healthy         (rh_healthy),
+        .rct_fail_out    (rh_rct_fail),
+        .apt_fail_out    (rh_apt_fail),
+        .level_fail_mask (rh_level_fail_mask)
     );
 
     // -------------------------------------------------------------------------
@@ -98,6 +109,9 @@ module ring_scheduler #(
             ring_health_cnt  <= 5'd0;
             busy             <= 1'b0;
             all_done         <= 1'b0;
+            ring_rct_fail    <= {N_RINGS{1'b0}};
+            ring_apt_fail    <= {N_RINGS{1'b0}};
+            ring_level_fail  <= {(N_RINGS*7){1'b0}};
         end else begin
             rh_start <= 1'b0;
             all_done <= 1'b0;
@@ -111,6 +125,9 @@ module ring_scheduler #(
                         ring_enable      <= {{(N_RINGS-1){1'b0}}, 1'b1};  // one-hot ring 0
                         ring_health_mask <= {N_RINGS{1'b0}};
                         ring_health_cnt  <= 5'd0;
+                        ring_rct_fail    <= {N_RINGS{1'b0}};
+                        ring_apt_fail    <= {N_RINGS{1'b0}};
+                        ring_level_fail  <= {(N_RINGS*7){1'b0}};
                         settle_cnt       <= ENABLE_DELAY[3:0];
                         state            <= ST_SETTLE;
                     end
@@ -132,6 +149,9 @@ module ring_scheduler #(
                 ST_GATHER: begin
                     if (rh_done) begin
                         ring_health_mask[ring_idx] <= rh_healthy;
+                        ring_rct_fail[ring_idx]    <= rh_rct_fail;
+                        ring_apt_fail[ring_idx]    <= rh_apt_fail;
+                        ring_level_fail[ring_idx*7 +: 7] <= rh_level_fail_mask;
                         state <= ST_LATCH;
                     end
                 end

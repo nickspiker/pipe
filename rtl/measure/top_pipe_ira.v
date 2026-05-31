@@ -469,6 +469,9 @@ module top_pipe_ira (
         .chip_state      (chip_state),
         .ring_health_cnt (trng_ring_health_cnt),
         .slot_flat       (all_slots_flat),
+        .ring_rct_fail   (16'b0),
+        .ring_apt_fail   (16'b0),
+        .ring_level_fail (112'b0),
         .strings_flat    (strings_flat)
     );
 
@@ -479,14 +482,14 @@ module top_pipe_ira (
     // -------------------------------------------------------------------------
     reg [3:0] re_render_init_cnt;
     reg [2:0] last_chip_state;
-    reg       last_mode;
+    reg [1:0] last_mode;
     reg       re_render_req;
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
             re_render_init_cnt <= 4'd0;
             re_render_req      <= 1'b0;
             last_chip_state    <= 3'd0;
-            last_mode          <= 1'b0;
+            last_mode          <= 2'd0;
         end else begin
             re_render_req <= 1'b0;
             if (re_render_init_cnt != 4'd15) begin

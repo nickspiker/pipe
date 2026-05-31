@@ -42,7 +42,11 @@ module ring_health #(
     input  wire start,                    // 1-cycle pulse to begin gather
     input  wire sample,                   // 1-bit ring sample this cycle
     output reg  done,                     // 1-cycle pulse at end of gather
-    output reg  healthy                   // valid in cycle of done
+    output reg  healthy,                  // valid in cycle of done
+    // Diagnostic surface (valid in cycle of done; unused ports default to wire)
+    output reg          rct_fail_out,     // RCT (Repetition Count Test) tripped
+    output reg          apt_fail_out,     // APT (Adaptive Proportion Test) tripped
+    output reg  [K:0]   level_fail_mask   // bit k set if level k popcount out of range
 );
 
     // -------------------------------------------------------------------------
@@ -117,6 +121,9 @@ module ring_health #(
             warmup_cnt  <= 4'd0;
             done        <= 1'b0;
             healthy     <= 1'b0;
+            rct_fail_out    <= 1'b0;
+            apt_fail_out    <= 1'b0;
+            level_fail_mask <= {(K+1){1'b0}};
         end else begin
             done <= 1'b0;
             case (state)
@@ -194,6 +201,9 @@ module ring_health #(
                         healthy <= !rct_fail
                                 && !apt_fail
                                 && all_levels_pass;
+                        rct_fail_out    <= rct_fail;
+                        apt_fail_out    <= apt_fail;
+                        level_fail_mask <= ~level_in_range;
                         state   <= ST_DONE;
                     end else begin
                         sample_cnt <= sample_cnt + 17'd1;

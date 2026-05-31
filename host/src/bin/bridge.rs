@@ -113,6 +113,11 @@ fn main() -> ExitCode {
         "wire_trace" => cmd_wire_trace(&port_path, cmd_args),
         "wire_count_decode" => cmd_wire_count_decode(&port_path, cmd_args),
         "wire_count_watch" => cmd_wire_count_watch(&port_path, cmd_args),
+        "wire_count_drive" => cmd_wire_count_drive(&port_path, cmd_args),
+        "wire_4096_decode" => cmd_wire_4096_decode(&port_path, cmd_args),
+        "wire_gap_decode" => cmd_wire_gap_decode(&port_path, cmd_args),
+        "meal_dump_ira" => cmd_meal_dump_ira(cmd_args),
+        "meal_challenge" => cmd_meal_challenge(cmd_args),
         "wire_pattern_decode" => cmd_wire_pattern_decode(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
@@ -654,8 +659,12 @@ fn capture_and_decode_counter(
         );
     }
 
-    // Find syncs (LOW runs > 1.5 × period_est).
-    let sync_threshold = (period_est * 1.5) as usize;
+    // Find syncs (LOW runs > 1.5 × period_est, ≤ 4 × period_est). The upper
+    // bound rejects the FPGA's post-TX RX window: bridge tristate during RX
+    // means the wire floats LOW for RX_TICKS (= 16) wire_clks. A real sync is
+    // SYNC_TICKS (= 2) wire_clks. Anything in between is fine to accept.
+    let sync_min = (period_est * 1.5) as usize;
+    let sync_max = (period_est * 4.0) as usize;
     let mut syncs: Vec<usize> = Vec::new();
     let mut i = 1;
     while i < samples.len() {
@@ -664,7 +673,8 @@ fn capture_and_decode_counter(
             while j < samples.len() && samples[j] == 0 {
                 j += 1;
             }
-            if j - i > sync_threshold && j < samples.len() {
+            let run_len = j - i;
+            if run_len > sync_min && run_len <= sync_max && j < samples.len() {
                 syncs.push(j);
             }
             i = j + 1;
@@ -712,8 +722,26 @@ fn cmd_wire_count_decode(port_path: &str, args: &[String]) -> Result<(), String>
     if counts.is_empty() {
         println!("  no syncs decoded — FPGA may be idling, or capture missed the TX window");
     } else {
+        const PATTERN_REF: &[u8; 32] = b"The quick brown fox jumps over t";
         for (i, c) in counts.iter().enumerate() {
-            println!("  sync #{}: count = {} (G#{:08X})", i, c, c);
+            // Payload: [3'h0:byte_idx][last_rx_byte][8'h00][pattern_byte]
+            let pattern_byte = (c & 0xFF) as u8;
+            let sep          = ((c >> 8) & 0xFF) as u8;
+            let last_rx_byte = ((c >> 16) & 0xFF) as u8;
+            let byte_idx     = ((c >> 24) & 0x1F) as u8;
+            let pad          = ((c >> 29) & 0x07) as u8;
+            let expected     = PATTERN_REF[byte_idx as usize & 31];
+            let pat_ok       = pattern_byte == expected;
+            let printable    = if pattern_byte.is_ascii_graphic() || pattern_byte == b' ' {
+                pattern_byte as char
+            } else {
+                '?'
+            };
+            println!(
+                "  sync #{}: G#{:08X}  byte_idx={:2}  pattern=G#{:02X} '{}'  last_rx=G#{:02X}  sep=G#{:02X}  pad=G#{}  {}",
+                i, c, byte_idx, pattern_byte, printable, last_rx_byte, sep, pad,
+                if pat_ok { "✓ pattern match" } else { "✗ MISMATCH" }
+            );
         }
     }
     let _ = period_est;
@@ -877,8 +905,9 @@ fn cmd_wire_count_watch(port_path: &str, args: &[String]) -> Result<(), String> 
         period_ns, (TRACE_MAX_SAMPLES * period_ns) as f64 / 1_000_000.0);
     println!();
 
-    let mut last_count: Option<u32> = None;
-    let mut last_count_time = std::time::Instant::now();
+    const PATTERN_REF: &[u8; 32] = b"The quick brown fox jumps over t";
+
+    let mut last_byte_idx: Option<u8> = None;
     let mut attempts = 0u64;
     let mut hits = 0u64;
     let mut rejected_garbage = 0u64;
@@ -889,45 +918,45 @@ fn cmd_wire_count_watch(port_path: &str, args: &[String]) -> Result<(), String> 
         let result = capture_and_decode_counter(port_path, TRACE_MAX_SAMPLES, period_ns, false);
         match result {
             Ok((_period, counts)) => {
-                // Filter the syncs: real TX has a count value consistent with
-                // the 1-Hz tick (delta from last ≈ elapsed seconds). False
-                // syncs often decode as 0 or jump wildly. We pick the BEST
-                // candidate from the capture — the one with the smallest
-                // sensible delta to the last known count.
+                // Filter the syncs: real TX has pattern_byte matching the
+                // FPGA's reference pattern at the decoded byte_idx position,
+                // and sep byte = 0x00. False syncs typically decode as 0x00 or
+                // fail the pattern check.
                 let elapsed_s = start.elapsed().as_secs_f64();
-                let expected_delta_s = last_count_time.elapsed().as_secs_f64();
                 let best = counts.iter().copied().filter(|&c| {
-                    // Reject 0 (almost always false positive after real TX).
-                    if c == 0 { return false; }
-                    // Reject obvious high-bit corruption: if last_count is small
-                    // and the new count has bits set in the top 16 that imply a
-                    // delta inconsistent with elapsed time, reject.
-                    if let Some(last) = last_count {
-                        let delta = c.wrapping_sub(last);
-                        // Allow up to 3x expected delta (transmission misses are common).
-                        let max_plausible = (expected_delta_s * 3.0).max(5.0) as u32;
-                        if delta > max_plausible || delta == 0 {
-                            return false;
-                        }
-                    }
-                    true
+                    // Accept any candidate whose pattern_byte appears anywhere
+                    // in the reference pattern AND whose separator byte is 0
+                    // (the format invariant). Pad byte is allowed nonzero so
+                    // pre-RX-window FPGA bitstreams still display.
+                    let pattern_byte = (c & 0xFF) as u8;
+                    let sep          = ((c >> 8) & 0xFF) as u8;
+                    if sep != 0 { return false; }
+                    PATTERN_REF.contains(&pattern_byte)
                 }).next();
                 if let Some(count) = best {
                     hits += 1;
-                    let new_marker = match last_count {
+                    let pattern_byte = (count & 0xFF) as u8;
+                    let last_rx_byte = ((count >> 16) & 0xFF) as u8;
+                    let byte_idx     = ((count >> 24) & 0x1F) as u8;
+                    let printable    = if pattern_byte.is_ascii_graphic() || pattern_byte == b' ' {
+                        pattern_byte as char
+                    } else { '?' };
+                    let delta_marker = match last_byte_idx {
                         Some(last) => {
-                            let delta = count.wrapping_sub(last);
-                            if delta == 1 { " ✓ (+1)".to_string() }
-                            else if delta < 10 { format!(" (+{delta})") }
-                            else { format!(" (+{delta}, multi-sec)") }
+                            let delta = (byte_idx.wrapping_sub(last)) & 0x1F;
+                            if delta == 1 { " ✓ +1".to_string() }
+                            else if delta == 0 { " (repeat)".to_string() }
+                            else { format!(" (+{delta})") }
                         }
                         None => " (first)".to_string(),
                     };
-                    println!("[{:6.1}s] count: {:>10} (G#{:08X})  [{}/{} hits, {} rejected]{}",
-                        elapsed_s, count, count, hits, attempts, rejected_garbage, new_marker);
+                    println!(
+                        "[{:6.1}s] byte_idx={:2} '{}' (G#{:02X}) rx=G#{:02X}  raw=G#{:08X}  [{}/{} hits, {} rejected]{}",
+                        elapsed_s, byte_idx, printable, pattern_byte, last_rx_byte, count,
+                        hits, attempts, rejected_garbage, delta_marker
+                    );
                     std::io::stdout().flush().ok();
-                    last_count = Some(count);
-                    last_count_time = std::time::Instant::now();
+                    last_byte_idx = Some(byte_idx);
                 } else if !counts.is_empty() {
                     rejected_garbage += counts.len() as u64;
                 }
@@ -939,6 +968,697 @@ fn cmd_wire_count_watch(port_path: &str, args: &[String]) -> Result<(), String> 
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// `meal_dump_ira` — read the OTP slot sector (0x100000, 256 bytes) from the
+/// FPGA's external SPI flash via openFPGALoader and decode the 8 slots.
+///
+/// Layout (set by `rtl/otp_persistent.v`):
+///   slot 0..3 → IRA (replicated)
+///   slot 4..7 → bitwise inverse of IRA (Claim 4 inverted-pair storage)
+///
+/// Verifies that slots 0..3 are byte-identical and slots 4..7 are the
+/// bitwise complement, then prints the IRA. Use this to confirm:
+///   1. Ceremony successfully persisted IRA to flash
+///   2. IRA survives power cycles (run before + after pulling the cable;
+///      the same value should come back)
+///   3. `--wipe-slots` correctly erased the sector (all bytes = 0xFF)
+fn cmd_meal_dump_ira(args: &[String]) -> Result<(), String> {
+    use std::process::Command;
+
+    let offset = args.first()
+        .map(|s| {
+            let s = s.trim_start_matches("0x").trim_start_matches("G#");
+            u32::from_str_radix(s, 16).map_err(|e| format!("bad OFFSET: {e}"))
+        })
+        .transpose()?
+        .unwrap_or(0x100000);
+
+    let tmp_path = "/tmp/pipe_meal_ira_dump.bin";
+    println!("meal_dump_ira: reading 256 bytes at flash offset 0x{:06X}", offset);
+
+    let status = Command::new("openFPGALoader")
+        .args([
+            "-c", "ft232",
+            "--dump-flash",
+            "--offset", &format!("0x{:X}", offset),
+            "--file-size", "256",
+            tmp_path,
+        ])
+        .status()
+        .map_err(|e| format!("failed to spawn openFPGALoader: {e}"))?;
+    if !status.success() {
+        return Err(format!("openFPGALoader exited with {}", status));
+    }
+
+    let bytes = std::fs::read(tmp_path)
+        .map_err(|e| format!("reading {tmp_path}: {e}"))?;
+    if bytes.len() < 256 {
+        return Err(format!("dump too short: {} bytes (expected 256)", bytes.len()));
+    }
+
+    // Split into 8 slots × 32 bytes
+    let mut slots: [[u8; 32]; 8] = [[0u8; 32]; 8];
+    for (i, slot) in slots.iter_mut().enumerate() {
+        slot.copy_from_slice(&bytes[i * 32..(i + 1) * 32]);
+    }
+
+    // Detect VIRGIN state (sector erased — all 0xFF)
+    let all_ff = slots.iter().all(|s| s.iter().all(|&b| b == 0xFF));
+    if all_ff {
+        println!();
+        println!("  All 256 bytes = 0xFF → sector erased (VIRGIN state).");
+        println!("  FPGA on next boot will be in VIRGIN, ready to provision.");
+        return Ok(());
+    }
+
+    // Display each slot
+    println!();
+    for (i, slot) in slots.iter().enumerate() {
+        let hex: String = slot.iter().map(|b| format!("{:02X}", b)).collect();
+        let label = if i < 4 { "ira (A)" } else { "~ira (B)" };
+        println!("  slot[{i}] = {hex}  ({label})");
+    }
+
+    // Verify A-slot agreement
+    let mut a_agree = true;
+    for i in 1..4 {
+        if slots[i] != slots[0] {
+            println!("  ✗ slot[{i}] (A-replica) does NOT match slot[0]");
+            a_agree = false;
+        }
+    }
+
+    // Verify B-slots are inverse of A-slots
+    let mut b_agree = true;
+    for i in 4..8 {
+        let inv: [u8; 32] = std::array::from_fn(|j| !slots[0][j]);
+        if slots[i] != inv {
+            println!("  ✗ slot[{i}] (B-replica) is not bitwise-inverse of slot[0]");
+            b_agree = false;
+        }
+    }
+
+    println!();
+    if a_agree && b_agree {
+        println!("  ✓ all 4 A-slots identical, all 4 B-slots = ~A (Claim 4 inverted-pair OK)");
+        let ira_hex: String = slots[0].iter().map(|b| format!("{:02X}", b)).collect();
+        println!();
+        println!("  IRA = {ira_hex}");
+        println!();
+        println!("  Persistence test: run this command, pull cable, replug, run again.");
+        println!("  IRA must match bit-for-bit. Use --wipe-slots in the build script to");
+        println!("  return to VIRGIN and re-provision a fresh IRA via the ceremony.");
+    } else {
+        println!();
+        println!("  ✗ INTEGRITY MISMATCH — slots do not match the expected A/B pattern.");
+        println!("    Possible causes: partial burn (FUCKED), wrong flash offset, or");
+        println!("    bitstream wrote in an unexpected layout. Try --wipe-slots and");
+        println!("    re-provision from scratch.");
+    }
+
+    Ok(())
+}
+
+/// `meal_challenge <CHALLENGE_HEX> [--expected-ira <IRA_HEX>]`
+///
+/// Computes the expected challenge-response output for a given (IRA, challenge)
+/// pair using the same BLAKE3 keyed-hash invocation `chal_resp_fsm.v`
+/// performs on-chip:
+///
+///   response = blake3::keyed_hash(IRA[32 bytes], challenge[32 bytes])
+///
+/// When `--expected-ira` is supplied, prints the locally-computed expected
+/// response so it can be compared bit-for-bit against the FPGA's wire output
+/// (either captured by oscilloscope/logic analyzer or by a future wire-driven
+/// verification path — see the bottom of this function for the protocol
+/// description).
+///
+/// IRA derivation paths supported:
+///   - v2 baked bitstream: pass the IRA hex that was baked at synthesis time
+///   - v1 fresh ceremony: read the 64-hex-char IRA from the OLED's mode 1
+///     screen and pass it here
+///   - Persistent flash variant: use `meal_dump_ira` to extract IRA from flash
+///     and feed the resulting hex into this command
+///
+/// Wire automation (deferred): driving the 256-bit challenge over PIPE and
+/// capturing the response requires a new bridge firmware command since the
+/// existing wire-drive primitives operate on single bytes. The chal_resp_fsm
+/// protocol is documented in rtl/chal_resp_fsm.v:
+///
+///   1. Bridge tristates wire (PULLMODE=DOWN → idle LOW)
+///   2. Bridge drives wire HIGH briefly to wake FPGA from LISTEN_HI
+///   3. Bridge drives wire LOW for ≥3 wire_ticks (RX_SYNC_THRESHOLD)
+///   4. Bridge clocks out 256 challenge bits LSB-first per byte, 2 wire_ticks/bit
+///   5. Bridge tristates; FPGA runs BLAKE3, then drives wire LOW for 4 ticks
+///      (TX_SYNC), then keeps LOW until first 1 in response (Claim 12a
+///      leading-zero suppression), then 256 response bits MSB-first 2 ticks/bit,
+///      then trailing 1, then tristates
+///   6. Bridge samples the trace from sync onward, finds sync, walks past
+///      leading zeros to first 1, unpacks 256 bits, returns hex
+fn cmd_meal_challenge(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err(
+            "meal_challenge <CHALLENGE_HEX> [--expected-ira <IRA_HEX>]\n  \
+             CHALLENGE_HEX: 64 hex chars (256 bits)\n  \
+             IRA_HEX (optional but recommended): 64 hex chars".to_string()
+        );
+    }
+    let challenge_hex = &args[0];
+    let challenge_bytes = parse_hex_256(challenge_hex, "challenge")?;
+
+    // Optional --expected-ira flag
+    let mut expected_ira: Option<[u8; 32]> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--expected-ira" => {
+                let v = args.get(i + 1).ok_or("--expected-ira needs a value")?;
+                expected_ira = Some(parse_hex_256(v, "expected-ira")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown arg: {other}")),
+        }
+    }
+
+    println!("meal_challenge:");
+    println!("  challenge = {challenge_hex}");
+    if let Some(ira) = expected_ira {
+        let ira_hex: String = ira.iter().map(|b| format!("{:02X}", b)).collect();
+        println!("  expected IRA = {ira_hex}");
+
+        // BLAKE3 keyed_hash matches chal_resp_fsm's on-chip invocation:
+        //   key = 32-byte IRA, data = 32-byte challenge → 32-byte response
+        let response = blake3::keyed_hash(&ira, &challenge_bytes);
+        let resp_bytes = response.as_bytes();
+        let resp_hex: String = resp_bytes.iter().map(|b| format!("{:02X}", b)).collect();
+        println!("  expected response = {resp_hex}");
+        println!();
+        println!("  This is what the FPGA's PIPE wire MUST emit (MSB first, Claim 12a");
+        println!("  framed: leading zeros suppressed up to first 1, then trailing 1).");
+        println!("  Capture the wire post-challenge and compare bit-for-bit.");
+    } else {
+        println!();
+        println!("  (No --expected-ira supplied; expected response not computed.)");
+        println!("  Provide --expected-ira <IRA_HEX> to get the local BLAKE3 keyed-hash");
+        println!("  reference for wire-trace comparison.");
+    }
+    Ok(())
+}
+
+/// Parse a 64-character hex string into a 32-byte (256-bit) array.
+fn parse_hex_256(s: &str, what: &str) -> Result<[u8; 32], String> {
+    let s = s.trim_start_matches("0x").trim_start_matches("G#");
+    if s.len() != 64 {
+        return Err(format!("{what} must be 64 hex chars (got {})", s.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(s.as_bytes()[i * 2]).ok_or_else(
+            || format!("{what}: bad hex char at position {}", i * 2))?;
+        let lo = hex_nibble(s.as_bytes()[i * 2 + 1]).ok_or_else(
+            || format!("{what}: bad hex char at position {}", i * 2 + 1))?;
+        *byte = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// `wire_gap_decode [PERIOD_NS]` — proves the bridge can stay locked through
+/// a 4096-wire_clk gap of no edges. FPGA bitstream `top_pipe_gap.v` emits:
+///   sync1 (4 LOW) → gap (4096 HIGH, no edges) → sync2 (4 LOW)
+/// Bridge captures both syncs in one trace, host estimates wire_clk_period
+/// from edges OUTSIDE the gap (idle alternation), then verifies that the
+/// distance from sync1_fall to sync2_fall equals (SYNC1_TICKS + GAP_TICKS) ×
+/// wire_clk_period within ±1 wire_clk. Pass = the patent claim is empirically
+/// demonstrated: 4096-slot timing recovery across a constant-wire interval.
+///
+/// Default PERIOD_NS = 50000 (50 µs/sample) so 8192 samples ≈ 410 ms covers
+/// the ~365 ms burst comfortably without needing a bigger trace buffer.
+fn cmd_wire_gap_decode(port_path: &str, args: &[String]) -> Result<(), String> {
+    const TRACE_MAX_SAMPLES: u32 = 8192;
+    let period_ns: u32 = args.first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad PERIOD_NS: {e}")))
+        .transpose()?
+        .unwrap_or(50_000);
+
+    let mut params = Vec::with_capacity(8);
+    params.extend_from_slice(&TRACE_MAX_SAMPLES.to_le_bytes());
+    params.extend_from_slice(&period_ns.to_le_bytes());
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_trace",
+        7,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() { return Err("no response (timeout)".into()); }
+    let section = parse_resp(&resp)?;
+    let data = section.get("data").map_err(|e| format!("missing data: {e}"))?
+        .first().and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()), _ => None
+        }).ok_or("data field not binary")?;
+    if data.len() < 8 { return Err("trace too short".into()); }
+    let captured = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let elapsed_us = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
+    let expected_bytes = (captured + 7) >> 3;
+    if data.len() < 8 + expected_bytes { return Err("trace truncated".into()); }
+    let bits_data = &data[8..8 + expected_bytes];
+    let samples: Vec<u8> = (0..captured).map(|i| (bits_data[i >> 3] >> (i & 7)) & 1).collect();
+    let actual_period_ns = if captured > 0 { (elapsed_us as f64 * 1000.0) / captured as f64 } else { 0.0 };
+    println!("wire_gap_decode: {} samples / {} µs ({:.0} ns/sample, total {:.0} ms)",
+        captured, elapsed_us, actual_period_ns, elapsed_us as f64 / 1000.0);
+
+    // Find ALL LOW runs longer than a single sample (= candidate sync regions).
+    let mut low_runs: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, length)
+    let mut i = 0;
+    while i < samples.len() {
+        if samples[i] == 0 {
+            let mut j = i;
+            while j < samples.len() && samples[j] == 0 { j += 1; }
+            low_runs.push((i, j, j - i));
+            i = j;
+        } else { i += 1; }
+    }
+    println!("  found {} LOW runs in trace", low_runs.len());
+
+    // Compute all edge positions for regression-based clock recovery later.
+    let edges: Vec<usize> = (1..samples.len()).filter(|&i| samples[i] != samples[i-1]).collect();
+    if edges.len() < 30 { return Err(format!("only {} edges in trace", edges.len())); }
+
+    // FPGA's per-burst structure: SYNC1_TICKS LOW → GAP_TICKS HIGH → SYNC2_TICKS LOW.
+    // The sync1→sync2 falling-edge distance is exactly SYNC1_TICKS + GAP_TICKS
+    // wire_clks (sync2 fires SYNC1_TICKS + GAP_TICKS wire_clks after sync1).
+    const SYNC1_TICKS: usize = 8;
+    const GAP_TICKS:   usize = 4096;
+    const EXPECTED_WIRE_CLKS: usize = SYNC1_TICKS + GAP_TICKS;  // 4104
+
+    // Find the two syncs: LOW runs longer than 5 samples (= ~5.5 wire_clks
+    // at the bridge's 79 µs sample rate vs 89 µs wire_clk). Real syncs are
+    // 8 wire_clks ≈ 9 samples; idle alternation is single-sample LOWs.
+    let sync_min_samples = 5usize;
+    let candidate_syncs: Vec<(usize, usize, usize)> = low_runs.iter()
+        .filter(|&&(_, _, len)| len >= sync_min_samples)
+        .copied().collect();
+    println!("  sync-length filter: {} LOW runs with ≥{} samples ({:.0} ns)",
+        candidate_syncs.len(), sync_min_samples, sync_min_samples as f64 * actual_period_ns);
+    for (idx, &(s, e, len)) in candidate_syncs.iter().enumerate() {
+        println!("    sync candidate #{}: samples [{}..{}], len={}", idx, s, e, len);
+    }
+
+    if candidate_syncs.len() < 2 {
+        return Err(format!("need at least 2 syncs to measure gap; found {}", candidate_syncs.len()));
+    }
+    let sync1_fall = candidate_syncs[0].0;
+    let sync2_fall = candidate_syncs.last().unwrap().0;
+    let measured_distance = sync2_fall - sync1_fall;
+
+    // Estimate wire_clk_period via linear regression on idle-alternation
+    // edges BEFORE sync1. Each edge is exactly 1 wire_clk apart in idle.
+    // Regression: edge_pos[i] = phase0 + i × wire_clk_period → least-squares
+    // fit gives a sub-sample-resolution period that beats integer median.
+    let idle_edges: Vec<f64> = edges.iter()
+        .filter(|&&e| e < sync1_fall)
+        .map(|&e| e as f64)
+        .collect();
+    if idle_edges.len() < 20 {
+        return Err(format!("only {} idle edges before sync1 (need ≥20 for clean regression)",
+            idle_edges.len()));
+    }
+    let n = idle_edges.len() as f64;
+    let sum_i: f64 = (0..idle_edges.len()).map(|i| i as f64).sum();
+    let sum_x: f64 = idle_edges.iter().sum();
+    let sum_ii: f64 = (0..idle_edges.len()).map(|i| (i*i) as f64).sum();
+    let sum_ix: f64 = idle_edges.iter().enumerate().map(|(i, &x)| i as f64 * x).sum();
+    let period_est = (n * sum_ix - sum_i * sum_x) / (n * sum_ii - sum_i * sum_i);
+    let period_est_ns = period_est * actual_period_ns;
+    println!();
+    println!("  wire_clk_period (linear regression on {} idle edges before sync1):",
+        idle_edges.len());
+    println!("    {:.4} samples = {:.1} ns/wire_clk", period_est, period_est_ns);
+
+    let predicted_distance = EXPECTED_WIRE_CLKS as f64 * period_est;
+    let drift_samples = measured_distance as f64 - predicted_distance;
+    let drift_wire_clks = drift_samples / period_est;
+    let drift_ppm = drift_wire_clks / EXPECTED_WIRE_CLKS as f64 * 1_000_000.0;
+
+    println!();
+    println!("  sync1 falling edge: sample {}", sync1_fall);
+    println!("  sync2 falling edge: sample {}", sync2_fall);
+    println!("  measured distance:  {} samples", measured_distance);
+    println!("  predicted distance: {} × {:.4} = {:.2} samples (4104 wire_clks)",
+        EXPECTED_WIRE_CLKS, period_est, predicted_distance);
+    println!("  drift:              {:+.3} samples = {:+.4} wire_clks = {:+.1} ppm",
+        drift_samples, drift_wire_clks, drift_ppm);
+
+    if drift_wire_clks.abs() < 1.0 {
+        println!();
+        println!("  ✓ PASS — clock recovery held through 4096-slot gap (drift < 1 wire_clk)");
+        println!("  → Patent claim demonstrated: PIPE line code tolerates 4096 wire_clks of");
+        println!("    constant-wire state without losing slot phase.");
+    } else if drift_wire_clks.abs() < 2.0 {
+        println!();
+        println!("  △ MARGINAL — drift in [1, 2) wire_clks (likely sample-quantization noise)");
+    } else {
+        println!();
+        println!("  ✗ FAIL — drifted {:.2} wire_clks across the gap (too much for slot lock)",
+            drift_wire_clks);
+    }
+
+    Ok(())
+}
+
+/// `wire_4096_decode [PERIOD_NS]` — captures a single 4096-bit TX burst
+/// from `top_pipe_4096.v` and decodes all 4096 bits. Reports first drift
+/// position (= first bit that disagrees with the expected pattern cycled 16×).
+///
+/// Buffer math: 65536 samples × ~16 µs = ~1.05 s, fits the FPGA's ~730 ms
+/// burst with margin. wire_clk ≈ 89 µs, so each bit ≈ 178 µs ≈ 11 samples.
+fn cmd_wire_4096_decode(port_path: &str, args: &[String]) -> Result<(), String> {
+    const TRACE_MAX_SAMPLES: u32 = 65536;
+    let period_ns: u32 = args.first()
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad PERIOD_NS: {e}")))
+        .transpose()?
+        .unwrap_or(10_000);
+
+    let mut params = Vec::with_capacity(8);
+    params.extend_from_slice(&TRACE_MAX_SAMPLES.to_le_bytes());
+    params.extend_from_slice(&period_ns.to_le_bytes());
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_trace",
+        7,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() { return Err("no response (timeout)".into()); }
+    let section = parse_resp(&resp)?;
+    let data = section.get("data").map_err(|e| format!("missing data: {e}"))?
+        .first().and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()), _ => None
+        }).ok_or("data field not binary")?;
+    if data.len() < 8 { return Err("trace too short".into()); }
+    let captured = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let elapsed_us = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
+    let expected_bytes = (captured + 7) >> 3;
+    if data.len() < 8 + expected_bytes { return Err("trace truncated".into()); }
+    let bits_data = &data[8..8 + expected_bytes];
+    let samples: Vec<u8> = (0..captured).map(|i| (bits_data[i >> 3] >> (i & 7)) & 1).collect();
+    let actual_period_ns = if captured > 0 { (elapsed_us as f64 * 1000.0) / captured as f64 } else { 0.0 };
+    println!("wire_4096_decode: {} samples / {} µs ({:.0} ns/sample, total {:.0} ms)",
+        captured, elapsed_us, actual_period_ns, elapsed_us as f64 / 1000.0);
+
+    let edges: Vec<usize> = (1..samples.len()).filter(|&i| samples[i] != samples[i-1]).collect();
+    if edges.len() < 50 { return Err(format!("only {} edges", edges.len())); }
+
+    // Estimate wire_clk_period from median of pre-sync intervals (idle).
+    let intervals: Vec<usize> = edges.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut sorted = intervals.clone();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2] as f64;
+    println!("  median inter-edge interval: {:.2} samples ({:.1} ns)",
+        median, median * actual_period_ns);
+
+    // Find sync: LOW run > 1.5 × median, < 4 × median.
+    let sync_min = (median * 1.5) as usize;
+    let sync_max = (median * 4.0) as usize;
+    let mut sync_end: Option<usize> = None;
+    let mut i = 1;
+    while i < samples.len() {
+        if samples[i] == 0 && samples[i - 1] == 1 {
+            let mut j = i;
+            while j < samples.len() && samples[j] == 0 { j += 1; }
+            let run_len = j - i;
+            if run_len > sync_min && run_len <= sync_max && j < samples.len() {
+                sync_end = Some(j);
+                break;
+            }
+            i = j + 1;
+        } else { i += 1; }
+    }
+    let sync_end = sync_end.ok_or_else(|| "no sync found".to_string())?;
+    println!("  sync detected at sample {}", sync_end);
+
+    // Lock period using edges WITHIN the data burst, AFTER the sync. Use a
+    // P-controller over those edges — this is the long-window clock recovery
+    // that the 4096-bit test exists to validate.
+    const N_DATA_BITS: u32 = 4096;
+    const SAMPLES_PER_BIT_NOMINAL: f64 = 2.0; // (2 wire_clks per bit, median = 1 wire_clk)
+    let nominal_bit_period = median * SAMPLES_PER_BIT_NOMINAL;
+    println!("  nominal bit period: {:.2} samples ({:.1} ns)",
+        nominal_bit_period, nominal_bit_period * actual_period_ns);
+
+    // Refine period using edges in the data window. P-loop over edges that
+    // are within ±25% of median (= wire_clk-spaced edges, not stretched).
+    let k_p = 0.01f64;
+    let mut period_est = median;
+    let mut phase_ref = sync_end as f64;
+    let burst_end_samples = sync_end + (N_DATA_BITS as usize * 2) * (median as usize + 1);
+    let burst_end_clamped = burst_end_samples.min(samples.len());
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    for &edge in edges.iter().filter(|&&e| e > sync_end && e < burst_end_clamped) {
+        let actual = edge as f64;
+        let error = actual - (phase_ref + period_est);
+        if error.abs() <= 0.25 * median {
+            period_est += k_p * error;
+            accepted += 1;
+        } else {
+            rejected += 1;
+        }
+        phase_ref = actual;
+    }
+    println!("  P-loop on data edges: {} accepted, {} rejected; period_est = {:.4} samples ({:.1} ns/wire_clk)",
+        accepted, rejected, period_est, period_est * actual_period_ns);
+
+    // Expected pattern: 256-bit reference cycled 16 times = 4096 bits.
+    const PATTERN_REF: &[u8; 32] = b"The quick brown fox jumps over t";
+    // Pattern bit N = bit (N%8) of PATTERN_REF[(N/8) % 32], LSB-first.
+    let expected_bit = |n: u32| -> u8 {
+        let byte_pos = (n / 8) as usize & 31;
+        let bit_pos = (n % 8) as usize;
+        (PATTERN_REF[byte_pos] >> bit_pos) & 1
+    };
+
+    // Decode: bit N at sync_end + (2N + 1.5) × period_est.
+    let mut decoded = vec![0u8; N_DATA_BITS as usize];
+    let mut first_dropout: Option<usize> = None;
+    for n in 0..N_DATA_BITS as usize {
+        let off = ((2.0 * n as f64 + 1.5) * period_est).round() as usize;
+        let pos = sync_end + off;
+        if pos >= samples.len() {
+            if first_dropout.is_none() { first_dropout = Some(n); }
+            break;
+        }
+        decoded[n] = samples[pos];
+    }
+
+    // Compare against expected, count matches + locate first drift.
+    let mut matches = 0u32;
+    let mut first_drift: Option<usize> = None;
+    let mut errors_per_kbit = [0u32; 4];
+    for n in 0..N_DATA_BITS as usize {
+        if decoded[n] == expected_bit(n as u32) {
+            matches += 1;
+        } else if first_drift.is_none() {
+            first_drift = Some(n);
+        } else {
+            errors_per_kbit[n / 1024] += 1;
+        }
+    }
+    if let Some(first) = first_drift { errors_per_kbit[first / 1024] += 1; }
+    let max_n_decoded = first_dropout.unwrap_or(N_DATA_BITS as usize);
+
+    println!();
+    println!("  decoded {} / {} bits", max_n_decoded, N_DATA_BITS);
+    println!("  bit-exact matches: {}/{} ({:.2}%)",
+        matches, N_DATA_BITS,
+        100.0 * matches as f64 / N_DATA_BITS as f64);
+    if let Some(first) = first_drift {
+        println!("  first drift at bit {} (= within kbit window {})", first, first / 1024);
+    } else {
+        println!("  ✓ ALL 4096 BITS LANDED — clock recovery held through full burst");
+    }
+    println!("  errors per kbit window: [0..1024]={}  [1024..2048]={}  [2048..3072]={}  [3072..4096]={}",
+        errors_per_kbit[0], errors_per_kbit[1], errors_per_kbit[2], errors_per_kbit[3]);
+
+    // Spot check: print first 32 and last 32 decoded bits as bytes for sanity.
+    let pack_bytes = |start: usize, n_bytes: usize| -> String {
+        let mut s = String::new();
+        for b in 0..n_bytes {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let idx = start + b * 8 + bit;
+                if idx < decoded.len() && decoded[idx] != 0 { byte |= 1 << bit; }
+            }
+            s.push_str(&format!("{:02X} ", byte));
+        }
+        s
+    };
+    let expected_pack = |start: usize, n_bytes: usize| -> String {
+        let mut s = String::new();
+        for b in 0..n_bytes {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let n = start + b * 8 + bit;
+                if expected_bit(n as u32) != 0 { byte |= 1 << bit; }
+            }
+            s.push_str(&format!("{:02X} ", byte));
+        }
+        s
+    };
+    println!();
+    println!("  first 32 bytes (256 bits) decoded:  {}", pack_bytes(0, 32));
+    println!("  first 32 bytes expected:           {}", expected_pack(0, 32));
+    println!("  last 32 bytes  (256 bits) decoded:  {}", pack_bytes(4096 - 256, 32));
+    println!("  last 32 bytes  expected:           {}", expected_pack(4096 - 256, 32));
+
+    Ok(())
+}
+
+/// `wire_count_drive [BYTE [SAMPLES [PERIOD_NS]]]` — bidirectional round-trip
+/// test. Bridge detects the FPGA's next sync, waits for the 32-bit data
+/// phase to finish, drives BYTE LSB-first during the FPGA's RX window, then
+/// captures the post-drive trace. Host decodes the captured trace and
+/// reports whether the FPGA's `last_rx_byte` field echoes BYTE.
+///
+/// Default BYTE = 0xFF (drives wire HIGH all 8 bits); SAMPLES = 8192;
+/// PERIOD_NS = 10000.
+fn cmd_wire_count_drive(port_path: &str, args: &[String]) -> Result<(), String> {
+    const TRACE_MAX_SAMPLES: u32 = 8192;
+    let byte_to_drive: u8 = args.first()
+        .map(|s| u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("G#"), 16)
+            .or_else(|_| s.parse::<u32>())
+            .map_err(|e| format!("bad BYTE: {e}")))
+        .transpose()?
+        .map(|v| v as u8)
+        .unwrap_or(0xFFu8);
+    let samples_req: u32 = args.get(1)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad SAMPLES: {e}")))
+        .transpose()?
+        .unwrap_or(TRACE_MAX_SAMPLES)
+        .clamp(1, TRACE_MAX_SAMPLES);
+    let period_ns: u32 = args.get(2)
+        .map(|s| s.parse::<u32>().map_err(|e| format!("bad PERIOD_NS: {e}")))
+        .transpose()?
+        .unwrap_or(10_000);
+
+    let mut params = Vec::with_capacity(9);
+    params.push(byte_to_drive);
+    params.extend_from_slice(&samples_req.to_le_bytes());
+    params.extend_from_slice(&period_ns.to_le_bytes());
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "wire_count_drive",
+        7,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() { return Err("no response (timeout)".into()); }
+    let section = parse_resp(&resp)?;
+    let data = section.get("data").map_err(|e| format!("missing data: {e}"))?
+        .first().and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()), _ => None
+        }).ok_or("data field not binary")?;
+    if data.len() < 12 { return Err(format!("response too short: {} bytes", data.len())); }
+    let captured_field = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let elapsed_us = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as u64;
+    let byte_driven = data[8];
+    let captured = (captured_field & 0x7FFF_FFFF) as usize;
+    let sync_found = (captured_field >> 31) & 1;
+    let expected_bytes = (captured + 7) >> 3;
+    if data.len() < 12 + expected_bytes {
+        return Err(format!("trace truncated: have {}, want {}", data.len(), 12 + expected_bytes));
+    }
+    let bits = &data[12..12 + expected_bytes];
+    let samples: Vec<u8> = (0..captured).map(|i| (bits[i >> 3] >> (i & 7)) & 1).collect();
+    let actual_period_ns = if captured > 0 { (elapsed_us as f64 * 1000.0) / captured as f64 } else { 0.0 };
+
+    println!("wire_count_drive: drove G#{byte_driven:02X}, sync_found={sync_found}, {captured} samples / {elapsed_us} µs ({actual_period_ns:.0} ns/sample)");
+    if sync_found == 0 {
+        println!("  no sync detected within 100ms — FPGA may be idling or unflashed");
+        return Ok(());
+    }
+
+    let edges: Vec<usize> = (1..samples.len()).filter(|&i| samples[i] != samples[i-1]).collect();
+    if edges.len() < 20 {
+        println!("  only {} edges in capture — degenerate trace", edges.len());
+        return Ok(());
+    }
+
+    // Same decoder as capture_and_decode_counter.
+    let intervals: Vec<usize> = edges.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut sorted = intervals.clone();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2] as f64;
+    let k_p = 0.05f64;
+    let mut period_est = median;
+    let mut phase_ref = edges[0] as f64;
+    for &edge in &edges[1..] {
+        let actual = edge as f64;
+        let error = actual - (phase_ref + period_est);
+        if error.abs() <= 0.25 * median {
+            period_est += k_p * error;
+        }
+        phase_ref = actual;
+    }
+    let sync_min = (period_est * 1.5) as usize;
+    let sync_max = (period_est * 4.0) as usize;
+    let mut syncs: Vec<usize> = Vec::new();
+    let mut i = 1;
+    while i < samples.len() {
+        if samples[i] == 0 && samples[i-1] == 1 {
+            let mut j = i;
+            while j < samples.len() && samples[j] == 0 { j += 1; }
+            let run_len = j - i;
+            if run_len > sync_min && run_len <= sync_max && j < samples.len() {
+                syncs.push(j);
+            }
+            i = j + 1;
+        } else { i += 1; }
+    }
+
+    const PATTERN_REF: &[u8; 32] = b"The quick brown fox jumps over t";
+    let mut matches = 0usize;
+    let mut total = 0usize;
+    for (idx, &sync_end) in syncs.iter().enumerate() {
+        let mut count: u32 = 0;
+        let mut decoded = 0u32;
+        for n in 0..32u32 {
+            let off = ((2.0 * n as f64 + 1.5) * period_est).round() as usize;
+            let pos = sync_end + off;
+            if pos >= samples.len() { break; }
+            if samples[pos] != 0 { count |= 1u32 << n; }
+            decoded += 1;
+        }
+        if decoded < 32 { continue; }
+        let pattern_byte = (count & 0xFF) as u8;
+        let last_rx = ((count >> 16) & 0xFF) as u8;
+        let byte_idx = ((count >> 24) & 0x1F) as u8;
+        let pat_expected = PATTERN_REF[byte_idx as usize & 31];
+        let pat_ok = pattern_byte == pat_expected;
+        let rx_ok = last_rx == byte_driven;
+        total += 1;
+        if rx_ok { matches += 1; }
+        let printable = if pattern_byte.is_ascii_graphic() || pattern_byte == b' ' {
+            pattern_byte as char
+        } else { '?' };
+        println!(
+            "  sync #{}: byte_idx={:2} pattern=G#{:02X} '{}' last_rx=G#{:02X}  {} pattern={}  rx_echo={}",
+            idx, byte_idx, pattern_byte, printable, last_rx,
+            if pat_ok { "✓" } else { "✗" }, if pat_ok { "match" } else { "MISMATCH" },
+            if rx_ok { format!("✓ G#{last_rx:02X} == G#{byte_driven:02X}") } else { format!("✗ G#{last_rx:02X} != G#{byte_driven:02X}") }
+        );
+    }
+    if total > 0 {
+        println!("\nround-trip echo: {matches}/{total} syncs carried last_rx = G#{byte_driven:02X}");
+    }
+    Ok(())
 }
 
 /// `wire_stats [SAMPLES]` — runs a tight bit-bang at the bridge's native loop rate over the requested sample budget, then reports duty cycle, average frequency, and per-state pulse-width stats (mean ± stddev, min, max). No buffer is held on the device — sample count caps wall-clock time only.

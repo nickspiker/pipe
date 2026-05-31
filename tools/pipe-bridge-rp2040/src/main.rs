@@ -160,6 +160,19 @@ static TRACE_ELAPSED_US: portable_atomic::AtomicU32 = portable_atomic::AtomicU32
 static TRACE_PERIOD_NS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
+// wire_count_drive — bidirectional round-trip with top_pipe_counter.v's RX
+// window. Detects FPGA sync, waits for TX data, drives a byte LSB-first
+// during the FPGA's RX window, then captures the next TX cycle into
+// TRACE_FAST_BUF so the host can verify the echo in last_rx_byte.
+//
+// Cross-core layout (samples & period reuse TRACE_PERIOD_NS):
+//   REQUEST low 8 bits = byte to drive; bit 8 = arm flag (=1)
+//   RESPONSE low 16 bits = captured sample count; bit 31 = sync_found
+static COUNT_DRIVE_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static COUNT_DRIVE_SAMPLES: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+static COUNT_DRIVE_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+// ---------------------------------------------------------------------------
 // Wire stats — streaming statistics at native sample rate, no buffer. fast_capture maxes out at TRACE_MAX_SAMPLES bits because of BRAM; stats doesn't store samples, so it can run for as long as we want and compute duty cycle / freq / pulse-width distribution over a much larger window.
 //
 // Per-state accounting:
@@ -859,6 +872,108 @@ fn fast_capture(samples: usize, period_ns: u32) -> u32 {
     }
 
     start.elapsed().as_micros() as u32
+}
+
+/// Detect FPGA sync, drive `byte_to_drive` LSB-first during the FPGA's RX
+/// window, then capture the next trace into TRACE_FAST_BUF.
+///
+/// FPGA timing (top_pipe_counter.v): wire_clk ≈ 86 µs; SYNC = 2 wire_clks
+/// LOW; DATA = 32 × 2 wire_clks; RX = 16 wire_clks tristate, FPGA samples 8
+/// bits at 2 wire_clks per bit. Bridge: scan GP0 ~1 µs cadence → on a
+/// [1.5, 4] wire_clk LOW run ending HIGH, lock sync_end; wait 5504 µs;
+/// drive byte LSB-first, 172 µs/bit; tristate; fast_capture.
+///
+/// Returns (sync_found, capture_elapsed_us). Caller must wrap in
+/// `cortex_m::interrupt::free` (same invariant as fast_capture).
+fn count_drive_and_capture(byte_to_drive: u8, samples: usize, period_ns: u32) -> (u32, u32) {
+    use embassy_rp::pac::{IO_BANK0, PADS_BANK0, SIO};
+    use embassy_rp::pac::io::vals::{Oeover, Outover};
+
+    // Empirically observed wire_clk period (host decoder reports period_est
+    // ≈ 89.2 µs; ring oscillator runs slightly slower than the 86 µs nominal
+    // from the divider chain math). Off-by-3 µs would accumulate to ~50 µs by
+    // bit 7 — enough to miss the FPGA's last RX sample.
+    const WIRE_CLK_US: u32 = 89;
+    const SYNC_MIN_US: u32 = (3 * WIRE_CLK_US) / 2;
+    const SYNC_MAX_US: u32 = 4 * WIRE_CLK_US;
+    const TX_DATA_US: u32 = 32 * 2 * WIRE_CLK_US;
+    const RX_BIT_US: u32 = 2 * WIRE_CLK_US;
+    const SYNC_TIMEOUT_US: u32 = 100_000;
+
+    PADS_BANK0.gpio(PIO_EDGE_GPIO as usize).modify(|w| {
+        w.set_od(false);
+        w.set_ie(true);
+        w.set_schmitt(true);
+    });
+    IO_BANK0.gpio(PIO_EDGE_GPIO as usize).ctrl().write(|w| {
+        w.set_funcsel(PIO_FUNCSEL_SIO);
+        w.set_outover(Outover::NORMAL);
+        w.set_oeover(Oeover::NORMAL);
+    });
+    let pin_mask: u32 = 1 << PIO_EDGE_GPIO;
+    SIO.gpio_oe(0).value_clr().write_value(pin_mask);
+    SIO.gpio_out(0).value_clr().write_value(pin_mask);
+
+    let gpio_in_ptr: *const u32 = SIO.gpio_in(0).as_ptr();
+    let start = embassy_time::Instant::now();
+
+    // Edge-driven sync detection: record the time of each LOW→HIGH and
+    // HIGH→LOW transition, and when we see LOW→HIGH whose preceding LOW
+    // duration is in [SYNC_MIN_US, SYNC_MAX_US], we've found sync. This is
+    // robust against per-iteration timing assumptions since we're using the
+    // hardware timer directly.
+    let mut prev = unsafe { gpio_in_ptr.read_volatile() } & 1;
+    let mut low_start_us: u32 = if prev == 0 { 0 } else { u32::MAX };
+    let sync_end_us: u32;
+    loop {
+        let now_us = start.elapsed().as_micros() as u32;
+        let s = unsafe { gpio_in_ptr.read_volatile() } & 1;
+        if s != prev {
+            if s == 0 {
+                // HIGH → LOW: mark start of a LOW run.
+                low_start_us = now_us;
+            } else if low_start_us != u32::MAX {
+                // LOW → HIGH: compute LOW run duration.
+                let low_dur = now_us.wrapping_sub(low_start_us);
+                if low_dur >= SYNC_MIN_US && low_dur <= SYNC_MAX_US {
+                    sync_end_us = now_us;
+                    break;
+                }
+                low_start_us = u32::MAX;
+            }
+            prev = s;
+        }
+        if now_us > SYNC_TIMEOUT_US {
+            return (0, 0);
+        }
+    }
+
+    let drive_target_us = sync_end_us + TX_DATA_US;
+    while (start.elapsed().as_micros() as u32) < drive_target_us {
+        cortex_m::asm::nop();
+    }
+
+    let drive_start_us = start.elapsed().as_micros() as u32;
+    SIO.gpio_oe(0).value_set().write_value(pin_mask);
+    // Drive MSB-first: FPGA's rx_byte_reg shifts left and the first-received
+    // sample lands at MSB. Sending bit 7 first means FPGA's MSB position
+    // receives the byte's MSB, etc. — bytes match without bit-reversal.
+    for bit_idx in 0..8u32 {
+        let wire_bit = (byte_to_drive >> (7 - bit_idx)) & 1;
+        if wire_bit != 0 {
+            SIO.gpio_out(0).value_set().write_value(pin_mask);
+        } else {
+            SIO.gpio_out(0).value_clr().write_value(pin_mask);
+        }
+        let bit_end_us = drive_start_us + (bit_idx + 1) * RX_BIT_US;
+        while (start.elapsed().as_micros() as u32) < bit_end_us {
+            cortex_m::asm::nop();
+        }
+    }
+    SIO.gpio_oe(0).value_clr().write_value(pin_mask);
+    SIO.gpio_out(0).value_clr().write_value(pin_mask);
+
+    (1, fast_capture(samples, period_ns))
 }
 
 /// Tight bit-banged stats collector. Reads GP0 at native loop rate, tracks per-state run length stats (count, min, max, sum, sumsq) so the host can derive duty cycle, average frequency, and pulse-width stddev from one pass. No buffer — sample budget is the only bound.
@@ -3267,6 +3382,21 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             STATS_REQUEST.store(0, PaOrdering::Relaxed);
         }
 
+        let cd_req = COUNT_DRIVE_REQUEST.load(PaOrdering::Acquire);
+        if cd_req != 0 {
+            let byte_to_drive = (cd_req & 0xFF) as u8;
+            let samples = (COUNT_DRIVE_SAMPLES.load(PaOrdering::Relaxed) as usize)
+                .min(TRACE_MAX_SAMPLES);
+            let period_ns = TRACE_PERIOD_NS.load(PaOrdering::Relaxed);
+            let (sync_found, capture_us) = cortex_m::interrupt::free(|_| {
+                count_drive_and_capture(byte_to_drive, samples, period_ns)
+            });
+            TRACE_ELAPSED_US.store(capture_us, PaOrdering::Relaxed);
+            let resp = (samples as u32) | (sync_found << 31);
+            COUNT_DRIVE_RESPONSE.store(resp.max(1), PaOrdering::Release);
+            COUNT_DRIVE_REQUEST.store(0, PaOrdering::Relaxed);
+        }
+
         let sync_req = SYNC_REQUEST.load(PaOrdering::Acquire);
         if sync_req != 0 {
             let frac_req = SYNC_FRAC_REQUEST.load(PaOrdering::Relaxed);
@@ -4010,10 +4140,10 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 TRACE_PERIOD_NS.store(period_ns, PaOrdering::Relaxed);
                 TRACE_REQUEST.store(samples_req, PaOrdering::Release);
 
-                // Worst-case wall time = samples × period_ns; cap at 2 s so a
+                // Worst-case wall time = samples × period_ns; cap at 4 s so a
                 // stuck wire task can't hang dispatch. At TRACE_MAX_SAMPLES
-                // (8192) and 100 µs/sample that's 819 ms — comfortably inside.
-                let deadline = Instant::now() + embassy_time::Duration::from_secs(2);
+                // (65536) and 16 µs/sample observed, max ≈ 1.05 s.
+                let deadline = Instant::now() + embassy_time::Duration::from_secs(4);
                 while TRACE_RESPONSE.load(PaOrdering::Acquire) == 0 {
                     if Instant::now() > deadline {
                         break;
@@ -4030,6 +4160,63 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 let mut payload = alloc::vec::Vec::with_capacity(8 + bytes_used);
                 payload.extend_from_slice(&captured.to_le_bytes());
                 payload.extend_from_slice(&elapsed_us.to_le_bytes());
+                let buf_ptr = &raw const TRACE_FAST_BUF as *const u8;
+                for i in 0..bytes_used {
+                    payload.push(unsafe { buf_ptr.add(i).read_volatile() });
+                }
+                fields.push(("data".to_string(), VsfType::v(b'b', payload)));
+            }
+        }
+        "wire_count_drive" => {
+            // Input: byte (u8) + samples (u32 LE) + period_ns (u32 LE) = 9 bytes.
+            // Defaults if short: byte=0xFF, samples=8192, period_ns=10_000.
+            // Response: u32 captured (bit 31 = sync_found) | u32 elapsed_us |
+            //           u8 byte_driven | u8 pad[3] | bitpacked samples
+            let data_in = cmd
+                .get("data")
+                .ok()
+                .and_then(|vs| vs.first().cloned())
+                .and_then(|v| match v {
+                    VsfType::v(b'b', bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let (byte_to_drive, samples_req, period_ns) = if data_in.len() >= 9 {
+                (
+                    data_in[0],
+                    u32::from_le_bytes([data_in[1], data_in[2], data_in[3], data_in[4]]),
+                    u32::from_le_bytes([data_in[5], data_in[6], data_in[7], data_in[8]]),
+                )
+            } else {
+                (0xFFu8, TRACE_MAX_SAMPLES as u32, 10_000u32)
+            };
+            let samples_req = samples_req.min(TRACE_MAX_SAMPLES as u32);
+            if samples_req == 0 {
+                fields.push(("err".to_string(), VsfType::a("zero_samples".to_string())));
+            } else {
+                COUNT_DRIVE_RESPONSE.store(0, PaOrdering::Relaxed);
+                COUNT_DRIVE_SAMPLES.store(samples_req, PaOrdering::Relaxed);
+                TRACE_PERIOD_NS.store(period_ns, PaOrdering::Relaxed);
+                COUNT_DRIVE_REQUEST.store(
+                    (byte_to_drive as u32) | (1u32 << 8),
+                    PaOrdering::Release,
+                );
+                let deadline = Instant::now() + embassy_time::Duration::from_secs(4);
+                while COUNT_DRIVE_RESPONSE.load(PaOrdering::Acquire) == 0 {
+                    if Instant::now() > deadline { break; }
+                    cortex_m::asm::nop();
+                }
+                let resp = COUNT_DRIVE_RESPONSE.load(PaOrdering::Relaxed);
+                let captured = resp & 0x7FFF_FFFF;
+                let sync_found = (resp >> 31) & 1;
+                let elapsed_us = TRACE_ELAPSED_US.load(PaOrdering::Relaxed);
+                let bytes_used = ((captured as usize) + 7) >> 3;
+                let captured_field = captured | (sync_found << 31);
+                let mut payload = alloc::vec::Vec::with_capacity(12 + bytes_used);
+                payload.extend_from_slice(&captured_field.to_le_bytes());
+                payload.extend_from_slice(&elapsed_us.to_le_bytes());
+                payload.push(byte_to_drive);
+                payload.extend_from_slice(&[0u8, 0u8, 0u8]);
                 let buf_ptr = &raw const TRACE_FAST_BUF as *const u8;
                 for i in 0..bytes_used {
                     payload.push(unsafe { buf_ptr.add(i).read_volatile() });

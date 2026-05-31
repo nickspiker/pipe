@@ -1,0 +1,92 @@
+# =============================================================================
+# pipe_meal.lpf — Full Meal Deal: ira ceremony + flash-backed OTP slots + PIPE
+#   wire challenge-response. Derived from pipe_ira.lpf with these additions:
+#     - SPI flash CS / MOSI / MISO pins (for runtime flash R/W)
+#     - PIPE wire pin (for challenge-response over the single-wire protocol)
+#   SCK is driven via the USRMCLK primitive (no LOCATE — it's a dedicated
+#   ECP5 config pin accessed post-config from inside the bitstream).
+# =============================================================================
+#   clk         → P6   (25 MHz crystal)
+#   led         → T6   (onboard LED, active-low)
+#   ext_led     → T2   (J4 pin 6 LED via buffer — FUCKED indicator)
+#   oled_*      → P2/R2 (SSD1306 I2C)
+#   kp_*        → 11 GPIOs for the dozenal keypad (KEYPAD.md)
+#   flash_cs_n  → N8   (SPI flash chip-select, post-config user logic)
+#   flash_mosi  → T8   (SPI flash MOSI / SI)
+#   flash_miso  → T7   (SPI flash MISO / SO)
+#   pipe_pad    → E16  (PIPE single-wire bidirectional IO, matches mirror-XOR)
+# =============================================================================
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 5 MHz;
+
+# Dozenal keypad — all 11 pins bidirectional with internal pull-up.
+LOCATE COMP "kp_p27" SITE "H14";
+IOBUF PORT "kp_p27" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p28" SITE "H15";
+IOBUF PORT "kp_p28" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p44" SITE "N14";
+IOBUF PORT "kp_p44" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p51" SITE "P14";
+IOBUF PORT "kp_p51" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p49" SITE "P12";
+IOBUF PORT "kp_p49" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p63" SITE "T14";
+IOBUF PORT "kp_p63" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p62" SITE "T13";
+IOBUF PORT "kp_p62" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p56" SITE "R13";
+IOBUF PORT "kp_p56" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p50" SITE "P13";
+IOBUF PORT "kp_p50" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p57" SITE "R14";
+IOBUF PORT "kp_p57" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p58" SITE "R15";
+IOBUF PORT "kp_p58" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "ext_led" SITE "T2";
+IOBUF PORT "ext_led" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+# -----------------------------------------------------------------------------
+# SPI flash pins — connect to the same GD25Q32 chip the ECP5 configures from.
+# Post-configuration, user logic drives these pins directly. SCK goes through
+# the USRMCLK primitive (no LOCATE constraint needed for the SCK port — there
+# is no SCK port; the primitive drives the dedicated CCLK pad internally).
+# CS/MOSI/MISO are on the standard configuration MFIO pins for ECP5 CABGA256.
+# -----------------------------------------------------------------------------
+LOCATE COMP "flash_cs_n" SITE "N8";
+IOBUF PORT "flash_cs_n" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "flash_mosi" SITE "T8";
+IOBUF PORT "flash_mosi" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "flash_miso" SITE "T7";
+IOBUF PORT "flash_miso" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+# -----------------------------------------------------------------------------
+# PIPE wire — single bidirectional IO carrying challenge in / response out.
+# Matches the pin used in pipe_mirror_xor.lpf so the existing bridge wire
+# connection on E16 just works without re-cabling.
+# -----------------------------------------------------------------------------
+LOCATE COMP "pipe_pad" SITE "E16";
+IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=DOWN;

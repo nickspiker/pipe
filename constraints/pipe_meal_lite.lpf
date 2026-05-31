@@ -1,0 +1,78 @@
+# =============================================================================
+# pipe_meal_lite.lpf — Meal Deal without runtime flash R/W.
+#   Derived from pipe_meal.lpf with flash CS/MOSI/MISO pins removed (the
+#   `lite` variant uses emulated otp.v with synthesis-time INIT_FILE baking
+#   instead of runtime SPI writes). Everything else (clock, keypad, OLED,
+#   LEDs, PIPE wire) is identical.
+# =============================================================================
+#   clk         → P6   (25 MHz crystal)
+#   led         → T6   (onboard LED, active-low)
+#   ext_led     → T2   (J4 pin 6 LED via buffer — primary status)
+#   oled_*      → P2/R2 (SSD1306 I2C)
+#   kp_*        → 11 GPIOs for the dozenal keypad (KEYPAD.md)
+#   pipe_pad    → E16  (PIPE single-wire bidirectional IO, matches mirror-XOR)
+# =============================================================================
+
+LOCATE COMP "clk" SITE "P6";
+IOBUF PORT "clk" IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk" 5 MHz;
+
+# Dozenal keypad — all 11 pins bidirectional with internal pull-up.
+LOCATE COMP "kp_p27" SITE "H14";
+IOBUF PORT "kp_p27" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p28" SITE "H15";
+IOBUF PORT "kp_p28" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p44" SITE "N14";
+IOBUF PORT "kp_p44" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p51" SITE "P14";
+IOBUF PORT "kp_p51" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p49" SITE "P12";
+IOBUF PORT "kp_p49" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p63" SITE "T14";
+IOBUF PORT "kp_p63" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p62" SITE "T13";
+IOBUF PORT "kp_p62" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p56" SITE "R13";
+IOBUF PORT "kp_p56" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p50" SITE "P13";
+IOBUF PORT "kp_p50" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p57" SITE "R14";
+IOBUF PORT "kp_p57" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "kp_p58" SITE "R15";
+IOBUF PORT "kp_p58" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+LOCATE COMP "led" SITE "T6";
+IOBUF PORT "led" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "ext_led" SITE "T2";
+IOBUF PORT "ext_led" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_scl" SITE "P2";
+IOBUF PORT "oled_scl" IO_TYPE=LVCMOS33;
+
+LOCATE COMP "oled_sda" SITE "R2";
+IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
+
+# Board user button (active-low, internal pull-up). Held = wipe OTP slots
+# back to VIRGIN and reset the ceremony FSM so a fresh ceremony can run
+# without a USB power-cycle.
+LOCATE COMP "user_btn" SITE "R7";
+IOBUF PORT "user_btn" IO_TYPE=LVCMOS33 PULLMODE=UP;
+
+# -----------------------------------------------------------------------------
+# PIPE wire — single bidirectional IO carrying challenge in / response out.
+# Matches the pin used in pipe_mirror_xor.lpf and pipe_meal.lpf so the existing
+# bridge wire connection on E16 works without re-cabling.
+# -----------------------------------------------------------------------------
+LOCATE COMP "pipe_pad" SITE "E16";
+IOBUF PORT "pipe_pad" IO_TYPE=LVCMOS33 PULLMODE=DOWN;

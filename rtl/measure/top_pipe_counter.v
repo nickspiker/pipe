@@ -1,20 +1,33 @@
 // =============================================================================
-// top_pipe_counter.v — Minimal counter transmitter for wire-listening pipeline
-// validation. Drops mirror-XOR protocol entirely. FPGA owns the wire
-// continuously and drives a known pattern that the bridge can listen to and
-// decode.
+// top_pipe_counter.v — Counter transmitter + RX window for wire-listening +
+// bidirectional validation. FPGA drives idle alternation continuously; once
+// per IDLE_TICKS, sends a sync prefix + 32-bit payload, then tristates for an
+// RX window. Bridge listens and may drive during the RX window. FPGA's next
+// TX payload echoes the byte sampled during the previous RX window in the
+// upper bits, so the host can verify bridge→FPGA round-trip in a single
+// capture.
 //
-// Wire encoding (matches the example in the user's spec):
+// Wire encoding:
 //   IDLE: alternating 1, 0, 1, 0, ... per wire_clk cycle. Continuous "clock".
-//   TRANSMISSION (once per second):
-//     2 wire_clks of LOW (sync prefix; breaks the idle alternation),
-//     followed by 32 data bits LSB-first. Each data bit takes 2 wire_clks:
-//       sub-phase 0: drive HIGH (= "host slot" position in the old protocol)
-//       sub-phase 1: drive bit value (= "enclave slot" position)
-//   After last bit: return to IDLE alternation. Counter increments.
+//   TRANSMISSION (every IDLE_TICKS wire_clks):
+//     SYNC: 2 wire_clks LOW (breaks idle alternation).
+//     DATA: 32 bits LSB-first. Each bit takes 2 wire_clks:
+//       sub-phase 0: drive HIGH (= "host slot" position in mirror-XOR)
+//       sub-phase 1: drive bit value (= "enclave slot")
+//     RX:   RX_TICKS wire_clks tristated. Sample wire_in once per 2 wire_clks
+//           (RX_TICKS/2 bits = 8 bits). Bridge may drive during this window.
+//   After RX: return to IDLE alternation.
 //
-// Bridge listens via existing wire_trace / SM2 sampler. Host decodes the
-// 32-bit counter and confirms it increments once per second.
+// TX payload layout (32 bits, LSB-first on wire):
+//   bits [7:0]:   pattern_byte (FPGA's known reference pattern)
+//   bits [15:8]:  8'h00 (separator — preserves regex compatibility when last_rx
+//                  is also zero)
+//   bits [23:16]: last_rx_byte (FPGA's echo of what bridge drove last RX)
+//   bits [28:24]: byte_idx (pattern position 0..31)
+//   bits [31:29]: 3'b0 (padding)
+//
+// Bridge round-trip: bridge drives a known byte sequence during each RX
+// window. Next TX's last_rx_byte field should match what the bridge drove.
 //
 // Same I/O port list as top_pipe_mirror_xor so the LPF works unchanged.
 // =============================================================================
@@ -88,116 +101,136 @@ module top_pipe_counter (
     );
 
     // -------------------------------------------------------------------------
-    // Counter transmitter FSM — PATTERN MODE
-    //   Every "second" (= IDLE_TICKS wire_clks), transmits a 32-bit count value.
-    //   The count payload is filled with pattern data: the low byte cycles
-    //   through the 32 ASCII chars of "The quick brown fox jumps over t",
-    //   so consecutive transmissions reveal the FPGA's known reference pattern.
-    //   Counter advances per TX. Bridge confirms decoded count low-bytes ==
-    //   "T", "h", "e", " ", "q", "u", ... in order.
+    // FSM: IDLE → TX → RX → IDLE
     // -------------------------------------------------------------------------
-    parameter integer IDLE_TICKS  = 11600;  // 1 second between TX (1 Hz tick)
+    localparam FSM_IDLE = 2'd0;
+    localparam FSM_TX   = 2'd1;
+    localparam FSM_RX   = 2'd2;
+
+    parameter integer IDLE_TICKS  = 256;    // ~22 ms between TX (high cadence)
     parameter integer SYNC_TICKS  = 2;
     parameter integer DATA_BITS   = 32;
     parameter integer BIT_TICKS   = 2;
     parameter integer TX_LEN      = SYNC_TICKS + DATA_BITS * BIT_TICKS;  // = 66
+    parameter integer RX_TICKS    = 16;     // 8 bits × 2 wire_clks per bit
 
-    // 256-bit pattern source. byte_idx is the position in the pattern (0..31).
-    // Pattern is "The quick brown fox jumps over t" — same as top_pipe_mirror_xor.
     parameter [255:0] TX_PATTERN_REF =
         256'h74207265766f2073706d756a20786f66206e776f7262206b6369757120656854;
-    reg [4:0]   byte_idx     = 5'd0;  // 0..31, cycles through pattern bytes
+
+    reg [1:0]   fsm          = FSM_IDLE;
+    reg [4:0]   byte_idx     = 5'd0;
     reg [13:0]  idle_div     = 14'd0;
-    reg         tx_active    = 1'b0;
     reg [9:0]   tx_phase     = 10'd0;
+    reg [4:0]   rx_phase     = 5'd0;
     reg [31:0]  tx_shift     = 32'd0;
-    reg         idle_state   = 1'b0;     // alternates per wire_clk during idle
+    reg [7:0]   rx_byte_reg  = 8'd0;
+    reg [7:0]   last_rx_byte = 8'd0;
+    reg         idle_state   = 1'b0;
     reg         wire_out_reg = 1'b1;
 
-    // Extract pattern byte at position byte_idx (each byte = 8 bits of TX_PATTERN_REF).
+    // wire_in_sync: 2-FF-synchronized pad input in enclave_clk domain.
+    // Sampled in wire_clk (= enclave_clk / 256), so already-stable values are
+    // sampled — no further CDC needed.
+    wire wire_in_sync;
+
+    // Extract pattern byte at position byte_idx
     wire [7:0] pattern_byte = TX_PATTERN_REF[8 * byte_idx +: 8];
 
-    // Phase counter and idle state alternation
+    // FSM update + idle alternation
     always @(posedge wire_clk) begin
         idle_state <= ~idle_state;
 
-        if (!tx_active) begin
-            if (idle_div == IDLE_TICKS - 1) begin
-                idle_div <= 0;
-                tx_active <= 1'b1;
-                tx_phase <= 0;
-                // TX payload: high 24 bits = byte_idx as a marker (zero-padded),
-                // low 8 bits = the actual pattern byte. Lets us verify both:
-                //   - bit-exact byte match against expected pattern
-                //   - byte index increments monotonically
-                tx_shift <= {24'h0, pattern_byte};
-                byte_idx <= byte_idx + 1'b1;  // wraps mod 32 (5-bit reg)
-            end else begin
-                idle_div <= idle_div + 1'b1;
+        case (fsm)
+            FSM_IDLE: begin
+                if (idle_div == IDLE_TICKS - 1) begin
+                    idle_div <= 0;
+                    fsm <= FSM_TX;
+                    tx_phase <= 0;
+                    // Payload format: [3'h0:byte_idx][last_rx_byte][8'h00][pattern_byte]
+                    tx_shift <= {3'h0, byte_idx, last_rx_byte, 8'h00, pattern_byte};
+                    byte_idx <= byte_idx + 1'b1;
+                end else begin
+                    idle_div <= idle_div + 1'b1;
+                end
             end
-        end else begin
-            if (tx_phase == TX_LEN - 1) begin
-                tx_active <= 1'b0;
-                tx_phase <= 0;
-            end else begin
-                tx_phase <= tx_phase + 1'b1;
+            FSM_TX: begin
+                if (tx_phase == TX_LEN - 1) begin
+                    fsm <= FSM_RX;
+                    rx_phase <= 0;
+                    rx_byte_reg <= 8'd0;
+                end else begin
+                    tx_phase <= tx_phase + 1'b1;
+                end
             end
-        end
+            FSM_RX: begin
+                // Sample once per 2 wire_clks (on odd phase, matches BIT_TICKS).
+                if (rx_phase[0] == 1'b1) begin
+                    rx_byte_reg <= {rx_byte_reg[6:0], wire_in_sync};
+                end
+                if (rx_phase == RX_TICKS - 1) begin
+                    fsm <= FSM_IDLE;
+                    // Final sample becomes last_rx_byte
+                    last_rx_byte <= {rx_byte_reg[6:0], wire_in_sync};
+                end else begin
+                    rx_phase <= rx_phase + 1'b1;
+                end
+            end
+            default: fsm <= FSM_IDLE;
+        endcase
     end
 
     // -------------------------------------------------------------------------
-    // Wire output decision per wire_clk
-    // -------------------------------------------------------------------------
-    //   IDLE (tx_active = 0): wire_out = idle_state (alternates 1, 0, 1, 0, ...)
+    // Wire output per FSM state
+    //   IDLE: wire_out = idle_state (alternates)
     //   TX sync (tx_phase < SYNC_TICKS): wire_out = 0
-    //   TX data: for each pair of wire_clks within a bit:
+    //   TX data:
     //     sub-phase 0 (= "host slot"): wire_out = 1
     //     sub-phase 1 (= "enclave slot"): wire_out = tx_shift[bit_idx]
+    //   RX: don't care (drive_en = 0)
     // -------------------------------------------------------------------------
-    wire [9:0]  data_phase   = tx_phase - SYNC_TICKS;  // 0..63
-    wire [4:0]  bit_idx      = data_phase[5:1];        // 0..31
-    wire        bit_subphase = data_phase[0];           // 0 = host, 1 = enclave
+    wire [9:0]  data_phase   = tx_phase - SYNC_TICKS;
+    wire [4:0]  bit_idx      = data_phase[5:1];
+    wire        bit_subphase = data_phase[0];
 
     always @(posedge wire_clk) begin
-        if (!tx_active) begin
-            wire_out_reg <= idle_state;
-        end else if (tx_phase < SYNC_TICKS) begin
-            wire_out_reg <= 1'b0;
-        end else if (bit_subphase == 1'b0) begin
-            wire_out_reg <= 1'b1;
-        end else begin
-            wire_out_reg <= tx_shift[bit_idx];
-        end
+        case (fsm)
+            FSM_IDLE: wire_out_reg <= idle_state;
+            FSM_TX: begin
+                if (tx_phase < SYNC_TICKS) begin
+                    wire_out_reg <= 1'b0;
+                end else if (bit_subphase == 1'b0) begin
+                    wire_out_reg <= 1'b1;
+                end else begin
+                    wire_out_reg <= tx_shift[bit_idx];
+                end
+            end
+            FSM_RX: wire_out_reg <= 1'b0;  // tristated; pad value comes from bridge or float
+            default: wire_out_reg <= idle_state;
+        endcase
     end
 
     // -------------------------------------------------------------------------
-    // Wire I/O — FPGA owns the wire (drive_en always 1)
+    // Wire I/O — FPGA tristates only during FSM_RX
     // -------------------------------------------------------------------------
-    wire wire_in_sync_unused;
     wire_io u_wire (
         .clk(enclave_clk),
         .reset_n(1'b1),
-        .drive_en(1'b1),
+        .drive_en(fsm != FSM_RX),
         .wire_out(wire_out_reg),
-        .wire_in(wire_in_sync_unused),
+        .wire_in(wire_in_sync),
         .pad(pipe_pad)
     );
 
     // -------------------------------------------------------------------------
-    // Status LED: lights solid when tx_active (= 5.7 ms once per second).
-    // Flashes briefly visible at human timescale.
+    // Status LED: lit during TX or RX (active phases).
     // -------------------------------------------------------------------------
-    always @(posedge wire_clk) led <= tx_active;
+    always @(posedge wire_clk) led <= (fsm != FSM_IDLE);
 
     // -------------------------------------------------------------------------
-    // Piezo H-bridge: only sounds during TX. Idle = silent (both pins LOW = 0V
-    // across piezo). Driving wire_out_reg here would play the IDLE alternation
-    // as a continuous ~11.6 kHz tone — annoying, hides the click of TX bursts.
-    // During TX, drive piezo with wire_out_reg so each transmission is audible
-    // as a brief click pattern (~5.7 ms long).
+    // Piezo H-bridge: drives during TX only. Silent during IDLE + RX.
     // -------------------------------------------------------------------------
-    assign piezo_enclave_p =  tx_active ?  wire_out_reg : 1'b0;
-    assign piezo_enclave_n =  tx_active ? ~wire_out_reg : 1'b0;
+    assign piezo_enclave_p =  (fsm == FSM_TX) ?  wire_out_reg : 1'b0;
+    assign piezo_enclave_n =  (fsm == FSM_TX) ? ~wire_out_reg : 1'b0;
 
 endmodule
 

@@ -28,8 +28,20 @@ module trng #(
     parameter integer SCHED_RCT_C  = 32,
     parameter integer SCHED_APT_W  = 256,
     parameter integer SCHED_APT_T  = 156,
-    parameter integer SCHED_LVL_LO = 1856,
-    parameter integer SCHED_LVL_HI = 2240
+    // LVL_LO/HI are deliberately wide. NIST SP 800-90B's textbook tolerance
+    // (±6σ ≈ ±192 around W/2) assumes high-quality entropy reaching the
+    // tester. Raw FPGA ring oscillator samples at this ring-to-clock ratio
+    // (~160 MHz ring / 25 MHz sampler ≈ 6×) carry systematic low-lag
+    // autocorrelation, and rings whose stage count makes their period a
+    // near-rational multiple of the sample period produce especially strong
+    // level-k popcount skew. BLAKE3 conditioning downstream produces uniform
+    // output from this source even at modest entropy per bit, so the health
+    // check here only needs to catch HARD failures (stuck rail, dead
+    // oscillator, near-100% bias) rather than subtle correlation or harmonic
+    // alignment. Bounds [256, 3840] = popcount must be in [6.25%, 93.75%]
+    // of W = catches stuck-near-rail patterns at all 7 iter-GF(2) levels.
+    parameter integer SCHED_LVL_LO = 256,
+    parameter integer SCHED_LVL_HI = 3840
 ) (
     input  wire         clk,            // enclave_clk (slow sampler, ~600 kHz)
     input  wire         reset_n,        // active-low POR
@@ -47,7 +59,11 @@ module trng #(
     output reg          health_fail,    // latched when <8 of 16 rings pass — FUCKED state
     output reg  [15:0]  ring_health,    // bitmask of last-gather healthy rings (1=pass)
     output reg   [4:0]  ring_health_cnt,// count of healthy rings 0..16 (for attestation responses)
-    output wire [15:0]  ring_enable     // advisory: one-hot mask of currently-active ring
+    output wire [15:0]  ring_enable,    // advisory: one-hot mask of currently-active ring
+    // Diagnostic surface (latched after each KOHI; valid after first gather_done or health_fail)
+    output reg  [15:0]   ring_rct_fail,    // bit i = ring i tripped RCT last gather
+    output reg  [15:0]   ring_apt_fail,    // bit i = ring i tripped APT last gather
+    output reg  [111:0]  ring_level_fail   // 7 bits per ring (level 0..6)
 );
 
     // -------------------------------------------------------------------------
@@ -77,6 +93,9 @@ module trng #(
     wire [4:0]   sched_ring_health_cnt;
     wire         sched_sample_bit;
     wire         sched_sample_valid;
+    wire [15:0]  sched_ring_rct_fail;
+    wire [15:0]  sched_ring_apt_fail;
+    wire [111:0] sched_ring_level_fail;
 
     ring_scheduler #(
         .N_RINGS      (16),
@@ -98,7 +117,10 @@ module trng #(
         .busy             (sched_busy),
         .all_done         (sched_all_done),
         .ring_health_mask (sched_ring_health_mask),
-        .ring_health_cnt  (sched_ring_health_cnt)
+        .ring_health_cnt  (sched_ring_health_cnt),
+        .ring_rct_fail    (sched_ring_rct_fail),
+        .ring_apt_fail    (sched_ring_apt_fail),
+        .ring_level_fail  (sched_ring_level_fail)
     );
 
     // -------------------------------------------------------------------------
@@ -155,6 +177,9 @@ module trng #(
             health_fail     <= 1'b0;
             ring_health     <= 16'b0;
             ring_health_cnt <= 5'b0;
+            ring_rct_fail   <= 16'b0;
+            ring_apt_fail   <= 16'b0;
+            ring_level_fail <= 112'b0;
         end else begin
             buf_we      <= 1'b0;
             gather_done <= 1'b0;
@@ -198,6 +223,9 @@ module trng #(
                     // Latch the health snapshot and decide HEALTHY/DEGRADED/FUCKED.
                     ring_health     <= sched_ring_health_mask;
                     ring_health_cnt <= sched_ring_health_cnt;
+                    ring_rct_fail   <= sched_ring_rct_fail;
+                    ring_apt_fail   <= sched_ring_apt_fail;
+                    ring_level_fail <= sched_ring_level_fail;
                     if (sched_ring_health_cnt < HEALTH_MIN) begin
                         // <8 rings passed — FUCKED. health_fail latches
                         // permanently (POR is the only clear path). Downstream

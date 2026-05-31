@@ -11,7 +11,7 @@ PIPE is the chip-level embodiment of a broader transport architecture called **P
 | **L0 — Medium** | Single bidirectional wire + pull-down (PIPE) / USB-C differential pair (ferros host) / fiber / etc. | Claims 1, 2 (single-wire, 3-pin package) |
 | **L1 — Line code** | Bit-to-medium encoding | Claim 12 (mirror-XOR, single-wire embodiment) |
 | **L2 — Framing** | Message boundaries on a stream-coded channel | Claim 12a (leading-zero suppress + trailing-1 marker) |
-| **L3 — Message format** | Structured payload + cryptographic envelope | Claim 13 (5-purpose ephemeral pubkey + ciphertext + trailing 1) |
+| **L3 — Message format** | Structured payload + cryptographic envelope (keyed) or hash-seeded scrambler envelope (keyless) | Claim 13 (5-purpose ephemeral pubkey + ciphertext + trailing 1) / Claim 13a (4-purpose payload-hash + scrambled-payload + trailing 1) |
 | **L4 — Crypto session** | ECDH key agreement + AEAD + identity binding | Claim 11 (entropy delivery + ira/wairua binding) |
 
 Each layer has one job and is independently replaceable. PT-over-USB-C reuses L2–L4 unchanged and swaps L0–L1 for the standard USB physical layer and line code. PT-over-fiber reuses L2–L4 and uses an optical L0 with NRZI or similar at L1. The novel single-wire mirror-XOR embodiment of L1 (Claim 12) is the chip-level instantiation.
@@ -55,7 +55,7 @@ A processing enclave **physically isolated** from a host system, comprising:
 
 - A self-contained timing source consisting of a combinational ring oscillator inside the enclave fabric (no external clock input, no governed timebase).
 - A write-once secret register, the output of which connects to exactly one consumer (a keyed cryptographic hash core inside the enclave) and to no other element.
-- A boot sequence that transitions, in a single direction, from entropy accumulation through key derivation and locking into an operational state from which no transition exits except by full power loss.
+- A boot sequence that transitions, in a single direction, from entropy accumulation thru key derivation and locking into an operational state from which no transition exits except by full power loss.
 - A single bidirectional communication line shared with the host, on which the enclave continuously emits a heartbeat pattern when idle, either party initiates communication by emitting a single bit that violates the heartbeat pattern, and exchanged data consists of cryptographically authenticated output without additional framing or encoding.
 
 ### Dependent claims (isolation embodiments)
@@ -226,7 +226,7 @@ The device of Claim 6 and Claim 7, wherein upon any intrinsic silicon-level heal
 
 - The wire remains at its pull-down resistor's quiescent level, indistinguishable from an absent or unpowered device, with no information leakage about which fault occurred;
 - The transition to the silent-wire state is caused only by silicon-level physical truth conditions (broken rings, corrupt OTP, interrupted burn), never by any protocol command, host-authenticated message, or input bit pattern, preserving the indestructible-from-outside property of Claim 6;
-- The OTP and internal state remain intact and electrically readable for forensic analysis if the device is decapsulated, but cannot be altered through the pin interface;
+- The OTP and internal state remain intact and electrically readable for forensic analysis if the device is decapsulated, but cannot be altered thru the pin interface;
 - The host's natural retry or alert behavior on detecting no response correctly identifies the device as non-functional without distinguishing whether it is broken, unpowered, or removed.
 
 ### Claim 9b — Host-asks-only state reporting
@@ -312,7 +312,7 @@ The line code of Claim 12, in a further embodiment wherein both parties transmit
 - The single bidirectional wire is wired-OR: pulled HIGH if either party actively drives HIGH, otherwise pulled LOW by the shared pull-down resistor;
 - Each party knows its own transmitted value (`own_drive`) and reads back the wire (`wire_value`) on the same slot;
 - Each party recovers the other party's transmitted bit by `other_data = wire_value XOR own_drive` (extraction of the other party's contribution by subtracting one's own known contribution);
-- The effective data throughput per wire is doubled relative to the slot-alternating embodiment of Claims 7 and 12, while preserving Claim 12's 100% per-direction efficiency, automatic DC balance, and zero clock-recovery overhead — with the DC-balance mechanism in this embodiment realized via either (i) transition-based encoding wherein data is encoded as toggles rather than levels, or (ii) differential physical topology, either of which preserves average 50% line duty cycle in the presence of uniformly-random simultaneous data from both parties.
+- The effective data thruput per wire is doubled relative to the slot-alternating embodiment of Claims 7 and 12, while preserving Claim 12's 100% per-direction efficiency, automatic DC balance, and zero clock-recovery overhead — with the DC-balance mechanism in this embodiment realized via either (i) transition-based encoding wherein data is encoded as toggles rather than levels, or (ii) differential physical topology, either of which preserves average 50% line duty cycle in the presence of uniformly-random simultaneous data from both parties.
 
 ### Claim 13 — Five-purpose message format: ephemeral pubkey simultaneously providing key transport, decryption material, authentication, DC balance, and frame leading edge
 
@@ -337,6 +337,56 @@ and wherein the ephemeral pubkey field of K bits (e.g., K = 256 for a standard e
 5. **Frame leading edge.** The leading-zero-suppression rule of Claim 12a applies to the pubkey field: transmission begins at the first 1 bit of the pubkey, omitting any leading zeros (which are reconstructed by the receiver from the prevailing idle state). The leading 1 bit is therefore the unambiguous start-of-message marker, and combined with the trailing-1 marker of Claim 12a forms the complete framing structure of the message without any separate framing bytes, sync words, or length headers.
 
 The novel contribution is the simultaneity of all five functions in a single K-bit field, exploiting the composition of (i) the line code of Claim 12, (ii) the framing scheme of Claim 12a, (iii) standard ECDH-based hybrid encryption, and (iv) the silent-failure policy of Claim 9a. Prior-art secure-element protocols (e.g., ATECC608A, A71CH, Optiga Trust M, TPM 2.0) use separate fields for each function: command-frame headers and length fields for framing, key-selector or key-handle bytes for key transport, separate MAC or signature fields for authentication, and either don't address line-level DC balance or rely on PHY-layer line codes (NRZI, 8B/10B) with separate DC-balance mechanisms. PIPE collapses all of these into one 256-bit ephemeral pubkey that does five jobs.
+
+### Claim 13a — Keyless plaintext variant: payload hash simultaneously providing framing, DC balance, CSPRNG seed for whitening, and integrity check
+
+The message format of Claim 13, in a further embodiment for transmissions where the sender does not require confidentiality (e.g., publicly-distributed firmware images, public-key material, debug telemetry), wherein the per-message wire structure is:
+
+```
+[ leading-zero-suppressed payload-hash | scrambled-payload | trailing 1 ]
+```
+
+and wherein:
+
+- The **payload-hash** field of H bits (e.g., H = 256 for BLAKE3) is the cryptographic hash of the plaintext payload. It contains no secret material; the entire transmission is plaintext-recoverable by any wire observer.
+- The **scrambled-payload** field is the plaintext payload bitwise-XORed with the keystream of a stream cipher (e.g., ChaCha20) seeded by the payload-hash. Because the payload-hash is uniformly distributed by the cryptographic properties of the hash function, and the stream cipher output is computationally indistinguishable from uniform regardless of seed, the scrambled-payload has approximately 50% one-bit density.
+- The receiver decodes the wire, separates the payload-hash and scrambled-payload, descrambles by XORing with ChaCha20(payload-hash), recovers the plaintext, recomputes BLAKE3(plaintext), and compares to the received payload-hash. A match confirms transport integrity; a mismatch indicates wire-level corruption.
+
+The single payload-hash field simultaneously provides four of the five functions of Claim 13's pubkey field, by the same compositional mechanism:
+
+1. **DC balance on the wire.** The payload-hash is uniformly distributed by the hash function's properties, and the scrambled-payload is uniformly distributed by the stream cipher's properties. Composed with Claim 12's line code, the entire transmission has statistical line-state distribution indistinguishable from the idle pattern, identically to Claim 13.
+2. **Frame leading edge.** The leading-zero-suppression rule of Claim 12a applies to the payload-hash field by the same construction as Claim 13.
+3. **Integrity checksum.** The payload-hash field functions as a self-attesting tamper-evident integrity check against passive wire errors (noise, glitches, ESD events). The receiver's rehash-and-compare is the integrity signal, occupying no separate field.
+4. **CSPRNG seed for whitening.** The payload-hash is reused as the stream cipher seed that produces the uniform-distribution property the scrambled-payload requires for DC balance — replacing the role that the ephemeral pubkey's key-transport-and-decryption function plays in Claim 13's keyed variant. This dual-use is the structural analogue of Claim 13's five-purpose pubkey.
+
+The functions of Claim 13 that are explicitly **not** provided by this variant:
+
+- **No confidentiality.** The transmission is plaintext-recoverable by any wire observer in possession of the standard ChaCha20 specification. This is intentional and is the defining property of the plaintext variant.
+- **No authentication against active substitution.** An active adversary in possession of the wire can replace the entire transmission (both payload-hash and scrambled-payload) with a self-consistent forgery, because the integrity check requires no secret. The payload-hash field provides *tamper-evident integrity against passive corruption*, not *cryptographic authentication against active adversaries*. Where authentication is required, the keyed variant of Claim 13 is the appropriate embodiment; alternatively, a digital signature over the payload-hash can be appended as a separate field.
+
+The novel contribution is that four of the five Claim-13 functions (framing, DC balance, integrity, whitening-seed) are obtainable from a single fixed-size hash field of public material, without any shared secret, ephemeral key, or cryptographic envelope — by exploiting the same compositional mechanism that makes Claim 13 work (statistical uniformity of the leading field composed with Claim 12's line code and Claim 12a's framing) and additionally repurposing the integrity-hash as the stream-cipher seed that produces the uniformity property the body field requires. Prior-art line-coded transmission protocols (NRZI-with-CRC, 8B/10B-with-CRC, scrambled-NRZ-with-CRC) provide DC balance and integrity via independent mechanisms (line code + appended CRC field) with strictly additive overhead; this claim provides both from a single shared field at zero additional overhead beyond the integrity check itself. Use cases include single-wire firmware distribution, public-key publication, and telemetry where transport integrity (not adversarial authentication) is the required property.
+
+### Claim 14 (umbrella) — Composite secure communication system integrating silicon trust anchor, post-quantum line code, transparent-hardness hashing, and tamper-evident ceremony with no software-trust gap
+
+A secure communication system, comprising:
+
+(a) **a silicon cryptographic processor** providing a physically-isolated trust anchor as recited in Claim 1, with packaging as recited in Claim 2, said processor exhibiting silent-failure-on-tamper behavior as recited in Claims 6 and 9a, and reporting state only in response to host queries as recited in Claim 9b;
+
+(b) **a multi-ring true random number generator** as recited in Claim 3, with health monitoring per Claims 3c and 3d, providing per-cycle conditioned entropy with statistical health checks performed at the silicon-physics level rather than at a software layer;
+
+(c) **a deferred identity commitment ceremony** as recited in Claim 5, binding the persistent identity of the processor of element (a) to its first-use context, with random pre-burn delay per Claim 8 and ring-enable gating per Claim 9;
+
+(d) **a single-wire bidirectional communication channel** between the cryptographic processor and a host system, employing the line code of Claim 12 with framing of Claim 12a, in some embodiments with full-full duplex per Claim 12b, providing transport without any cryptographic primitive susceptible to polynomial-time attack by Shor's algorithm and providing clock recovery thru constant-state intervals of at least 4096 wire-clock periods as empirically validated in the reference implementation;
+
+(e) **a single-bit-in, 256-bit-out entropy delivery protocol** as recited in Claim 11, providing key material derivable only by parties with prior pairing knowledge of the processor of element (a), structured as the keyless plaintext variant of Claim 13a or, in alternative embodiments, the keyed five-purpose-field variant of Claim 13;
+
+(f) **a transparently-hard cryptographic hash function** providing preimage resistance via combinatorial path explosion of provably-counted operation sequences (rather than via conjectured algebraic hardness), achieving at least approximately 255 bits of classical preimage security and at least 128 bits of quantum preimage security against attacks bounded by Grover's algorithm;
+
+(g) **device-bound at-rest message storage** wherein the device-specific encryption keys are derived from material obtainable only via successful completion of the protocol of element (e) with the cryptographic processor of element (a), such that compromise of the host software or filesystem does not yield the device key absent physical possession of the cryptographic processor of element (a);
+
+wherein the security guarantees provided by elements (a) thru (g) are mutually independent, such that compromise of any single element does not compromise the security guarantees provided by the remaining elements; and wherein the composition of elements (a) thru (g) provides end-to-end communication security from the silicon trust anchor thru the on-wire message format and continuing thru at-rest message storage, with no point in the security chain depending on (i) software-stored secrets, (ii) cryptographic primitives susceptible to polynomial-time quantum attack, or (iii) conjectured (rather than demonstrably-provable) hardness assumptions.
+
+The novel contribution of this claim is the **compositional integration**, rather than any single element thereof. Each element exists in prior-art form in isolation — TPMs provide hardware trust anchors, NIST has standardized post-quantum primitives, memory-hard hashes are documented in the literature, line codes with clock recovery are widely known — but the integrated system providing simultaneously: (i) hardware-rooted trust anchor with tamper-evident silent failure; (ii) post-quantum-by-construction transport, key derivation, and authentication; (iii) transparent (non-conjectural) hardness for both in-transit and at-rest cryptographic operations; and (iv) an unbroken security chain from silicon trust anchor thru application layer with no software-trust gap, is collectively unprecedented in the prior-art secure-communication literature. Prior secure-communication systems achieve at most two of properties (i)-(iv) — typically (i) (via TPM/Secure Enclave) and partial (ii) (via hybrid post-quantum constructions such as Signal's PQXDH) — and none achieve property (iii) for the entire stack or property (iv) without a software-rooted gap at the trust anchor.
 
 ---
 
