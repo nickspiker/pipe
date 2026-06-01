@@ -238,7 +238,7 @@ echo "--- Synthesise ---"
     read_verilog -I $RTL $OTP_DEFINE $RTL/otp.v
     read_verilog -I $RTL $RTL/inverted_pair_verify.v
     read_verilog -I $RTL $RTL/ira_fsm.v
-    read_verilog -I $RTL $RTL/chal_resp_fsm.v
+    read_verilog -I $RTL $RTL/l3_session_fsm.v
     read_verilog -I $RTL $RTL/wire_io.v
     read_verilog -I $RTL $RTL/ssd1306_i2c.v
     read_verilog -I $RTL $RTL/oled_greyscale_driver.v

@@ -269,16 +269,18 @@ module top_pipe_meal_lite (
     // Keys for mode select: "0"=STATUS, "1"=IRA HEX, "2"=OTP SLOTS, "A"=HEALTH DETAIL
     wire provision_request = key_press_pulse && (key_code == 5'd15);
 
-    reg [1:0] mode;
+    reg [2:0] mode;
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
-            mode <= 2'd1;  // boot default: IRA HEX (most useful for v1/v2 demos)
+            mode <= 3'd1;  // boot default: IRA HEX (most useful for v1/v2 demos)
         end else if (key_press_pulse) begin
             case (key_code)
-                5'd14: mode <= 2'd0;  // Zil   "0" → STATUS
-                5'd13: mode <= 2'd1;  // Zila  "1" → IRA HEX
-                5'd12: mode <= 2'd2;  // Zilor "2" → OTP SLOTS
-                5'd10: mode <= 2'd3;  // "A" key → RING HEALTH DETAIL (diagnostic)
+                5'd14: mode <= 3'd0;  // Zil   "0" → STATUS
+                5'd13: mode <= 3'd1;  // Zila  "1" → IRA HEX
+                5'd12: mode <= 3'd2;  // Zilor "2" → OTP SLOTS
+                5'd10: mode <= 3'd3;  // "A" key → RING HEALTH DETAIL
+                5'd9 : mode <= 3'd4;  // "B" key → WAIRUA HEX (Claim 5 session secret)
+                5'd8 : mode <= 3'd5;  // "C" key → L3 STATUS (session/drop/finger)
                 default: ;
             endcase
         end
@@ -293,7 +295,13 @@ module top_pipe_meal_lite (
     wire [15:0] trng_ring_health;
     wire [4:0]  trng_ring_health_cnt;
     wire [15:0] trng_ring_enable;
-    wire        trng_start, blake3_start;
+    // Arbitrated wairua-gen pipeline. ira_fsm drives during ceremony; L3 drives
+    // for fresh-session wairua refresh. They are mutually exclusive: ira_fsm
+    // runs only while chip_state < HEALTHY; L3 runs only when chip_alive.
+    wire        ira_trng_start, ira_blake3_start;
+    wire        l3_trng_start, l3_wairua_gen_start;
+    wire        trng_start  = ira_trng_start  | l3_trng_start;
+    wire        blake3_start = ira_blake3_start | l3_wairua_gen_start;
     wire [15:0]  trng_ring_rct_fail;
     wire [15:0]  trng_ring_apt_fail;
     wire [111:0] trng_ring_level_fail;
@@ -348,21 +356,23 @@ module top_pipe_meal_lite (
         .i_b3_done    (b3_shared_done)
     );
 
-    wire [255:0] cr_blake3_chain;
-    wire [511:0] cr_blake3_mblock;
-    wire [63:0]  cr_blake3_counter;
-    wire [31:0]  cr_blake3_numbytes;
-    wire [31:0]  cr_blake3_dflags;
-    wire         cr_blake3_start;
-    wire [511:0] cr_blake3_hash;
-    wire         cr_blake3_valid;
+    // L3 session FSM drives the shared blake3 core for Message-B compressions
+    // (single-block hashes; counter is always 0). Tree pipeline takes priority
+    // when busy (ceremony); otherwise L3 owns the core.
+    wire [255:0] l3_b3_chain;
+    wire [511:0] l3_b3_mblock;
+    wire [31:0]  l3_b3_numbytes;
+    wire [31:0]  l3_b3_dflags;
+    wire         l3_b3_valid;
+    wire [511:0] l3_b3_hash;
+    wire         l3_b3_done;
 
-    wire [255:0] b3_shared_chain    = blake3_busy ? tree_b3_chain    : cr_blake3_chain;
-    wire [511:0] b3_shared_mblock   = blake3_busy ? tree_b3_mblock   : cr_blake3_mblock;
-    wire [63:0]  b3_shared_counter  = blake3_busy ? tree_b3_counter  : cr_blake3_counter;
-    wire [31:0]  b3_shared_numbytes = blake3_busy ? tree_b3_numbytes : cr_blake3_numbytes;
-    wire [31:0]  b3_shared_dflags   = blake3_busy ? tree_b3_dflags   : cr_blake3_dflags;
-    wire         b3_shared_valid    = blake3_busy ? tree_b3_valid    : cr_blake3_start;
+    wire [255:0] b3_shared_chain    = blake3_busy ? tree_b3_chain    : l3_b3_chain;
+    wire [511:0] b3_shared_mblock   = blake3_busy ? tree_b3_mblock   : l3_b3_mblock;
+    wire [63:0]  b3_shared_counter  = blake3_busy ? tree_b3_counter  : 64'b0;
+    wire [31:0]  b3_shared_numbytes = blake3_busy ? tree_b3_numbytes : l3_b3_numbytes;
+    wire [31:0]  b3_shared_dflags   = blake3_busy ? tree_b3_dflags   : l3_b3_dflags;
+    wire         b3_shared_valid    = blake3_busy ? tree_b3_valid    : l3_b3_valid;
     wire [511:0] b3_shared_hash;
     wire         b3_shared_done;
 
@@ -380,8 +390,8 @@ module top_pipe_meal_lite (
         .o_valid   (b3_shared_done)
     );
 
-    assign cr_blake3_hash  = b3_shared_hash;
-    assign cr_blake3_valid = b3_shared_done;
+    assign l3_b3_hash = b3_shared_hash;
+    assign l3_b3_done = b3_shared_done;
 
     // =========================================================================
     // OTP — emulated 8×256 with optional synthesis-time INIT_FILE.
@@ -450,11 +460,11 @@ module top_pipe_meal_lite (
         .provision_request (provision_request),
         .chip_state        (chip_state),
         .byzantine_ok      (byzantine_ok),
-        .trng_start        (trng_start),
+        .trng_start        (ira_trng_start),
         .trng_busy         (trng_busy),
         .trng_gather_done  (trng_gather_done),
         .trng_health_fail  (trng_health_fail),
-        .blake3_start      (blake3_start),
+        .blake3_start      (ira_blake3_start),
         .blake3_busy       (blake3_busy),
         .blake3_ira_valid  (blake3_ira_valid),
         .blake3_ira        (blake3_ira),
@@ -545,15 +555,25 @@ module top_pipe_meal_lite (
         .MAX_CHARS_PER_LINE(MAX_CHARS_PER_LINE),
         .SLOT_BITS         (256)
     ) u_mode_fsm (
-        .mode            (mode),
-        .ira             (recovered_ira),
-        .chip_state      (chip_state),
-        .ring_health_cnt (trng_ring_health_cnt),
-        .slot_flat       (all_slots_flat),
-        .ring_rct_fail   (trng_ring_rct_fail),
-        .ring_apt_fail   (trng_ring_apt_fail),
-        .ring_level_fail (trng_ring_level_fail),
-        .strings_flat    (strings_flat)
+        .mode               (mode),
+        .ira                (recovered_ira),
+        .chip_state         (chip_state),
+        .ring_health_cnt    (trng_ring_health_cnt),
+        .slot_flat          (all_slots_flat),
+        .ring_rct_fail      (trng_ring_rct_fail),
+        .ring_apt_fail      (trng_ring_apt_fail),
+        .ring_level_fail    (trng_ring_level_fail),
+        // L3 observability — MODE 4 (WAIRUA HEX) + MODE 5 (L3 STATUS)
+        .wairua             (l3_wairua_disp),
+        .l3_state           (l3_state_debug),
+        .l3_session_counter (l3_session_counter),
+        .l3_drop_counter    (l3_drop_counter),
+        .l3_h_req_finger    (l3_h_req_finger),
+        .l3_h_resp_finger   (l3_h_resp_finger),
+        .l3_last_mode_perm  (l3_last_mode_perm),
+        .l3_last_was_query  (l3_last_was_query),
+        .l3_session_valid   (l3_session_valid),
+        .strings_flat       (strings_flat)
     );
 
     // Re-render request: LATCHED until the renderer accepts it (i.e. leaves
@@ -570,7 +590,7 @@ module top_pipe_meal_lite (
     // consumed).
     reg [3:0] re_render_init_cnt;
     reg [2:0] last_chip_state;
-    reg [1:0] last_mode;
+    reg [2:0] last_mode;
     reg       last_chip_fucked;
     reg       last_trng_health_fail;
     reg       last_trng_gather_done_seen;
@@ -582,7 +602,7 @@ module top_pipe_meal_lite (
             re_render_init_cnt         <= 4'd0;
             re_render_req              <= 1'b0;
             last_chip_state            <= 3'd0;
-            last_mode                  <= 2'd0;
+            last_mode                  <= 3'd0;
             last_chip_fucked           <= 1'b0;
             last_trng_health_fail      <= 1'b0;
             last_trng_gather_done_seen <= 1'b0;
@@ -643,9 +663,12 @@ module top_pipe_meal_lite (
     );
 
     // =========================================================================
-    // PIPE wire — bidirectional I/O for challenge-response.
-    // chal_resp_fsm takes ownership of wire after chip_alive. Until then wire
-    // is tristated and pulled DOWN by the LPF (= idle LOW).
+    // PIPE wire — bidirectional I/O. wire_io is the pad tristate buffer with
+    // synchronized input. The mirror-XOR codec + slot timing are inlined below
+    // so everything runs in the single enclave_clk domain (no gated clock).
+    // Until chip_alive, drive_en is held LOW so the line stays HIGH-Z and the
+    // external pull-down (or internal weak pull-down on the dev rig) keeps it
+    // idle LOW — indistinguishable from "chip absent" (Claim 6 silent wire).
     // =========================================================================
     wire wire_out_internal;
     wire drive_en_internal;
@@ -660,29 +683,154 @@ module top_pipe_meal_lite (
         .pad     (pipe_pad)
     );
 
-    // =========================================================================
-    // Challenge-response FSM. On chip_alive, listens for 256-bit challenges
-    // and responds with BLAKE3_keyed_hash(IRA, challenge) using shared blake3.
-    // =========================================================================
-    wire [3:0] cr_state_debug;
+    // -------------------------------------------------------------------------
+    // L2 slot timing (single enclave_clk domain, slot_pulse = 1-cycle pulse at
+    // each slot boundary, my_slot alternates with OWN_IDLE_FIRST = 1 for the
+    // enclave so it drives the first heartbeat).
+    //
+    // SLOT_DIV picks the wire bit rate. enclave_clk = 25 MHz; slot_rate =
+    // 25 MHz / SLOT_DIV. 500 → 50 kHz slot rate (~100 kbps wire-bit rate
+    // counting both directions), which is what the RP2040 bridge's CDR has
+    // been validated against (see memory pipe_2026_05_28_session: "audible
+    // piezo proof-test PROVED late-window drift is ALGORITHM ... both FPGA
+    // divider tap AND bridge SM1 PIO drive sound rock-stable"). At this
+    // rate one Message-B exchange = 513 wire bits per direction = ~20 ms,
+    // motuhake (5 rounds) ≈ 100 ms. Plenty of headroom.
+    // -------------------------------------------------------------------------
+    localparam integer SLOT_DIV = 500;
+    localparam integer SLOT_CW  = (SLOT_DIV <= 2) ? 1 : $clog2(SLOT_DIV);
 
-    chal_resp_fsm u_chal_resp (
-        .clk             (clk),
-        .reset_n         (reset_n),
-        .chip_healthy    (chip_alive),
-        .wire_in_sync    (wire_in_synced),
-        .wire_out        (wire_out_internal),
-        .drive_en        (drive_en_internal),
-        .ira_value       (recovered_ira),
-        .blake3_start    (cr_blake3_start),
-        .blake3_chain    (cr_blake3_chain),
-        .blake3_mblock   (cr_blake3_mblock),
-        .blake3_counter  (cr_blake3_counter),
-        .blake3_numbytes (cr_blake3_numbytes),
-        .blake3_dflags   (cr_blake3_dflags),
-        .blake3_valid    (cr_blake3_valid),
-        .blake3_hash     (cr_blake3_hash),
-        .fsm_state_debug (cr_state_debug)
+    reg [SLOT_CW-1:0] slot_cnt;
+    reg               slot_pulse;
+    reg               my_slot;
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            slot_cnt   <= {SLOT_CW{1'b0}};
+            slot_pulse <= 1'b0;
+            my_slot    <= 1'b1;                 // enclave: OWN_IDLE_FIRST
+        end else begin
+            slot_pulse <= 1'b0;
+            if (slot_cnt == SLOT_DIV - 1) begin
+                slot_cnt   <= {SLOT_CW{1'b0}};
+                slot_pulse <= 1'b1;
+                my_slot    <= ~my_slot;
+            end else begin
+                slot_cnt <= slot_cnt + 1'b1;
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // L1 mirror-XOR codec (inline, enclave_clk domain).
+    //   Encode (combinational, valid every cycle while my_slot = 1):
+    //     wire_out = OWN_IDLE (1) ^ tx_data ^ other_last
+    //     drive_en = chip_alive AND my_slot AND wire_out  (asymmetric pull-down
+    //                — we drive HIGH or release; never drive LOW)
+    //   Decode (registered, fires at slot boundary as my_slot toggles to 1):
+    //     rx_data = wire_in ^ OTHER_IDLE (0) ^ own_last
+    // -------------------------------------------------------------------------
+    reg own_last;
+    reg other_last;
+    wire l3_tx_data_w;
+    wire l3_tx_active_w;
+    reg  l3_rx_valid_r;
+    reg  l3_rx_data_r;
+    reg  l3_tx_slot_r;
+
+    wire wire_logical = 1'b1 ^ l3_tx_data_w ^ other_last;
+    assign wire_out_internal = wire_logical;
+    assign drive_en_internal = chip_alive && my_slot && wire_logical;
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            own_last      <= 1'b0;
+            other_last    <= 1'b0;
+            l3_rx_valid_r <= 1'b0;
+            l3_rx_data_r  <= 1'b0;
+            l3_tx_slot_r  <= 1'b0;
+        end else begin
+            l3_rx_valid_r <= 1'b0;
+            l3_tx_slot_r  <= 1'b0;
+            if (slot_pulse) begin
+                // my_slot has JUST toggled. After the toggle:
+                //   my_slot = 1 → enclave slot upcoming, host slot just ended
+                //   my_slot = 0 → host slot upcoming, enclave slot just ended
+                if (my_slot) begin
+                    // Decode host's just-ended slot, advance L3 TX engine.
+                    l3_rx_data_r  <= wire_in_synced ^ 1'b0 ^ own_last;
+                    other_last    <= wire_in_synced ^ 1'b0 ^ own_last;
+                    l3_rx_valid_r <= 1'b1;
+                    l3_tx_slot_r  <= 1'b1;
+                end else begin
+                    // Record what we drove in the just-ended enclave slot.
+                    own_last <= l3_tx_data_w;
+                end
+            end
+        end
+    end
+
+    // =========================================================================
+    // L3 session FSM (PROTOCOL.md v0). Owns the wire after chip_alive.
+    //   * fresh-session (Message A: 1,0,...,0) → KOHI → wairua → H_req/H_resp
+    //   * Message B (X1||X2 each way): mode = SESSION vs PERMANENT by X2 form
+    //   * q/health (Claim 9c) via BLAKE3("Kei te ora koe?") domain identifier
+    //   * Pads ratchet on verified exchange; DROP increments drop_counter
+    // =========================================================================
+    wire [255:0] l3_wairua_disp;
+    wire [63:0]  l3_session_counter;
+    wire [63:0]  l3_boot_epoch;
+    wire [63:0]  l3_drop_counter;
+    wire [31:0]  l3_h_req_finger;
+    wire [31:0]  l3_h_resp_finger;
+    wire         l3_last_mode_perm;
+    wire         l3_last_was_query;
+    wire         l3_session_valid;
+    wire [4:0]   l3_state_debug;
+
+    l3_session_fsm u_l3 (
+        .clk                 (clk),
+        .reset_n             (reset_n),
+        .chip_alive          (chip_alive),
+
+        .rx_valid            (l3_rx_valid_r),
+        .rx_data             (l3_rx_data_r),
+        .tx_slot             (l3_tx_slot_r),
+        .tx_data             (l3_tx_data_w),
+        .tx_active           (l3_tx_active_w),
+
+        .b3_chain            (l3_b3_chain),
+        .b3_mblock           (l3_b3_mblock),
+        .b3_numbytes         (l3_b3_numbytes),
+        .b3_dflags           (l3_b3_dflags),
+        .b3_valid            (l3_b3_valid),
+        .b3_hash             (l3_b3_hash),
+        .b3_done             (l3_b3_done),
+
+        .ira_value           (recovered_ira),
+
+        .trng_start          (l3_trng_start),
+        .trng_gather_done    (trng_gather_done),
+        .trng_health_fail    (trng_health_fail),
+        .wairua_gen_start    (l3_wairua_gen_start),
+        .wairua_gen_result   (blake3_ira),
+        .wairua_gen_valid    (blake3_ira_valid),
+
+        .chip_state_in       (chip_state),
+        .ring_health_mask_in (trng_ring_health),
+        .ring_health_cnt_in  (trng_ring_health_cnt),
+        .slot_burned_mask_in (otp_burned_mask),
+        .fsm_state_in        (fsm_state),
+
+        .wairua_disp         (l3_wairua_disp),
+        .session_counter     (l3_session_counter),
+        .boot_epoch          (l3_boot_epoch),
+        .drop_counter        (l3_drop_counter),
+        .h_req_finger        (l3_h_req_finger),
+        .h_resp_finger       (l3_h_resp_finger),
+        .last_mode_perm      (l3_last_mode_perm),
+        .last_was_query      (l3_last_was_query),
+        .session_valid_o     (l3_session_valid),
+        .fsm_state_debug     (l3_state_debug)
     );
 
 endmodule

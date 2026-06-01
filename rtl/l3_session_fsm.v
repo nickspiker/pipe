@@ -163,8 +163,11 @@ module l3_session_fsm (
         32'h5bd32dfb, 32'hbecf5506, 32'h00625478, 32'hffee8e80
     };
 
-    // Fresh-session detection pattern (1 followed by 255 zeros, MSB first).
-    localparam [255:0] MSG_A_PATTERN = {1'b1, 255'b0};
+    // Fresh-session detection pattern. The wire shape is: frame-1, then 256
+    // zeros. The frame-1 is consumed by ST_IDLE without shifting (Claim 12a
+    // leading-edge marker), so rx_buf1 ends up holding the 256-bit payload =
+    // all zeros. Probability of a Message-B X1 accidentally matching: 2⁻²⁵⁶.
+    localparam [255:0] MSG_A_PATTERN = 256'b0;
 
     // =========================================================================
     // Session state (PROTOCOL.md L3)
@@ -190,6 +193,8 @@ module l3_session_fsm (
     reg [8:0]   rx_bit_cnt;
     reg [9:0]   tx_bit_cnt;
     reg [8:0]   fs_tx_cnt;                // counter for fresh-session emit of wairua
+    reg         fs_frame_sent;            // 0 until the leading frame-1 has been emitted
+    reg         tx_frame_sent;            // same, for Message B response
 
     // =========================================================================
     // FSM
@@ -291,6 +296,8 @@ module l3_session_fsm (
             drop_counter      <= 64'b0;
             last_mode_perm    <= 1'b0;
             last_was_query    <= 1'b0;
+            fs_frame_sent     <= 1'b0;
+            tx_frame_sent     <= 1'b0;
         end else begin
             // Default one-cycle strobes
             b3_valid           <= 1'b0;
@@ -310,9 +317,13 @@ module l3_session_fsm (
                     tx_data   <= 1'b0;
                     tx_active <= 1'b0;
                     if (chip_alive && rx_valid && rx_data) begin
-                        // Got the first 1 — start buffering 256 bits.
-                        rx_buf1     <= {255'b0, 1'b1};   // MSB shift convention: this is bit 255 of message
-                        rx_bit_cnt  <= 9'd1;
+                        // Got the framing 1. It is NOT part of the message —
+                        // it is Claim 12a's leading-edge marker that says "the
+                        // host is leaving idle, the next 256/512 bits are the
+                        // payload." Don't shift it into rx_buf1; just consume
+                        // it and start the buffer empty.
+                        rx_buf1     <= 256'b0;
+                        rx_bit_cnt  <= 9'd0;
                         state       <= ST_RX_BUF1;
                     end
                 end
@@ -384,7 +395,12 @@ module l3_session_fsm (
                 end
 
                 ST_FS_HREQ_WAIT: begin
-                    if (b3_done) begin
+                    // Drop b3_valid so the *_REQ state's assertion becomes a
+                    // one-cycle pulse; gate the latch on (b3_done && !b3_valid)
+                    // so we don't sample the BLAKE3 core's reset/stale o_valid
+                    // before it has even seen our i_valid pulse.
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
                         h_req <= b3_hash[255:0];
                         state <= ST_FS_HRESP_REQ;
                     end
@@ -400,27 +416,34 @@ module l3_session_fsm (
                 end
 
                 ST_FS_HRESP_WAIT: begin
-                    if (b3_done) begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
                         h_resp        <= b3_hash[255:0];
                         session_valid <= 1'b1;
                         fs_tx_cnt     <= 9'b0;
+                        fs_frame_sent <= 1'b0;
                         state         <= ST_FS_EMIT;
                     end
                 end
 
                 // -----------------------------------------------------------
-                // FS_EMIT — push wairua onto enclave data stream, MSB first.
+                // FS_EMIT — leading frame-1 (Claim 12a edge marker), then push
+                // wairua onto the enclave data stream, MSB first. Total = 257
+                // enclave slots: 1 frame + 256 wairua.
                 // -----------------------------------------------------------
                 ST_FS_EMIT: begin
                     tx_active <= 1'b1;
                     if (tx_slot) begin
-                        // emit MSB of wairua_reg shifted left by fs_tx_cnt
-                        tx_data   <= wairua_reg[255 - fs_tx_cnt];
-                        fs_tx_cnt <= fs_tx_cnt + 9'd1;
-                        if (fs_tx_cnt == 9'd255) begin
-                            // Last bit emitted; back to IDLE.
-                            tx_active <= 1'b0;
-                            state     <= ST_IDLE;
+                        if (!fs_frame_sent) begin
+                            tx_data       <= 1'b1;
+                            fs_frame_sent <= 1'b1;
+                        end else begin
+                            tx_data   <= wairua_reg[255 - fs_tx_cnt];
+                            fs_tx_cnt <= fs_tx_cnt + 9'd1;
+                            if (fs_tx_cnt == 9'd255) begin
+                                tx_active <= 1'b0;
+                                state     <= ST_IDLE;
+                            end
                         end
                     end
                 end
@@ -463,7 +486,8 @@ module l3_session_fsm (
                 // MODE_WAIT — detect mode; save BLAKE3(message_req) for ratchet later.
                 // -----------------------------------------------------------
                 ST_MODE_WAIT: begin
-                    if (b3_done) begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
                         req_hash_reg <= b3_hash[255:0]; // save for ratchet
                         if (x2_match_session) begin
                             mode_permanent <= 1'b0;
@@ -499,7 +523,8 @@ module l3_session_fsm (
                 end
 
                 ST_RESP_WAIT: begin
-                    if (b3_done) begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
                         message_resp_reg <= b3_hash[255:0];
                         // Pre-compute tx_buf1 now; tx_buf2 fills after next hash.
                         tx_buf1 <= b3_hash[255:0] ^ h_req;
@@ -520,30 +545,39 @@ module l3_session_fsm (
                 end
 
                 ST_RESPH_WAIT: begin
-                    if (b3_done) begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
                         resp_hash_reg <= b3_hash[255:0]; // save for ratchet
                         tx_buf2 <= mode_permanent ? ((~b3_hash[255:0]) ^ h_resp)
                                                   : (  b3_hash[255:0]  ^ h_resp);
-                        tx_bit_cnt <= 10'b0;
-                        state      <= ST_TX_EMIT;
+                        tx_bit_cnt    <= 10'b0;
+                        tx_frame_sent <= 1'b0;
+                        state         <= ST_TX_EMIT;
                     end
                 end
 
                 // -----------------------------------------------------------
-                // TX_EMIT — emit 512 enclave bits: tx_buf1 (MSB first) then tx_buf2.
+                // TX_EMIT — leading frame-1 (Claim 12a edge marker), then 512
+                // enclave bits: tx_buf1 (MSB first) then tx_buf2 (MSB first).
+                // Total = 513 enclave slots.
                 // -----------------------------------------------------------
                 ST_TX_EMIT: begin
                     tx_active <= 1'b1;
                     if (tx_slot) begin
-                        if (tx_bit_cnt < 10'd256) begin
-                            tx_data <= tx_buf1[255 - tx_bit_cnt[7:0]];
+                        if (!tx_frame_sent) begin
+                            tx_data       <= 1'b1;
+                            tx_frame_sent <= 1'b1;
                         end else begin
-                            tx_data <= tx_buf2[255 - (tx_bit_cnt[7:0])];
-                        end
-                        tx_bit_cnt <= tx_bit_cnt + 10'd1;
-                        if (tx_bit_cnt == 10'd511) begin
-                            tx_active <= 1'b0;
-                            state     <= ST_RATCHET_QREQ;
+                            if (tx_bit_cnt < 10'd256) begin
+                                tx_data <= tx_buf1[255 - tx_bit_cnt[7:0]];
+                            end else begin
+                                tx_data <= tx_buf2[255 - (tx_bit_cnt[7:0])];
+                            end
+                            tx_bit_cnt <= tx_bit_cnt + 10'd1;
+                            if (tx_bit_cnt == 10'd511) begin
+                                tx_active <= 1'b0;
+                                state     <= ST_RATCHET_QREQ;
+                            end
                         end
                     end
                 end

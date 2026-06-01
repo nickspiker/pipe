@@ -648,6 +648,66 @@ static TX_MIRROR_PATTERN: portable_atomic::AtomicU32 = portable_atomic::AtomicU3
 static PIPE_COMMS_LOCKED: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
+// PIPE Layer-3 round atomics + shared buffers.
+//
+// pipe_l3_round drives up to L3_MAX_BITS host-slot bits onto the wire and
+// captures up to L3_MAX_BITS enclave-slot bits in one exchange. CDR is
+// preserved between successive calls via PIPE_SESSION_LIVE: on entry the
+// service routine checks the flag; if set, it skips the multi-second CDR
+// acquisition and jumps straight into streaming, reusing the already-locked
+// SM1+SM2+SM0 + interval_fp_period state.
+//
+// Buffers live in static storage (not the heap) because the streaming path
+// runs inside `cortex_m::interrupt::free` and must not allocate. The 17 x u32
+// = 544-bit shape gives headroom over the 513-bit Message-B-per-direction
+// maximum from rtl/measure/l3_session_fsm_tb.v.
+//
+// All bit ordering matches the existing mirror-mode convention: LSB-first
+// within each u32 word for TX, LSB-first within each output byte for RX.
+const L3_MAX_BITS: u32 = 520;
+const L3_BUF_WORDS: usize = 17;
+
+/// Request slot: non-zero `max_iter` arms a pipe_l3_round; core 1 zeroes after.
+static L3_REQUEST: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Response signal: non-zero when core 1 has finished the round.
+static L3_RESPONSE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Bits to drive (0..=L3_MAX_BITS). Set BEFORE L3_REQUEST goes non-zero.
+static L3_TX_COUNT: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Bits to capture (0..=L3_MAX_BITS). Set BEFORE L3_REQUEST goes non-zero.
+static L3_RX_COUNT: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// Flags: bit 0 = open_session (force fresh CDR acquire even if live),
+/// bit 1 = close_session (stop SMs after this call).
+static L3_FLAGS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+/// "SMs running, CDR live" latch. True after a successful pipe_l3_round when
+/// close_session was not set. Cleared on lock loss or close_session.
+static PIPE_SESSION_LIVE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+/// Result published by core 1. session_ok = 1 if CDR held throughout the
+/// exchange, 0 if lost. rx_actual_count may be less than the requested count
+/// on lock loss / wall-clock abort. slot_drift surfaces the final
+/// interval_fp_period for host-side diagnostic.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct L3RoundResult {
+    session_ok: u8,
+    rx_actual_count: u32,
+    slot_drift: u32,
+    rx_bits: [u32; L3_BUF_WORDS],
+}
+
+static mut L3_RESULT: L3RoundResult = L3RoundResult {
+    session_ok: 0,
+    rx_actual_count: 0,
+    slot_drift: 0,
+    rx_bits: [0; L3_BUF_WORDS],
+};
+
+/// Streaming TX buffer. Filled by dispatch from the host's `tx_bits` payload
+/// before L3_REQUEST goes non-zero. Bits 0..tx_count are consumed in order;
+/// the first transmitted bit is L3_TX_BITS[0] bit 0.
+static mut L3_TX_BITS: [u32; L3_BUF_WORDS] = [0; L3_BUF_WORDS];
+
+// ---------------------------------------------------------------------------
 // Wire decode — slot-aligned continuous decode, runs after wire_sync acquisition.
 //
 // fast_decode reuses fast_sync's acquisition (same-polarity 128+128 sum >> 9) to lock slot_iter, then waits for the next rising edge on the wire to anchor phase: per PROTOCOL.md Layer 1, in idle the enclave drives HIGH on its even slots, so a rising edge marks the start of an enclave (even) slot. From there iter_in_slot counts up to slot, then wraps with slot_phase toggling.
@@ -1620,6 +1680,29 @@ fn pio_sample_try_read() -> Option<u32> {
         return None;
     }
     Some(PIO0.rxf(PIO_SAMPLE_SM).read())
+}
+
+/// Stop SM2 (wire sampler) without touching SM0/SM1. Companion to
+/// pio_tx_mirror_stop for the L3 round end-of-round SM2 resync — we keep
+/// SM1 cycling so the wire keeps mirroring during host slots, but SM2 must
+/// restart on a clean byte boundary so round N+1's enclave/host slot parity
+/// tracker is correct from sample 0.
+fn pio_sample_stop() {
+    use embassy_rp::pac::PIO0;
+    PIO0.ctrl().modify(|w| {
+        let cur = w.sm_enable();
+        w.set_sm_enable(cur & !(1 << PIO_SAMPLE_SM));
+    });
+}
+
+/// Drain all bytes currently in SM2's RX FIFO. Used at end-of-round so the
+/// next round starts with an empty SM2 RX FIFO. Companion to pio_sample_arm
+/// (which also drains, but only after it has restarted SM2).
+fn pio_sample_drain_rx() {
+    use embassy_rp::pac::PIO0;
+    while (PIO0.fstat().read().rxempty() & (1 << PIO_SAMPLE_SM)) == 0 {
+        let _ = PIO0.rxf(PIO_SAMPLE_SM).read();
+    }
 }
 
 /// Non-blocking read from SM0's edge-timestamp RX FIFO. Returns the raw PIO X
@@ -3092,6 +3175,534 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     }
 }
 
+/// Persistent state for the live PIPE Layer-3 session. Populated on the first
+/// successful acquisition inside fast_l3_round; reused on subsequent rounds
+/// when `PIPE_SESSION_LIVE` is set. Holds everything fast_l3_round needs to
+/// stream another exchange without re-acquiring CDR:
+///   - interval_fp_period : the rise-to-rise period in fixed point (drives
+///     SM1 clkdiv on every reuse).
+///   - frac_bits          : fixed-point scaling so interval_fp can be parsed.
+///   - acq_slot_cyc_period: the acquisition seed period (cyc), kept for the
+///     ±30% sanity window on each future per-edge slew step.
+///   - acq_slot_cyc_low / acq_slot_cyc_high : per-polarity seeds for the
+///     polarity-window math (currently unused by the streaming path but
+///     captured so it can be re-applied without re-acquiring).
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct L3SessionState {
+    interval_fp_period: u32,
+    interval_fp_low: u32,
+    interval_fp_high: u32,
+    frac_bits: u32,
+    p_shift: u32,
+    acq_slot_cyc_period: u32,
+    acq_slot_cyc_low: u32,
+    acq_slot_cyc_high: u32,
+}
+
+static mut L3_SESSION_STATE: L3SessionState = L3SessionState {
+    interval_fp_period: 0,
+    interval_fp_low: 0,
+    interval_fp_high: 0,
+    frac_bits: 0,
+    p_shift: 0,
+    acq_slot_cyc_period: 0,
+    acq_slot_cyc_low: 0,
+    acq_slot_cyc_high: 0,
+};
+
+/// PIPE Layer-3 round.
+///
+/// Drives up to `tx_count` host-slot bits from `L3_TX_BITS` and captures up to
+/// `rx_count` enclave-slot bits into `L3_RESULT.rx_bits`. The wire-level
+/// codec (mirror-XOR + 2-instr SM1 program + SM2 sampler) is identical to
+/// `wire_mirror` — we just feed SM1's TX FIFO from a streaming buffer instead
+/// of a fixed pattern, and we pack each sampled enclave bit into RX storage.
+///
+/// CDR strategy: if `PIPE_SESSION_LIVE` is set (and `open_session` did NOT
+/// force a fresh acquire) the SMs are assumed to be running with valid clkdiv
+/// from the previous round, so we skip acquisition entirely and jump straight
+/// to streaming. Otherwise we run the full acquisition loop (same logic as
+/// `fast_sync`), enable SM1+SM2 on the first rising edge after acquisition,
+/// then start streaming.
+///
+/// `open_session` bit: force fresh CDR even if PIPE_SESSION_LIVE is set
+/// (used by the host to recover after seeing too many corrupted rounds).
+/// `close_session` bit: stop SMs at the end, clear PIPE_SESSION_LIVE.
+///
+/// `max_iter` is the wall-clock safety cap, same units as fast_sync's
+/// max_iter. If the exchange hasn't drained tx_count + captured rx_count
+/// within max_iter PIO edges, we abort with session_ok=0 and return whatever
+/// we have. This prevents a desynced wire from hanging the USB call.
+///
+/// Caller MUST run inside `cortex_m::interrupt::free`.
+fn fast_l3_round(
+    max_iter: u32,
+    tx_count: u32,
+    rx_count: u32,
+    open_session: bool,
+    close_session: bool,
+) -> L3RoundResult {
+    let start = embassy_time::Instant::now();
+    let _ = start;
+
+    // Bounds-check counts. The dispatch handler already clamps to L3_MAX_BITS
+    // but we re-clamp here so the streaming loop's array indexing is safe.
+    let tx_count = tx_count.min(L3_MAX_BITS);
+    let rx_count = rx_count.min(L3_MAX_BITS);
+
+    // Default-zero output. session_ok flips to 1 if we complete the exchange
+    // without lock loss + without hitting max_iter.
+    let mut result = L3RoundResult {
+        session_ok: 0,
+        rx_actual_count: 0,
+        slot_drift: 0,
+        rx_bits: [0; L3_BUF_WORDS],
+    };
+
+    // ------------------------------------------------------------------
+    // CDR acquisition (or skip-if-live).
+    // ------------------------------------------------------------------
+    let live = PIPE_SESSION_LIVE.load(PaOrdering::Acquire) != 0 && !open_session;
+    let frac_bits = SYNC_FRAC_BITS_DEFAULT.clamp(SYNC_FRAC_BITS_MIN, SYNC_FRAC_BITS_MAX);
+    let p_shift: u32 = 8;
+    let mut interval_fp_period: u32;
+    let interval_fp_low: u32;
+    let interval_fp_high: u32;
+    let acquisition_slot_cyc_period: u32;
+    let acquisition_slot_cyc_low: u32;
+    let acquisition_slot_cyc_high: u32;
+
+    // Edge cap: convert host-provided poll cap to an edge cap. Mirrors
+    // fast_sync's translation. Hard wall-clock cap (~8 sec).
+    const SYNC_MAX_EDGES_PIO: u32 = 1 << 15;
+    let max_edges_total = (max_iter >> 9)
+        .min(SYNC_MAX_EDGES_PIO)
+        .max(SYNC_ACQ_PER_POLARITY * 4 + 1);
+    let wall_cap_us: u64 = 8_000_000;
+
+    // Whether the SMs are already running with a valid clkdiv. When live,
+    // we don't re-init SM0/SM1/SM2 — they're still cycling from the previous
+    // round, anchored to the same FPGA slot boundary.
+    if live {
+        // Reuse persisted CDR state. SMs are assumed to be running.
+        let s = unsafe { L3_SESSION_STATE };
+        interval_fp_period = s.interval_fp_period;
+        interval_fp_low = s.interval_fp_low;
+        interval_fp_high = s.interval_fp_high;
+        acquisition_slot_cyc_period = s.acq_slot_cyc_period;
+        acquisition_slot_cyc_low = s.acq_slot_cyc_low;
+        acquisition_slot_cyc_high = s.acq_slot_cyc_high;
+    } else {
+        // Fresh start. Tear down any prior session (if open_session forced),
+        // then run acquisition + SM enable + streaming. Same path as
+        // wire_mirror's first half.
+        if PIPE_SESSION_LIVE.load(PaOrdering::Relaxed) != 0 {
+            pio_tx_mirror_stop();
+            PIPE_SESSION_LIVE.store(0, PaOrdering::Release);
+        }
+        pio_edge_init();
+        let initial = pio_edge_start();
+        pio_tx_mirror_init();
+        pio_sample_init();
+
+        // Discard the first FIFO entry (partial phase).
+        let _ = pio_edge_read_until(wall_cap_us, start);
+
+        // Acquisition loop — minimal copy of fast_sync's acquisition. Pulls
+        // 256 rise + 256 fall same-slot intervals via the min-bootstrap
+        // running-minimum filter, computes the seed in fp form.
+        let mut acq_sum_low: u64 = 0;
+        let mut acq_sum_high: u64 = 0;
+        let mut acq_rising: u32 = 0;
+        let mut acq_falling: u32 = 0;
+        let mut min_interval_u: u32 = u32::MAX;
+        let mut iter: u32 = 0;
+        loop {
+            if iter >= max_edges_total {
+                // Failed to acquire within the wall-clock budget. Tear down.
+                pio_edge_stop();
+                pio_tx_mirror_stop();
+                PIPE_SESSION_LIVE.store(0, PaOrdering::Release);
+                return result;
+            }
+            let raw = match pio_edge_read_until(wall_cap_us, start) {
+                Some(r) => r,
+                None => {
+                    pio_edge_stop();
+                    pio_tx_mirror_stop();
+                    PIPE_SESSION_LIVE.store(0, PaOrdering::Release);
+                    return result;
+                }
+            };
+            iter += 1;
+            let rising = ((iter ^ initial) & 1) == 1;
+            let own_cyc_u: u32 = (!raw).wrapping_shl(1);
+            if own_cyc_u < min_interval_u {
+                if own_cyc_u * 2 < min_interval_u {
+                    acq_sum_low = 0;
+                    acq_sum_high = 0;
+                    acq_rising = 0;
+                    acq_falling = 0;
+                }
+                min_interval_u = own_cyc_u;
+            }
+            let threshold_u = min_interval_u.saturating_add(min_interval_u / 2);
+            if own_cyc_u <= threshold_u {
+                if rising {
+                    if acq_rising < SYNC_ACQ_PER_POLARITY {
+                        acq_sum_low += own_cyc_u as u64;
+                        acq_rising += 1;
+                    }
+                } else if acq_falling < SYNC_ACQ_PER_POLARITY {
+                    acq_sum_high += own_cyc_u as u64;
+                    acq_falling += 1;
+                }
+            }
+            if acq_rising >= SYNC_ACQ_PER_POLARITY && acq_falling >= SYNC_ACQ_PER_POLARITY {
+                break;
+            }
+        }
+        interval_fp_low = (acq_sum_low << frac_bits >> SYNC_ACQ_SHIFT_PER_POLARITY_LOCAL) as u32;
+        interval_fp_high = (acq_sum_high << frac_bits >> SYNC_ACQ_SHIFT_PER_POLARITY_LOCAL) as u32;
+        acquisition_slot_cyc_low = (interval_fp_low >> frac_bits) as u32;
+        acquisition_slot_cyc_high = (interval_fp_high >> frac_bits) as u32;
+        interval_fp_period = interval_fp_low.wrapping_add(interval_fp_high);
+        acquisition_slot_cyc_period = (interval_fp_period >> frac_bits) as u32;
+
+        // Wait for the next rising edge to anchor SM1/SM2.
+        let mut anchored = false;
+        let mut anchor_attempts: u32 = 0;
+        while !anchored && anchor_attempts < max_edges_total {
+            anchor_attempts += 1;
+            let raw = match pio_edge_read_until(wall_cap_us, start) {
+                Some(r) => r,
+                None => {
+                    pio_edge_stop();
+                    pio_tx_mirror_stop();
+                    PIPE_SESSION_LIVE.store(0, PaOrdering::Release);
+                    return result;
+                }
+            };
+            iter += 1;
+            let rising = ((iter ^ initial) & 1) == 1;
+            if rising {
+                let interval_fp_slot = interval_fp_period >> 1;
+                let (ci, cf) = interval_fp_to_clkdiv(interval_fp_slot, frac_bits);
+                let (ci2, cf2) = interval_fp_to_clkdiv(interval_fp_slot >> 4, frac_bits);
+                pio_sample_arm(ci2, cf2);
+                pio_tx_mirror_start(ci, cf, true);
+                anchored = true;
+                // No FIFO pre-fill: streaming loop owns FIFO pushes. SM1
+                // starts at `nop side 0` (tristate) and the first OUT
+                // instruction reads from an empty OSR — autopull pulls from
+                // FIFO. We need at least one word in the FIFO before SM1
+                // executes its first OUT. Push the first L3 word now if
+                // tx_count > 0; if tx_count == 0, push 0 so SM1 drives idle.
+                let first_word = if tx_count > 0 {
+                    unsafe { L3_TX_BITS[0] }
+                } else {
+                    0
+                };
+                let _ = pio_tx_try_push(first_word);
+            }
+            let _ = raw;
+        }
+        if !anchored {
+            pio_edge_stop();
+            pio_tx_mirror_stop();
+            PIPE_SESSION_LIVE.store(0, PaOrdering::Release);
+            return result;
+        }
+        // PIO0 SM0 stays running — we keep consuming edges in the streaming
+        // loop for the per-edge CDR refresh.
+    }
+
+    // ------------------------------------------------------------------
+    // Streaming exchange.
+    // ------------------------------------------------------------------
+    // For the "live" path SM1/SM2 are still cycling from the previous round.
+    // SM1's FIFO will have drained (we stopped pushing at end of last round),
+    // so SM1 has been driving 0 (autopull from empty FIFO sources 0 in the
+    // current PIO0 hardware). We start pushing the new TX bits now; SM1
+    // immediately picks them up.
+    //
+    // The streaming loop:
+    //   1. Consume RX FIFO bytes from SM2, pack the next `rx_count` bits into
+    //      result.rx_bits LSB-first.
+    //   2. Top up SM1's TX FIFO with the next 32-bit word from L3_TX_BITS
+    //      whenever there's room AND we have bits left to send.
+    //   3. Consume edge intervals from SM0 to update interval_fp_period and
+    //      refresh SM1's clkdiv (per-edge CDR maintenance — keeps SM1's
+    //      slot rate locked to the FPGA's actual rate even across rounds).
+    //   4. Bail out on (a) tx_count bits drained AND rx_count bits captured,
+    //      (b) max_iter edges consumed (wall-clock cap), or (c) lock loss
+    //      (interval_fp_period drifts off the ±30% sanity window).
+    let mut tx_bits_pushed: u32 = 0;
+    let mut rx_bits_captured: u32 = 0;
+    let mut tx_next_word_idx: u32 = 0;
+    // Total slot-midpoint samples consumed from SM2 across this round. Even
+    // values = enclave slot (FPGA drives), odd = host slot (bridge drives,
+    // we discard). Counts both kinds.
+    let mut slot_samples_consumed: u64 = 0;
+    // First word already pushed during anchor (or already drained in live path).
+    if !live && tx_count > 0 {
+        // We pre-pushed L3_TX_BITS[0] above; account for up to 32 bits.
+        tx_bits_pushed = tx_count.min(32);
+        tx_next_word_idx = 1;
+    }
+    // Save acquisition seeds for the ±30% sanity window used during streaming.
+    let seed_period_fp = (acquisition_slot_cyc_period as u64) << frac_bits;
+    let min_period_fp = ((seed_period_fp * 7 / 10) as u32).max(1u32 << frac_bits);
+    let max_period_fp = (seed_period_fp * 13 / 10).min(u32::MAX as u64) as u32;
+
+    let mut prev_own_cyc: i32 = 0;
+    let mut have_prev_own_cyc = false;
+    let mut iter: u32 = 0;
+    let mut lost_lock = false;
+
+    while iter < max_edges_total {
+        // (1) TX FIFO topup. Push the next 32-bit word from L3_TX_BITS when
+        //     there's room AND we still have bits to drive. Once tx_count
+        //     bits have been pushed we stop — SM1 drains, then sources 0 via
+        //     empty-FIFO autopull (drives wire LOW during host slots), which
+        //     is the idle/quiescent state.
+        if tx_bits_pushed < tx_count {
+            let word = if tx_next_word_idx < L3_BUF_WORDS as u32 {
+                unsafe { L3_TX_BITS[tx_next_word_idx as usize] }
+            } else {
+                0
+            };
+            if pio_tx_try_push(word) {
+                let remaining = tx_count - tx_bits_pushed;
+                tx_bits_pushed = tx_bits_pushed.saturating_add(remaining.min(32));
+                tx_next_word_idx = tx_next_word_idx.saturating_add(1);
+            }
+        }
+
+        // (2) RX byte drain from SM2. Each FIFO entry packs 8 wire-state
+        //     samples (one per slot midpoint). SM1+SM2 enable together; SM2
+        //     samples both host AND enclave slots, so even slots are "FPGA
+        //     drive" (= what the FPGA is sending us — L3 RX bits) and odd
+        //     slots are "bridge drive" (= what WE put on the wire — discard).
+        //
+        //     L3 protocol: enclave drives leading-1 marker + payload bits.
+        //     After the leading 1 wire bit appears, every subsequent enclave
+        //     bit is a payload bit. We pack only enclave-slot bits LSB-first
+        //     into result.rx_bits.
+        while let Some(byte_word) = pio_sample_try_read() {
+            let byte = ((byte_word >> 24) & 0xff) as u8;
+            // bit 0 of `byte` = oldest sample (first slot of this byte's
+            // window). SM2 was enabled in the same CTRL.modify as SM1 (or
+            // is already running from a previous round), and SM1's anchor
+            // instruction is `nop side 0` = tristate during the enclave
+            // slot that contained the anchor rising edge. So SM2's first
+            // ever sample lands mid-enclave. Even slot_samples_consumed =
+            // enclave (FPGA drives), odd = host (bridge drives).
+            //
+            // We only keep enclave samples — those are the L3 RX bits.
+            for bit_idx in 0..8u32 {
+                if rx_bits_captured >= rx_count {
+                    break;
+                }
+                let is_enclave_slot = (slot_samples_consumed & 1) == 0;
+                slot_samples_consumed = slot_samples_consumed.wrapping_add(1);
+                if !is_enclave_slot {
+                    continue;
+                }
+                let bit = (byte >> bit_idx) & 1;
+                let word_idx = (rx_bits_captured / 32) as usize;
+                let bit_in_word = rx_bits_captured % 32;
+                if word_idx < L3_BUF_WORDS && bit != 0 {
+                    result.rx_bits[word_idx] |= 1u32 << bit_in_word;
+                }
+                rx_bits_captured = rx_bits_captured.saturating_add(1);
+            }
+            if rx_bits_captured >= rx_count {
+                break;
+            }
+        }
+
+        // (3) Edge update from SM0 for per-edge CDR refresh. Non-blocking:
+        //     if no edge yet, fall through and loop.
+        if let Some(raw) = pio_edge_try_read() {
+            iter += 1;
+            let rising = (iter & 1) == 1; // approximate; live mode lost initial polarity
+            let own_cyc_u: u32 = (!raw).wrapping_shl(1);
+            let own_cyc: i32 = own_cyc_u as i32;
+
+            if rising && have_prev_own_cyc {
+                let period_now = own_cyc.wrapping_add(prev_own_cyc);
+                let period_slot = (interval_fp_period >> frac_bits) as i32;
+                if period_slot >= 16 {
+                    let seed_period_cyc = acquisition_slot_cyc_period as i32;
+                    let narrow_window = (seed_period_cyc / 50).max(4);
+                    let n_periods: i32 = if seed_period_cyc > 0 {
+                        ((period_now + seed_period_cyc / 2) / seed_period_cyc).max(1).min(8)
+                    } else {
+                        0
+                    };
+                    let expected_seed = n_periods * seed_period_cyc;
+                    let seed_phase_err = period_now - expected_seed;
+                    if n_periods >= 1 && seed_phase_err.abs() < narrow_window {
+                        let expected = n_periods * period_slot;
+                        let phase_err_period = period_now - expected;
+                        let shift = frac_bits as i32 - p_shift as i32;
+                        let raw_slew = if shift >= 0 {
+                            phase_err_period << shift
+                        } else {
+                            phase_err_period >> -shift
+                        };
+                        let max_slew = (seed_period_fp / SYNC_SLEW_CLAMP_DENOM as u64)
+                            .min(i32::MAX as u64) as i32;
+                        let slew = raw_slew.clamp(-max_slew, max_slew);
+                        let new_fp = interval_fp_period.wrapping_add_signed(slew);
+                        if new_fp >= min_period_fp && new_fp <= max_period_fp {
+                            interval_fp_period = new_fp;
+                            // Refresh SM1's clkdiv from the new period.
+                            let interval_fp_slot = interval_fp_period >> 1;
+                            let (ci, cf) = interval_fp_to_clkdiv(interval_fp_slot, frac_bits);
+                            embassy_rp::pac::PIO0.sm(PIO_TX_SM).clkdiv().write(|w| {
+                                w.set_int(ci);
+                                w.set_frac(cf);
+                            });
+                        } else {
+                            // Period drifted outside the ±30% safety window. We
+                            // declare lock loss; this is the structural lock
+                            // signal that survives glitches without false-tripping
+                            // on momentary noise.
+                            lost_lock = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            prev_own_cyc = own_cyc;
+            have_prev_own_cyc = true;
+        }
+
+        // (4) Done?
+        if tx_bits_pushed >= tx_count && rx_bits_captured >= rx_count {
+            break;
+        }
+    }
+
+    let session_ok = !lost_lock && iter < max_edges_total;
+
+    // Persist CDR state for the next round, even if this round failed mid-way
+    // — the host may want to retry without re-acquiring from scratch (the
+    // open_session flag is the explicit re-acquire trigger).
+    unsafe {
+        L3_SESSION_STATE = L3SessionState {
+            interval_fp_period,
+            interval_fp_low,
+            interval_fp_high,
+            frac_bits,
+            p_shift,
+            acq_slot_cyc_period: acquisition_slot_cyc_period,
+            acq_slot_cyc_low: acquisition_slot_cyc_low,
+            acq_slot_cyc_high: acquisition_slot_cyc_high,
+        };
+    }
+
+    result.rx_actual_count = rx_bits_captured;
+    result.slot_drift = interval_fp_period;
+    result.session_ok = if session_ok { 1 } else { 0 };
+
+    if !session_ok || close_session {
+        // Tear down on lock loss or explicit close. Next round will re-acquire.
+        pio_edge_stop();
+        pio_tx_mirror_stop();
+        pio_sample_stop();
+        PIPE_SESSION_LIVE.store(0, PaOrdering::Release);
+        PIPE_COMMS_LOCKED.store(0, PaOrdering::Release);
+    } else {
+        // Healthy + leave-alive: keep SM0+SM1 running so the wire keeps
+        // mirroring (host slots driven by SM1's autopull-zero idle state, FPGA
+        // owns enclave slots) and CDR maintenance is uninterrupted.
+        //
+        // SM2 RESYNC: arbitrary rx_count (e.g. 257 for fresh-session, 513 for
+        // Message-B) leaves SM2's 8-bit ISR partially populated and SM2's RX
+        // FIFO holding bytes whose first sample is mid-byte from this round's
+        // perspective. Round N+1 needs to start with "next SM2 sample = an
+        // enclave-slot sample" (matches slot_samples_consumed=0 even-parity
+        // convention). The fix: stop SM2, drain its FIFO, wait for the next
+        // SM0 rising edge (= start of enclave slot), then re-arm and re-enable
+        // SM2 on that rising edge — identical timing to the fresh-anchor path.
+        // SM2's pre-roll `nop [7]` positions the first sample mid-enclave, so
+        // round N+1's first byte's bit 0 IS the first enclave sample.
+        //
+        // SM1 stays running throughout. SM0 stays running throughout.
+        // PIPE_SESSION_LIVE is set after the resync completes; if the resync
+        // can't find a rising edge within the wall-clock window, we tear down
+        // and force round N+1 to re-acquire from scratch.
+        pio_sample_stop();
+        pio_sample_drain_rx();
+        // Also drain any stale SM0 edges that piled up during the streaming
+        // loop's bursty FIFO drains — keeps round N+1's CDR loop from
+        // processing stale intervals before the resync rising edge.
+        while pio_edge_try_read().is_some() {}
+        // Wait for the next rising edge using SM0. Approach: drain SM0's FIFO
+        // (already done above), then for each newly-arrived edge sample GP0 via
+        // SIO immediately after pop. Pin HIGH at pop time = edge was rising
+        // (start of enclave slot). Pin LOW = falling (start of host slot) —
+        // discard and pop the next edge. PIO IRQ-to-CPU-read latency is a few
+        // sys_clk cycles, far shorter than the half-slot time, so the post-pop
+        // read reliably reflects the polarity of the edge SM0 just timestamped.
+        let resync_ok = {
+            use embassy_rp::pac::SIO;
+            let resync_deadline_us: u64 = 100_000; // 100 ms — many slot periods.
+            let resync_start = embassy_time::Instant::now();
+            let mut rising_seen = false;
+            while !rising_seen {
+                if resync_start.elapsed().as_micros() > resync_deadline_us {
+                    break;
+                }
+                if pio_edge_try_read().is_some() {
+                    let p = unsafe {
+                        (SIO.gpio_in(0).as_ptr().read_volatile() >> PIO_EDGE_GPIO) & 1
+                    };
+                    if p == 1 {
+                        rising_seen = true;
+                    }
+                }
+            }
+            rising_seen
+        };
+        if resync_ok {
+            // Re-arm SM2 with the current CDR period's clkdiv and re-enable it.
+            // pio_sample_arm sets CLKDIV, restarts SM2's PC + clkdiv counter,
+            // drains its FIFO, and injects jmp PIO_SAMPLE_ADDR_PREROLL. Then a
+            // separate CTRL.modify re-enables SM2.
+            use embassy_rp::pac::PIO0;
+            let interval_fp_slot = interval_fp_period >> 1;
+            let (ci2, cf2) = interval_fp_to_clkdiv(interval_fp_slot >> 4, frac_bits);
+            pio_sample_arm(ci2, cf2);
+            PIO0.ctrl().modify(|w| {
+                let cur = w.sm_enable();
+                w.set_sm_enable(cur | (1 << PIO_SAMPLE_SM));
+            });
+            PIPE_SESSION_LIVE.store(1, PaOrdering::Release);
+            PIPE_COMMS_LOCKED.store(1, PaOrdering::Release);
+        } else {
+            // No rising edge within the resync window → wire is silent or
+            // FPGA stalled. Tear down so round N+1 re-acquires from scratch.
+            pio_edge_stop();
+            pio_tx_mirror_stop();
+            PIPE_SESSION_LIVE.store(0, PaOrdering::Release);
+            PIPE_COMMS_LOCKED.store(0, PaOrdering::Release);
+            result.session_ok = 0;
+        }
+    }
+
+    result
+}
+
+/// Sentinel: same value as SYNC_ACQ_SHIFT_PER_POLARITY in fast_sync (= 8 =
+/// log2(SYNC_ACQ_PER_POLARITY)). Duplicated here as a local const so the
+/// L3 path doesn't depend on a private name inside fast_sync's body.
+const SYNC_ACQ_SHIFT_PER_POLARITY_LOCAL: u32 = 8;
+
 /// Slot-clock decoder. Acquisition + bang-bang CDR (same as fast_sync) seeds and tracks `interval_fp`. A continuous slot clock — driven by `interval_fp >> FRAC_BITS` — ticks autonomously regardless of edge density on the wire. Each tick advances slot_phase (enclave/host) and fires a mid-slot sample event. Edges feed the bang-bang to refine `interval_fp` (drift tracking) and update per-polarity wire-state width stats (RC bias diagnostic).
 ///
 /// Why slot clock independent of edges: real protocol data has multi-slot HIGH/LOW dropouts (PROTOCOL.md Examples 2-5 show wire-LOW spans across multiple slot owners). An edge-triggered sampler would miss those slots entirely. The slot clock keeps ticking and we sample the wire's current state on every slot — codec decodes whatever the wire actually says, including extended LOWs.
@@ -3414,6 +4025,24 @@ async fn pipe_wire_task(mut wire: Flex<'static>) {
             // Release: pairs with core 0's Acquire on SYNC_RESPONSE.
             SYNC_RESPONSE.store(iters, PaOrdering::Release);
             SYNC_REQUEST.store(0, PaOrdering::Relaxed);
+        }
+
+        let l3_req = L3_REQUEST.load(PaOrdering::Acquire);
+        if l3_req != 0 {
+            let tx_count = L3_TX_COUNT.load(PaOrdering::Relaxed);
+            let rx_count = L3_RX_COUNT.load(PaOrdering::Relaxed);
+            let flags = L3_FLAGS.load(PaOrdering::Relaxed);
+            let open_session = (flags & 0x1) != 0;
+            let close_session = (flags & 0x2) != 0;
+            let result = cortex_m::interrupt::free(|_| {
+                fast_l3_round(l3_req, tx_count, rx_count, open_session, close_session)
+            });
+            unsafe {
+                L3_RESULT = result;
+            }
+            // Release: pairs with core 0's Acquire on L3_RESPONSE.
+            L3_RESPONSE.store(1, PaOrdering::Release);
+            L3_REQUEST.store(0, PaOrdering::Relaxed);
         }
 
         let decode_req = DECODE_REQUEST.load(PaOrdering::Acquire);
@@ -4840,6 +5469,113 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 payload.extend_from_slice(&pads_sio.to_le_bytes());
                 fields.push(("data".to_string(), VsfType::v(b'b', payload)));
             });
+        }
+        "pipe_l3_round" => {
+            // PIPE Layer-3 single-round exchange. Drives up to L3_MAX_BITS host-
+            // slot bits onto the wire and captures up to L3_MAX_BITS enclave-
+            // slot bits. The CDR lock is preserved between successive calls
+            // so a host can run fresh-session → Message-B → Message-B without
+            // re-acquiring (~seconds of saved latency per round).
+            //
+            // Request `data` layout (LE except byte-bag):
+            //   offset  size  field
+            //   0       2     tx_count (u16)
+            //   2       2     rx_count (u16)
+            //   4       4     max_iter (u32) — CDR/streaming wall-clock cap
+            //   8       1     flags    (u8) — bit0=open_session, bit1=close_session
+            //   9       N     tx_bits  (ceil(tx_count/8) bytes, LSB-first)
+            //
+            // Reply `data` layout:
+            //   0       1     session_ok (u8)
+            //   1       1     reserved
+            //   2       2     rx_actual_count (u16 LE)
+            //   4       4     slot_drift (u32 LE) — final interval_fp_period
+            //   8       N     rx_bits (ceil(rx_actual_count/8) bytes, LSB-first)
+            let data_in = cmd
+                .get("data")
+                .ok()
+                .and_then(|vs| vs.first().cloned())
+                .and_then(|v| match v {
+                    VsfType::v(b'b', bytes) => Some(bytes),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if data_in.len() < 9 {
+                fields.push(("err".to_string(), VsfType::a("l3_bad_request".to_string())));
+            } else {
+                let tx_count = u16::from_le_bytes([data_in[0], data_in[1]]) as u32;
+                let rx_count = u16::from_le_bytes([data_in[2], data_in[3]]) as u32;
+                let max_iter = u32::from_le_bytes([
+                    data_in[4], data_in[5], data_in[6], data_in[7],
+                ]);
+                let flags = data_in[8] as u32;
+                if tx_count > L3_MAX_BITS || rx_count > L3_MAX_BITS {
+                    fields.push(("err".to_string(), VsfType::a("l3_count_too_large".to_string())));
+                } else if flags & !0x3 != 0 {
+                    // Reserved flag bits must be zero.
+                    fields.push(("err".to_string(), VsfType::a("l3_bad_flags".to_string())));
+                } else {
+                    let tx_byte_count = (tx_count.div_ceil(8)) as usize;
+                    if data_in.len() < 9 + tx_byte_count {
+                        fields.push(("err".to_string(), VsfType::a("l3_short_tx_payload".to_string())));
+                    } else {
+                        // Pack tx_bits LSB-first byte-stream into the u32 buffer.
+                        let mut tx_words = [0u32; L3_BUF_WORDS];
+                        for i in 0..tx_byte_count {
+                            let b = data_in[9 + i] as u32;
+                            let word_idx = i / 4;
+                            let byte_in_word = (i & 3) as u32;
+                            if word_idx < L3_BUF_WORDS {
+                                tx_words[word_idx] |= b << (byte_in_word * 8);
+                            }
+                        }
+                        unsafe {
+                            (&raw mut L3_TX_BITS).write(tx_words);
+                        }
+                        let max_iter = max_iter
+                            .min(SYNC_MAX_ITERATIONS)
+                            .max(SYNC_ACQ_PER_POLARITY * 8);
+                        L3_RESPONSE.store(0, PaOrdering::Relaxed);
+                        L3_TX_COUNT.store(tx_count, PaOrdering::Relaxed);
+                        L3_RX_COUNT.store(rx_count, PaOrdering::Relaxed);
+                        L3_FLAGS.store(flags, PaOrdering::Relaxed);
+                        L3_REQUEST.store(max_iter, PaOrdering::Release);
+
+                        let deadline = Instant::now() + embassy_time::Duration::from_secs(120);
+                        while L3_RESPONSE.load(PaOrdering::Acquire) == 0 {
+                            if Instant::now() > deadline {
+                                break;
+                            }
+                            cortex_m::asm::nop();
+                        }
+
+                        if L3_RESPONSE.load(PaOrdering::Relaxed) == 0 {
+                            fields.push(("err".to_string(), VsfType::a("l3_timeout".to_string())));
+                        } else {
+                            let r = unsafe { L3_RESULT };
+                            let rx_byte_count = (r.rx_actual_count.div_ceil(8)) as usize;
+                            let mut payload = alloc::vec::Vec::with_capacity(8 + rx_byte_count);
+                            payload.push(r.session_ok);
+                            payload.push(0u8); // reserved/pad
+                            let rx_actual_u16 = (r.rx_actual_count as u16).to_le_bytes();
+                            payload.extend_from_slice(&rx_actual_u16);
+                            payload.extend_from_slice(&r.slot_drift.to_le_bytes());
+                            // Re-pack rx_bits u32 buffer into LSB-first byte stream.
+                            for i in 0..rx_byte_count {
+                                let word_idx = i / 4;
+                                let byte_in_word = (i & 3) as u32;
+                                let b = if word_idx < L3_BUF_WORDS {
+                                    ((r.rx_bits[word_idx] >> (byte_in_word * 8)) & 0xff) as u8
+                                } else {
+                                    0
+                                };
+                                payload.push(b);
+                            }
+                            fields.push(("data".to_string(), VsfType::v(b'b', payload)));
+                        }
+                    }
+                }
+            }
         }
         "wire_decode" => {
             // Input: bytes 0..4 = max_iter (u32 LE), bytes 4..8 = frac_bits (u32 LE, optional).

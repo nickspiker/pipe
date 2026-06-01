@@ -249,13 +249,22 @@ H_resp         : 256 bits   — XOR pad for the "hash" half of next exchange
 
 `H_req` and `H_resp` ratchet on every verified exchange (see below). All three reset on fresh-session.
 
-### Initiate bit
+### Frame bit
 
-**Every message from either side begins with a logical `1` as its first transmitted bit.** This is what announces "I am about to transmit a message" — the wire transitions out of pull-down LOW (host slot idle) or out of pull-down LOW after an enclave release on its slot, into a driven HIGH. Without this rule, a message whose first encoded bit happens to be `0` would be indistinguishable from continued idle, since both would result in a passive LOW host slot. The initiate bit is the first bit of the payload, not extra framing: fresh-session is `1, 0, 0, …, 0` (256 bits with leading 1); authenticated payloads are 512 bits with the first bit forced to 1 (the sender constrains `message[0]` so that `X1[0] = message[0] XOR H_req[0] = 1`).
+**Every message from either side begins with a single logical `1` as its first transmitted bit, and this bit is pure framing — it is NOT part of the payload.** It announces "I am about to transmit a message": the wire transitions out of idle LOW (host slot held LOW by pull-down, or enclave slot released to pull-down) into a driven HIGH. Without it, a payload whose first bit happens to be `0` would be indistinguishable from continued idle.
+
+The frame bit is overhead, one bit per message per direction. The receiver consumes it and discards it; the message proper begins on the next slot. Concretely:
+
+  * Fresh-session = `1` (frame) + `0×256` (payload) = **257 wire bits** total.
+  * Message B    = `1` (frame) + 256-bit X1 + 256-bit X2 = **513 wire bits** per direction.
+
+Because the frame bit is not derived from `message_req XOR H_req`, the host can put any 256-bit value in `message_req` — including canonical identifiers like Q_HEALTH or BLAKE3("motuhake") whose bits are determined by hash output and cannot be edited. This is what makes the same `message_req` produce the same response across exchanges in a session (determinism: A==B), and what makes canonical domain identifiers work unconditionally in every fresh-session.
+
+This is Claim 12a's leading-edge marker applied to L3 framing: a single 1-bit transition announces "frame begins now," after which a fixed-length payload follows. No length field, no opcode, no extra framing — one bit of overhead.
 
 ### Message shape A — fresh-session (host → enclave, then enclave → host)
 
-Host signal: a single `1` followed by 255 zeros in the host's data stream — a 256-bit pattern of `1, 0, 0, …, 0`.
+Host signal: 257 wire bits — leading frame-`1`, then 256 zero data bits. The frame bit is consumed and discarded; the payload is the all-zero 256-bit value.
 
 Enclave response:
 ```
@@ -263,20 +272,21 @@ session_secret ← TRNG.draw(256)
 H_req          ← BLAKE3(session_secret)
 H_resp         ← BLAKE3(~session_secret)
 ```
-Enclave emits `session_secret` (256 bits) in its data stream.
+Enclave emits 257 wire bits: leading frame-`1`, then `session_secret` (256 bits) MSB-first.
 
 Host, on receiving the 256-bit secret, performs the same `H_req` / `H_resp` derivation. Both sides are now synchronized.
 
-Detection: enclave buffers the host's first 256 data bits after idle. If they are exactly `1, 0, 0, …, 0` it is a fresh-session request; any other pattern is the start of a message-B exchange (probability of message B accidentally matching: 2⁻²⁵⁵).
+Detection: after consuming the frame bit, the enclave buffers the host's first 256 data bits. If they are exactly zero it is a fresh-session request; any other pattern is the start of a Message B exchange (probability of Message B's X1 accidentally matching: 2⁻²⁵⁶).
 
-### Message shape B — authenticated exchange (512 bits each direction)
+### Message shape B — authenticated exchange (513 bits each direction)
 
-Host's request, 512 bits sent over 512 host slots:
+Host's request, 513 wire bits sent over 513 host slots: leading frame-`1`, then 256 X1 bits, then 256 X2 bits:
 
 ```
-bits   0..255 :  X1 = message_req  XOR  H_req
-bits 256..511 :  X2 =  BLAKE3(message_req)  XOR  H_resp        (mode = SESSION)
-                 X2 = ~BLAKE3(message_req)  XOR  H_resp        (mode = PERMANENT)
+slot 0       :  frame bit = 1 (consumed and discarded by enclave)
+slots 1..256 :  X1 = message_req  XOR  H_req
+slots 257..512: X2 =  BLAKE3(message_req)  XOR  H_resp        (mode = SESSION)
+                X2 = ~BLAKE3(message_req)  XOR  H_resp        (mode = PERMANENT)
 ```
 
 Enclave verifies by recovering `message_req = X1 XOR H_req`, computing `BLAKE3(message_req)`, and checking which of `BLAKE3(message_req) XOR H_resp` or `~BLAKE3(message_req) XOR H_resp` equals `X2`. The matching case determines mode. No match → corruption → drop, do not advance pads (host will retry or fresh-session).
@@ -288,12 +298,13 @@ active_key   = session_secret    (SESSION)
 message_resp = BLAKE3.keyed(active_key, message_req)
 ```
 
-Enclave's response, 512 bits sent over 512 enclave slots, mirrors the requested mode:
+Enclave's response, 513 wire bits sent over 513 enclave slots (leading frame-`1`, then 256 X1' bits, then 256 X2' bits), mirrors the requested mode:
 
 ```
-bits   0..255 :  X1 = message_resp  XOR  H_req
-bits 256..511 :  X2 =  BLAKE3(message_resp)  XOR  H_resp        (SESSION echo)
-                 X2 = ~BLAKE3(message_resp)  XOR  H_resp        (PERMANENT echo)
+slot 0       :  frame bit = 1 (consumed and discarded by host)
+slots 1..256 :  X1' = message_resp  XOR  H_req
+slots 257..512: X2' =  BLAKE3(message_resp)  XOR  H_resp        (SESSION echo)
+                X2' = ~BLAKE3(message_resp)  XOR  H_resp        (PERMANENT echo)
 ```
 
 Host verifies the same way the enclave did. On successful verification both sides advance:
@@ -304,6 +315,64 @@ H_resp ← BLAKE3(message_resp)
 
 A mismatch on either side is detected at verify time. The corrupted exchange is dropped, pads are *not* advanced, the other side will be desynced on next attempt → host issues fresh-session and both sides reset.
 
+### Domain identifiers (well-known `message_req` values)
+
+`message_req` is an arbitrary 256-bit value at the wire level — the protocol does not interpret it. By convention, certain `message_req` values are reserved as **domain identifiers**: they are the BLAKE3 of a short Māori phrase, and they trigger either a behavioural variation on the enclave (q/health) or simply mark the exchange as belonging to a specific test/use category.
+
+| Name      | Phrase (gloss)                            | `message_req` value                                                  | Effect                                                                                                          |
+|-----------|-------------------------------------------|----------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| Q_HEALTH  | "Kei te ora koe?" (are you alive/well?)   | `c0a6cabf 9f69f2af f78b5115 1e9300cd 5bd32dfb becf5506 00625478 ffee8e80` | Triggers q/health state-vector response (see next section). Behaviour change is implementation-visible.        |
+| MOTUHAKE  | "motuhake" (independent, distinct)        | `BLAKE3("motuhake")` (32 bytes, ASCII without trailing NUL)          | Conventional canonical-test domain separator. No behavioural change — exchange behaves as a vanilla Message B. |
+
+The MOTUHAKE identifier is the canonical end-to-end test the chip ships with. It enables a host to assert all five demo properties at once with two SESSION + two PERMANENT exchanges using identical `message_req`:
+
+```
+A = PIPE(motuhake | active_key=WAIRUA)   // SESSION
+B = PIPE(motuhake | active_key=WAIRUA)   // SESSION, same session
+C = PIPE(motuhake | active_key=IRA)      // PERMANENT
+D = PIPE(motuhake | active_key=IRA)      // PERMANENT, same session
+
+Expected:
+  A == B                                  // deterministic given (session, key, message)
+  C == D                                  // deterministic
+  A != C                                  // SESSION and PERMANENT live in different keyspaces
+  C == BLAKE3.keyed(IRA, motuhake)        // host can recompute the PERMANENT side standalone
+  // A is not host-recomputable — host does not know WAIRUA from the wire alone
+  // (host does know WAIRUA: it was sent in cleartext during fresh-session)
+  // After power cycle: IRA unchanged → C and D still match; WAIRUA fresh → new A,B
+```
+
+Why Māori: ferros is named after a Māori concept (ira = "essential genetic/spiritual code"); the protocol's named values follow suit. They are arbitrary domain separators — any other 256-bit values would work — but consistency in naming makes the demo arc legible and gives the q/health response a stable identifier across silicon revisions.
+
+### Q_HEALTH state vector (claim 9c "clever" embodiment)
+
+When `message_req == Q_HEALTH`, the enclave composes its BLAKE3 input as a **single 64-byte block** with `message_req` in the low half and a packed 32-byte **state vector** in the high half:
+
+```
+mblock[255  :   0] = message_req           (= Q_HEALTH)
+mblock[511  : 256] = state_block           (packed, 256 bits, LSB at bit 256)
+numbytes           = 64
+message_resp       = BLAKE3.keyed(active_key, mblock, 64 bytes)
+```
+
+This is still **one BLAKE3 compression** — q/health responses are not slower than vanilla Message B. The host verifies by composing the same 64-byte block in the same byte order and hashing under the same `active_key`.
+
+State block layout (matches `rtl/l3_session_fsm.v`):
+
+| Bits (within mblock) | Width | Field                | Notes                                                            |
+|---------------------:|------:|----------------------|------------------------------------------------------------------|
+|              258:256 |     3 | chip_state           | 0=VIRGIN, 1=FUCKED, 2=DEGRADED-2, 3=DEGRADED-1, 4=HEALTHY        |
+|              274:259 |    16 | ring_health_mask     | Per-ring pass bits (16 rings, LSB = ring 0)                      |
+|              279:275 |     5 | ring_health_cnt      | Healthy-ring count (0–16)                                        |
+|              287:280 |     8 | slot_burned_mask     | OTP slot burned bits (8 slots, LSB = slot 0)                     |
+|              290:288 |     3 | fsm_state            | Ceremony FSM state (debug-only)                                  |
+|              354:291 |    64 | session_counter      | Verified Message-B exchanges in this session                     |
+|              418:355 |    64 | boot_epoch           | Enclave_clk cycles since power-on (free-running)                 |
+|              482:419 |    64 | drop_counter         | Lifetime count of dropped exchanges (corrupt / failed verify)    |
+|              511:483 |    29 | reserved zero        | Future fields                                                    |
+
+All counters are 64-bit: the chain-state advancement they encode is integrity-bearing data even during a health-check response, and the state block has 29 bits of headroom for future additions. The host that wants to prove a property — "this chip has handled at least N exchanges since boot," "this chip has had zero drops in the last K seconds," "ring 7 is currently failing TRNG health" — issues `PIPE(Q_HEALTH | active_key)`, recomputes the expected hash over the asserted state, and checks for a match.
+
 ### Properties
 
 - **One escape hatch for everything.** Bit error, lost response, suspicious payload, host software lost state, enclave hung mid-burn — fresh-session resets all of it. No partial-recovery protocol to design.
@@ -311,7 +380,7 @@ A mismatch on either side is detected at verify time. The corrupted exchange is 
 - **Cross-session repetition hidden after exchange 1.** Two sessions doing the same exchange-2 produce entirely different wire bytes because `H_req` and `H_resp` at exchange 2 depend on session-specific exchange-1 message hashes. (Exchange 1 leaks `msg XOR BLAKE3(msg) XOR K_session` to anyone computing X1 XOR X2 — this is the known residue of the dual-init from a single seed, intentionally accepted because eavesdropping is out of scope.)
 - **Mode-confusion immune.** Same `message_req` under SESSION vs PERMANENT produces different second-halves (hash vs bit-flipped hash). An attacker cannot replay a SESSION response as a PERMANENT response.
 - **Burn timing observable but unexploitable.** First PERMANENT request takes ~1–2 s (entropy spin-up + TRNG-randomized burn timing + read-verify), subsequent requests are ~ms. The wire reveals "the burn happened around now" but not "when within that window each fuse blew" or "what bits got burned."
-- **Bandwidth-bounded.** At 50 kHz slot rate, one exchange (~2 × 1024 slots after counting both directions) is ~40 ms. Brute-forcing a 256-bit key over the wire is ≈ 2²⁵⁶ × 0.04 s = beyond cosmological. Slow is the security property.
+- **Bandwidth-bounded.** At 50 kHz slot rate, one exchange (513 host slots + 513 enclave slots = ~1026 slots after counting both directions) is ~20 ms. Brute-forcing a 256-bit key over the wire is ≈ 2²⁵⁶ × 0.02 s = beyond cosmological. Slow is the security property.
 - **Statistically uniform.** Every bit on the wire is either TRNG output, BLAKE3 output, an XOR of two such, or a bit-flip thereof. No structure for an eavesdropper to lock onto, even if eavesdropping returned to scope.
 
 ### What about the first authenticated exchange after fresh-session?

@@ -118,6 +118,8 @@ fn main() -> ExitCode {
         "wire_gap_decode" => cmd_wire_gap_decode(&port_path, cmd_args),
         "meal_dump_ira" => cmd_meal_dump_ira(cmd_args),
         "meal_challenge" => cmd_meal_challenge(cmd_args),
+        "meal_health" => cmd_meal_health(&port_path, cmd_args),
+        "meal_motuhake" => cmd_meal_motuhake(&port_path, cmd_args),
         "wire_pattern_decode" => cmd_wire_pattern_decode(&port_path, cmd_args),
         "wire_stats" => cmd_wire_stats(&port_path, cmd_args),
         "wire_sync" => cmd_wire_sync(&port_path, cmd_args),
@@ -3794,6 +3796,447 @@ fn cmd_wire_mirror(port_path: &str, args: &[String]) -> Result<(), String> {
     print_period_hist(&period_hist, period_seed_cyc);
 
     Ok(())
+}
+
+/// Response from the firmware `pipe_l3_round` op. The bridge layer L3 protocol
+/// (BLAKE3, ratchet, X1/X2 encode/decode, Q_HEALTH composer) lives in higher
+/// layers; this helper is the bare USB round-trip.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct L3RoundResponse {
+    /// 1 if the bridge held CDR lock for the entire exchange, 0 if lost
+    /// (in which case `rx_actual_count` may be less than what was requested
+    /// and the next call should set `open_session=true` to force re-acquire).
+    pub session_ok: bool,
+    /// Number of valid rx bits captured. May be less than the requested count
+    /// on lock loss or wall-clock abort.
+    pub rx_actual_count: u32,
+    /// Final `interval_fp_period` from the bridge CDR — a host-visible
+    /// estimate of slot timing for diagnostic. Same fp scaling as
+    /// `wire_sync`'s `final_interval_fp_period`.
+    pub slot_drift: u32,
+    /// Captured enclave-slot bits, LSB-first within each byte (i.e., the
+    /// first captured bit is `rx_bits[0]` bit 0). Length is
+    /// `ceil(rx_actual_count / 8)`.
+    pub rx_bits: Vec<u8>,
+}
+
+/// Thin USB round-trip for the firmware `pipe_l3_round` op. Serialises the
+/// request payload + parses the response payload. Does NOT implement the L3
+/// protocol logic (BLAKE3, fresh-session/Message-B encoding, ratchet, etc.)
+/// — those live in their own modules.
+///
+/// `tx_bits` byte stream is LSB-first within each byte: the first transmitted
+/// bit is `tx_bits[0]` bit 0. The bridge consumes exactly `tx_bit_count` bits
+/// from this buffer (ignoring any padding bits past that count) and tristates
+/// the wire after the last one (drives 0 on host slots until the round ends).
+///
+/// `rx_count` requests up to this many enclave-slot bits be captured. Actual
+/// captured count is in the response and may be less on lock loss.
+///
+/// `flags`:
+///   bit 0 = open_session — force fresh CDR acquire even if the bridge thinks
+///           a session is live. Use on first round of a new exchange.
+///   bit 1 = close_session — tear down the SMs after this round. Use on the
+///           last round of an exchange so the wire goes silent.
+///
+/// `max_iter` is the wall-clock safety cap on edge-count (same units as
+/// wire_sync's `max_iter`). 1 << 25 ≈ 2 s is a sensible default for a single
+/// round; the firmware will abort early once both tx_count and rx_count are
+/// satisfied.
+#[allow(dead_code)]
+pub fn cmd_pipe_l3_round(
+    port_path: &str,
+    tx_bits: &[u8],
+    tx_bit_count: u16,
+    rx_count: u16,
+    flags: u8,
+    max_iter: u32,
+) -> Result<L3RoundResponse, String> {
+    const L3_MAX_BITS: u16 = 520;
+    if tx_bit_count > L3_MAX_BITS || rx_count > L3_MAX_BITS {
+        return Err(format!(
+            "tx_count={tx_bit_count} or rx_count={rx_count} exceeds L3_MAX_BITS={L3_MAX_BITS}"
+        ));
+    }
+    let needed_tx_bytes = (tx_bit_count as usize).div_ceil(8);
+    if tx_bits.len() < needed_tx_bytes {
+        return Err(format!(
+            "tx_bits buffer too small: have {} bytes, need {} for tx_count={tx_bit_count}",
+            tx_bits.len(),
+            needed_tx_bytes
+        ));
+    }
+    if flags & !0x3 != 0 {
+        return Err(format!("reserved flag bits set: G#{flags:02X}"));
+    }
+
+    let mut params = Vec::with_capacity(9 + needed_tx_bytes);
+    params.extend_from_slice(&tx_bit_count.to_le_bytes());
+    params.extend_from_slice(&rx_count.to_le_bytes());
+    params.extend_from_slice(&max_iter.to_le_bytes());
+    params.push(flags);
+    params.extend_from_slice(&tx_bits[..needed_tx_bytes]);
+
+    let (resp, _rtt) = send_cmd(
+        port_path,
+        "pipe_l3_round",
+        47,
+        vec![("data".to_string(), VsfType::v(b'b', params))],
+    )?;
+    if resp.is_empty() {
+        return Err("no response (timeout)".into());
+    }
+    let section = parse_resp(&resp)?;
+    if let Some(err) = resp_ascii(&section, "err") {
+        return Err(format!("device returned err: {err}"));
+    }
+    let data = section
+        .get("data")
+        .map_err(|e| format!("missing data: {e}"))?
+        .first()
+        .and_then(|v| match v {
+            VsfType::v(b'b', bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "data field not a binary blob".to_string())?;
+    if data.len() < 8 {
+        return Err(format!(
+            "l3 response too short: {} bytes (need >= 8)",
+            data.len()
+        ));
+    }
+    let session_ok = data[0] != 0;
+    let rx_actual_count = u16::from_le_bytes([data[2], data[3]]) as u32;
+    let slot_drift = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let rx_byte_count = (rx_actual_count as usize).div_ceil(8);
+    if data.len() < 8 + rx_byte_count {
+        return Err(format!(
+            "l3 response truncated: {} bytes, need {} for rx_actual_count={rx_actual_count}",
+            data.len(),
+            8 + rx_byte_count
+        ));
+    }
+    let rx_bits = data[8..8 + rx_byte_count].to_vec();
+    Ok(L3RoundResponse {
+        session_ok,
+        rx_actual_count,
+        slot_drift,
+        rx_bits,
+    })
+}
+
+// ---------- L3 protocol orchestration ------------------------------------- //
+
+/// `Transport` impl that drives the L3 protocol over USB via `cmd_pipe_l3_round`.
+///
+/// First round of a fresh session sets `flags = open_session`; subsequent
+/// rounds reuse the bridge's persisted CDR lock so we don't pay ~tens of ms
+/// of acquisition per round. On lock loss the next round will re-acquire.
+struct BridgeL3Transport<'a> {
+    port_path: &'a str,
+    session_open: bool,
+    last_slot_drift: u32,
+}
+
+impl<'a> BridgeL3Transport<'a> {
+    fn new(port_path: &'a str) -> Self {
+        Self {
+            port_path,
+            session_open: false,
+            last_slot_drift: 0,
+        }
+    }
+}
+
+impl<'a> pipe_host::l3::Transport for BridgeL3Transport<'a> {
+    fn round(&mut self, tx_bits: &[bool], rx_bit_count: usize) -> Result<Vec<bool>, String> {
+        // The chip has variable latency between receiving the request and
+        // emitting the response — fresh-session has the slowest tail
+        // (TRNG gather + 2 × BLAKE3, ~ms). The bridge firmware caps per-round
+        // capture at L3_MAX_BITS=520. So drive the request in round 0, then
+        // poll-rx in subsequent rounds until the frame-1 marker appears.
+        // CDR lock is preserved between rounds by the firmware (session
+        // stays "live"), so this is just a few extra USB round-trips, no
+        // re-acquisition cost.
+        const CAPTURE_BITS: u16 = 519;
+        const MAX_POLL_ROUNDS: usize = 50; // 50 × ~10 ms ≈ 500 ms ceiling
+
+        let mut accumulated: Vec<bool> = Vec::new();
+        let mut tx_payload = pipe_host::l3::pack_bits_lsb_first(tx_bits);
+        let mut tx_count_remaining: u16 = tx_bits.len() as u16;
+
+        for poll in 0..MAX_POLL_ROUNDS {
+            let flags = if self.session_open { 0x00 } else { 0x01 };
+            let this_tx_bytes: &[u8] = if poll == 0 { &tx_payload } else { &[] };
+            let this_tx_count: u16 = if poll == 0 { tx_count_remaining } else { 0 };
+            let resp = cmd_pipe_l3_round(
+                self.port_path,
+                this_tx_bytes,
+                this_tx_count,
+                CAPTURE_BITS,
+                flags,
+                1 << 25,
+            )?;
+            self.last_slot_drift = resp.slot_drift;
+            if !resp.session_ok && poll == 0 {
+                eprintln!(
+                    "  warning: bridge flagged session_ok=0 (slot_drift={}, captured {} bits) — proceeding",
+                    resp.slot_drift, resp.rx_actual_count
+                );
+            }
+            self.session_open = true;
+            let mut this_chunk = pipe_host::l3::unpack_bits_lsb_first(
+                &resp.rx_bits,
+                resp.rx_actual_count as usize,
+            )
+            .map_err(|e| e.to_string())?;
+            accumulated.append(&mut this_chunk);
+
+            // Hunt for a frame-1 followed by a high-entropy payload. SM2's
+            // first samples after each re-arm can have spurious transients
+            // (single 1 surrounded by 0s); the real frame leads into
+            // BLAKE3-conditioned random bits at ~50% density. Require the
+            // first 64 bits after the candidate frame to contain at least 8
+            // ones (~12%, generous lower bound — pure random would give ~32).
+            let mut search_start = 0usize;
+            loop {
+                let rel = accumulated[search_start..].iter().position(|&b| b);
+                if rel.is_none() {
+                    break;
+                }
+                let frame_idx = search_start + rel.unwrap();
+                if accumulated.len() - frame_idx < rx_bit_count {
+                    break; // not enough trailing yet
+                }
+                let probe_end = (frame_idx + 1 + 64).min(accumulated.len());
+                let probe_ones = accumulated[frame_idx + 1..probe_end]
+                    .iter()
+                    .filter(|&&b| b)
+                    .count();
+                if probe_ones >= 8 {
+                    return Ok(accumulated[frame_idx..frame_idx + rx_bit_count].to_vec());
+                }
+                // Reject this candidate (low entropy) and look further on.
+                search_start = frame_idx + 1;
+            }
+
+            // Avoid keeping a huge buffer around — only keep the last ~2KB
+            // worth of bits since the frame, in case the frame hasn't shown
+            // up yet but will soon.
+            if accumulated.len() > 8 * CAPTURE_BITS as usize {
+                let cut = accumulated.len() - 4 * CAPTURE_BITS as usize;
+                accumulated.drain(..cut);
+            }
+            // Drop tx after the first round.
+            tx_payload.clear();
+            tx_count_remaining = 0;
+        }
+        Err(format!(
+            "no frame-1 marker after {} poll rounds ({} bits captured); chip silent or session desynced",
+            MAX_POLL_ROUNDS,
+            MAX_POLL_ROUNDS * CAPTURE_BITS as usize
+        ))
+        // Scan for the frame-1 marker. Skip any leading idle bits (0s) the
+        // chip emitted before the response was ready.
+    }
+}
+
+/// `meal_health <expected_state_json> [--ira <64-hex>] [--mode session|permanent]`
+///
+/// Runs the chip's q/health commitment under the given key (default
+/// PERMANENT). Compares the wire-decoded response against the locally-
+/// recomputed BLAKE3.keyed(active_key, Q_HEALTH || state_block). PASS iff
+/// they match: the chip's permanent (or session) key has just signed the
+/// state we asserted.
+///
+/// The simplest invocation accepts an inline state-block JSON; for the demo
+/// we'll typically pass `--ira` once after reading it from the OLED in v1.
+fn cmd_meal_health(port_path: &str, args: &[String]) -> Result<(), String> {
+    let mut ira_hex: Option<String> = None;
+    let mut mode = pipe_host::l3::Mode::Permanent;
+    let mut state = pipe_host::l3::StateBlock::default();
+    state.chip_state = 4; // sensible default = HEALTHY
+    state.ring_health_mask = 0xFFFF;
+    state.ring_health_cnt = 16;
+    state.slot_burned_mask = 0xFF;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ira" => {
+                ira_hex = Some(args.get(i + 1).cloned().ok_or("--ira needs hex value")?);
+                i += 2;
+            }
+            "--mode" => {
+                let m = args.get(i + 1).ok_or("--mode needs value")?;
+                mode = match m.as_str() {
+                    "session" => pipe_host::l3::Mode::Session,
+                    "permanent" => pipe_host::l3::Mode::Permanent,
+                    other => return Err(format!("unknown mode '{other}'")),
+                };
+                i += 2;
+            }
+            "--chip-state" => {
+                state.chip_state = args
+                    .get(i + 1)
+                    .ok_or("--chip-state needs value")?
+                    .parse::<u8>()
+                    .map_err(|e| format!("--chip-state: {e}"))?;
+                i += 2;
+            }
+            "--ring-mask" => {
+                let s = args.get(i + 1).ok_or("--ring-mask needs hex")?;
+                state.ring_health_mask = u16::from_str_radix(s.trim_start_matches("G#"), 16)
+                    .map_err(|e| format!("--ring-mask: {e}"))?;
+                i += 2;
+            }
+            "--ring-cnt" => {
+                state.ring_health_cnt = args
+                    .get(i + 1)
+                    .ok_or("--ring-cnt needs value")?
+                    .parse::<u8>()
+                    .map_err(|e| format!("--ring-cnt: {e}"))?;
+                i += 2;
+            }
+            "--slot-mask" => {
+                let s = args.get(i + 1).ok_or("--slot-mask needs hex")?;
+                state.slot_burned_mask = u8::from_str_radix(s.trim_start_matches("G#"), 16)
+                    .map_err(|e| format!("--slot-mask: {e}"))?;
+                i += 2;
+            }
+            "--session-counter" => {
+                state.session_counter = args
+                    .get(i + 1)
+                    .ok_or("--session-counter needs value")?
+                    .parse::<u64>()
+                    .map_err(|e| format!("--session-counter: {e}"))?;
+                i += 2;
+            }
+            "--drop-counter" => {
+                state.drop_counter = args
+                    .get(i + 1)
+                    .ok_or("--drop-counter needs value")?
+                    .parse::<u64>()
+                    .map_err(|e| format!("--drop-counter: {e}"))?;
+                i += 2;
+            }
+            "--boot-epoch" => {
+                state.boot_epoch = args
+                    .get(i + 1)
+                    .ok_or("--boot-epoch needs value")?
+                    .parse::<u64>()
+                    .map_err(|e| format!("--boot-epoch: {e}"))?;
+                i += 2;
+            }
+            other => return Err(format!("unknown arg '{other}'")),
+        }
+    }
+    let ira = parse_hex_word256(ira_hex.as_deref().unwrap_or_else(|| {
+        eprintln!("warning: --ira not supplied; defaulting to all-zero. PERMANENT-mode result will be meaningless.");
+        ""
+    }))?;
+
+    let mut tx = BridgeL3Transport::new(port_path);
+    eprintln!("→ opening L3 session (fresh-session)...");
+    let report = pipe_host::l3::meal_health(&mut tx, ira, mode, state.clone())
+        .map_err(|e| format!("orchestration failed: {e}"))?;
+
+    println!("mode           : {:?}", report.mode);
+    println!("expected_state : {:?}", report.state);
+    println!("recovered_resp : {}", hex_word256(&report.recovered_response));
+    println!("expected_resp  : {}", hex_word256(&report.expected_response));
+    println!("slot_drift     : {}", tx.last_slot_drift);
+    if report.q_health_pass {
+        println!("q/health: PASS — chip key committed to asserted state");
+        Ok(())
+    } else {
+        println!("q/health: FAIL — state hypothesis didn't match chip's commitment");
+        Err("q_health_mismatch".into())
+    }
+}
+
+/// `meal_motuhake --ira <64-hex>` — A/B/C/D canonical test.
+fn cmd_meal_motuhake(port_path: &str, args: &[String]) -> Result<(), String> {
+    let mut ira_hex: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ira" => {
+                ira_hex = Some(args.get(i + 1).cloned().ok_or("--ira needs hex")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown arg '{other}'")),
+        }
+    }
+    let ira = parse_hex_word256(ira_hex.as_deref().ok_or("--ira required")?)?;
+
+    let mut tx = BridgeL3Transport::new(port_path);
+    eprintln!("→ opening L3 session (fresh-session)...");
+    let report = pipe_host::l3::meal_motuhake(&mut tx, ira)
+        .map_err(|e| format!("orchestration failed: {e}"))?;
+
+    println!("A (session 1)  : {}", hex_word256(&report.a_session_1));
+    println!("B (session 2)  : {}", hex_word256(&report.b_session_2));
+    println!("C (permanent 1): {}", hex_word256(&report.c_permanent_1));
+    println!("D (permanent 2): {}", hex_word256(&report.d_permanent_2));
+    println!("slot_drift     : {}", tx.last_slot_drift);
+    println!();
+    println!("session determinism (A == B)            : {}", yn(report.session_deterministic));
+    println!("permanent determinism (C == D)          : {}", yn(report.permanent_deterministic));
+    println!("modes separated (A != C)                : {}", yn(report.modes_separated));
+    println!("permanent matches local recompute (C)   : {}", yn(report.permanent_matches_local_recompute));
+
+    let all_ok = report.session_deterministic
+        && report.permanent_deterministic
+        && report.modes_separated
+        && report.permanent_matches_local_recompute;
+    if all_ok {
+        println!();
+        println!("motuhake: PASS — all four canonical properties hold");
+        Ok(())
+    } else {
+        println!();
+        println!("motuhake: FAIL — at least one canonical property broken");
+        Err("motuhake_fail".into())
+    }
+}
+
+fn parse_hex_word256(s: &str) -> Result<pipe_host::l3::Word256, String> {
+    let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned = cleaned.trim_start_matches("G#");
+    if cleaned.is_empty() {
+        return Ok([0u8; 32]);
+    }
+    if cleaned.len() != 64 {
+        return Err(format!(
+            "expected 64 hex chars (32 bytes), got {}",
+            cleaned.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&cleaned[2 * i..2 * i + 2], 16)
+            .map_err(|e| format!("bad hex at byte {i}: {e}"))?;
+    }
+    Ok(out)
+}
+
+fn hex_word256(w: &pipe_host::l3::Word256) -> String {
+    let mut s = String::with_capacity(64);
+    for b in w {
+        use std::fmt::Write;
+        write!(&mut s, "{:02x}", b).unwrap();
+    }
+    s
+}
+
+fn yn(b: bool) -> &'static str {
+    if b {
+        "PASS"
+    } else {
+        "FAIL"
+    }
 }
 
 /// Wait for a path to (dis)appear by polling with a short interval.
