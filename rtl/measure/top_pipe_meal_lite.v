@@ -265,7 +265,7 @@ module top_pipe_meal_lite (
         .shift_held   (shift_held)
     );
 
-    // Enter (key 15) — provision_request (run KOHI → BLAKE3 → TAHU)
+    // Enter — provision_request (run KOHI → BLAKE3 → TAHU)
     // Keys for mode select: "0"=STATUS, "1"=IRA HEX, "2"=OTP SLOTS, "A"=HEALTH DETAIL
     wire provision_request = key_press_pulse && (key_code == 5'd15);
 
@@ -275,12 +275,12 @@ module top_pipe_meal_lite (
             mode <= 3'd1;  // boot default: IRA HEX (most useful for v1/v2 demos)
         end else if (key_press_pulse) begin
             case (key_code)
-                5'd14: mode <= 3'd0;  // Zil   "0" → STATUS
-                5'd13: mode <= 3'd1;  // Zila  "1" → IRA HEX
-                5'd12: mode <= 3'd2;  // Zilor "2" → OTP SLOTS
-                5'd10: mode <= 3'd3;  // "A" key → RING HEALTH DETAIL
-                5'd9 : mode <= 3'd4;  // "B" key → WAIRUA HEX (Claim 5 session secret)
-                5'd8 : mode <= 3'd5;  // "C" key → L3 STATUS (session/drop/finger)
+                5'd14: mode <= 3'd0;  // Zil   → STATUS
+                5'd13: mode <= 3'd1;  // Zila  → IRA HEX
+                5'd12: mode <= 3'd2;  // Zilor → OTP SLOTS
+                5'd10: mode <= 3'd3;  // Ter   → RING HEALTH DETAIL
+                5'd9 : mode <= 3'd4;  // Tera  → WAIRUA HEX (Claim 5 session secret)
+                5'd8 : mode <= 3'd5;  // Teror → L3 STATUS (session/drop/finger)
                 default: ;
             endcase
         end

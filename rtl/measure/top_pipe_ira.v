@@ -222,10 +222,10 @@ module top_pipe_ira (
     );
 
     // Key role assignments:
-    //   Enter (key 15) — provision_request (run KOHI → BLAKE3 → TAHU)
-    //   Zil   (key 14, "0") — OLED screen 0 (STATUS)
-    //   Zila  (key 13, "1") — OLED screen 1 (IRA HEX)
-    //   Zilor (key 12, "2") — OLED screen 2 (OTP SLOTS)
+    //   Enter — provision_request (run KOHI → BLAKE3 → TAHU)
+    //   Zil   — OLED screen 0 (STATUS)
+    //   Zila  — OLED screen 1 (IRA HEX)
+    //   Zilor — OLED screen 2 (OTP SLOTS)
     wire provision_request = key_press_pulse && (key_code == 5'd15);
 
     // OLED display mode register. Direct addressing: each "screen key" sets
@@ -236,9 +236,9 @@ module top_pipe_ira (
             mode <= 2'd1;  // boot defaults to IRA HEX (the most useful first view)
         end else if (key_press_pulse) begin
             case (key_code)
-                5'd14: mode <= 2'd0;  // Zil   "0" → STATUS
-                5'd13: mode <= 2'd1;  // Zila  "1" → IRA HEX
-                5'd12: mode <= 2'd2;  // Zilor "2" → OTP SLOTS
+                5'd14: mode <= 2'd0;  // Zil   → STATUS
+                5'd13: mode <= 2'd1;  // Zila  → IRA HEX
+                5'd12: mode <= 2'd2;  // Zilor → OTP SLOTS
                 default: ;            // other keys leave mode alone
             endcase
         end
