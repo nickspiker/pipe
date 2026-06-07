@@ -9,7 +9,7 @@
 //
 //   MODE 0 — STATUS
 //     Line 0:  "PIPE STATUS"
-//     Line 1:  state name ("VIRGIN" / "FUCKED" / "DEGRADED-2" / "DEGRADED-1" /
+//     Line 1:  state name ("KORE" / "DARK" / "DEGRADED-2" / "DEGRADED-1" /
 //              "HEALTHY")
 //     Line 2:  "rings: N/16"  (N = ring_health_cnt)
 //     Line 3:  (blank)

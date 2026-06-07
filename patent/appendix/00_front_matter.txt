@@ -1,0 +1,37 @@
+// ============================================================================
+// COMPUTER PROGRAM LISTING APPENDIX
+//
+// Submitted under 37 CFR Section 1.96 in support of the patent application titled:
+//
+//   "Vendor-Free Domain-Separated Cryptographic Device Attestation Using Owner-Initiated Provisioning and Single-Channel Mirror-XOR Line Code"
+//
+// This appendix comprises hardware-description-language (Verilog) source listings for the chip-side embodiment validated in the Experimental Validation subsection of the specification.
+// The listings are exemplary embodiments and are not intended to limit the scope of any claim to the specific signal names, parameter values, bit widths, structural arrangements, technology targets, or synthesis tool flows depicted herein.
+// A person of ordinary skill in the art will recognise that equivalent embodiments may be realised in alternative hardware-description languages (including VHDL, SystemVerilog, Chisel, and Bluespec), on alternative silicon technologies (including application-specific integrated circuit processes at any technology node, structured ASIC, and any field-programmable gate array fabric), and with alternative module decompositions without departing from the scope of the claims.
+//
+// Standard cryptographic primitives invoked by the listings (BLAKE3, X25519, ChaCha20-Poly1305) are represented as port-interface module declarations only; full reference implementations are published and publicly available, are not material to the novelty of the present invention, and are referenced by their published specifications below.
+//
+// CLAIM CORRESPONDENCE MAP
+// ------------------------
+//   Module                          Supports claim(s)
+//   ring_osc.v                      8       (entropy source primitive)
+//   slot_clk.v                      3, 4    (slot timing, slot-counted decode)
+//   codec.v                         3       (mirror-XOR encode/decode)
+//   wire_io.v                       3       (bidirectional channel port)
+//   otp.v                           9       (write-once storage primitive)
+//   inverted_pair_verify.v          9, 8    (byzantine quorum, DARK gate)
+//   trng.v                          8       (noise-detection circuitry, KOHI)
+//   ring_scheduler.v                8       (round-robin per-ring health)
+//   ring_health.v                   8       (RCT + APT + iterated GF(2) tests)
+//   ira_fsm.v                       1, 8    (provisioning ceremony, DARK)
+//   l3_session_fsm.v                2, 5, 6, 7   (per-message wire format, handshake-as-entropy, ira/wairua dichotomy)
+//
+// REFERENCED CRYPTOGRAPHIC PRIMITIVES (stubbed, port-interface only)
+// -----------------------------------------------------------------
+//   blake3.v        BLAKE3 cryptographic hash function. Reference specification: O'Connor, Aumasson, Neves, Wilcox-O'Hearn, "BLAKE3: one function, fast everywhere," 2020, github.com/BLAKE3-team/BLAKE3-specs.
+//   x25519.v        Curve25519 elliptic-curve Diffie-Hellman. Reference: IETF RFC 7748.
+//   chacha20_poly1305.v   Authenticated encryption with associated data. Reference: IETF RFC 8439.
+//
+// FILE COUNT: 14 modules (11 novel + 3 stubs)
+//
+// ============================================================================

@@ -10,7 +10,7 @@ PIPE has **two parallel 4-inverted-pair structures**, identical in layout and ve
 
 | Name | Storage | Lifetime | Failure recovery |
 |---|---|---|---|
-| **`ira_set`** | eFuse (8 slots, 4 inverted pairs) | Permanent — burned at provisioning, never modified | XOR-check failure on boot → STATE 1 (FUCKED), refuse all operation |
+| **`ira_set`** | eFuse (8 slots, 4 inverted pairs) | Permanent — burned at provisioning, never modified | XOR-check failure on boot → STATE 1 (DARK), refuse all operation |
 | **`wairua_set`** | RAM (8 slots, 4 inverted pairs) | Ephemeral — established per session via handshake, destroyed on power-off | XOR-check failure mid-session → brick session, refuse all messages, require power-cycle to re-handshake |
 
 The Māori pairing: `ira` is the gene/essence of the device — its persistent identity burned into silicon. `wairua` is the spirit — the ephemeral animating force of each session, alive only while powered. Body and spirit, persistent and transient, sharing the same 4-pair inverted-XOR verification machinery to defend against cosmic-ray bit flips on either side.
@@ -54,7 +54,7 @@ The chip stores `ira` four times and `~ira` four times. Each pair `(slot_iA, slo
 
 | `A XOR B` | Pair classification |
 |---|---|
-| All zeros | **virgin** — both slots unburned |
+| All zeros | **kore** — both slots unburned |
 | All ones | **valid** — proper inverted burn |
 | Anything else | **corrupt** — partial burn, aging drift, attack |
 
@@ -66,8 +66,8 @@ PIPE has exactly five states reachable from power-on reset. State transitions ha
 
 | State | Name | Condition | Behavior |
 |---|---|---|---|
-| **0** | VIRGIN | All 4 pairs have `A=B=0` (XOR = 0) | Enter provisioning mode (KOHI → TATARI → TAHU) |
-| **1** | FUCKED | 0 or 1 valid pairs, OR multiple valid pairs disagree on `ira` | Refuse to operate. OTP preserved for diagnosis. |
+| **0** | KORE | All 4 pairs have `A=B=0` (XOR = 0) | Enter provisioning mode (KOHI → TATARI → TAHU) |
+| **1** | DARK | 0 or 1 valid pairs, OR multiple valid pairs disagree on `ira` | Refuse to operate. OTP preserved for diagnosis. |
 | **2** | DEGRADED-2 | Exactly 2 valid pairs, agreeing on `ira` | Operate. Status byte reports `pair_valid_count=2` (MARGINAL) — host warns user to retire chip. |
 | **3** | DEGRADED-1 | Exactly 3 valid pairs, agreeing on `ira` | Operate. Status byte reports `pair_valid_count=3` (DEGRADED). |
 | **4** | HEALTHY | All 4 pairs valid, all agreeing on `ira` | Operate. Status byte reports `pair_valid_count=4` (HEALTHY). |
@@ -79,9 +79,9 @@ There is no STATE 5 (deliberate-destruct), no transient-failure-counter, no scor
 ```
 1. For each of 8 slots: read 3 times, take per-bit majority. (Layer 1 robustness)
 2. For each of 4 pairs i: compute A_i XOR B_i
-3. Classify each pair: virgin (=0), valid (=all-ones), or corrupt
+3. Classify each pair: kore (=0), valid (=all-ones), or corrupt
 4. Decision:
-   - all 4 virgin                                  → STATE 0, enter provisioning
+   - all 4 kore                                  → STATE 0, enter provisioning
    - ≥ 2 valid AND all valid agree on same ira     → STATE 2/3/4, operate
    - anything else                                  → STATE 1, refuse
 ```
@@ -96,7 +96,7 @@ Rings are **gated off** by default. Five triggers can spin them up:
 |---|---|---|
 | **Handshake** (single `He` break in a clean 256-cycle envelope on either side) | `wairua_set` in RAM | First KOHI of a session. Generates session-side keys + chain init. |
 | **Permanent attest request** (PROVISIONED device) | `wairua_set` refresh in RAM | Per-attest freshness — every permanent attest gets fresh entropy mixed with stored `ira`. |
-| **First permanent attest request** (VIRGIN device) | `ira_set` in eFuse | One-time provisioning ceremony. KOHI → TATARI → TAHU. Irreversible. |
+| **First permanent attest request** (KORE device) | `ira_set` in eFuse | One-time provisioning ceremony. KOHI → TATARI → TAHU. Irreversible. |
 | **Fresh-session "1" bit** on wire mid-conversation | `wairua_set` reset in RAM | Same as handshake — reset session state, generate new keys. |
 | **OLED mode = RING-DETAIL** (local diagnostic) | None (display only) | Rings spin so the user can read frequencies. |
 
@@ -155,10 +155,10 @@ The 4-pair design's operating threshold is "≥ 2 valid pairs agreeing on `ira`.
 |---|---|
 | 1 slot | STATE 3 (DEGRADED-1, operates) |
 | 2 slots | STATE 2 or 3 (operates) |
-| 3 slots distributed across 3 different pairs | STATE 1 (FUCKED, brick) |
-| 4 slots distributed 1-per-pair | STATE 1 (FUCKED, brick) |
+| 3 slots distributed across 3 different pairs | STATE 1 (DARK, brick) |
+| 4 slots distributed 1-per-pair | STATE 1 (DARK, brick) |
 | 4 slots clustered in 2 pairs (both A and B die in same pair) | STATE 2 (operates) |
-| 5+ slots distributed | STATE 1 (FUCKED) |
+| 5+ slots distributed | STATE 1 (DARK) |
 
 **Guaranteed-survival number: 2 slot failures** (any distribution).
 
@@ -200,7 +200,7 @@ The chip naturally computes its state on every boot. Expose it through a status 
 
 ```
 struct chip_status {
-    state:                       u3,  // 0=VIRGIN, 1=FUCKED, 2/3/4=operating health levels
+    state:                       u3,  // 0=KORE, 1=DARK, 2/3/4=operating health levels
     layer1_retries_this_boot:    u4,  // 0=clean, higher=read flakiness rising
     reserved:                    u1
 }
@@ -217,13 +217,13 @@ Hosts get full visibility:
 
 No fuses spent on status. It's a live readout the chip computes anyway.
 
-## FUCKED state — silent wire
+## DARK state — silent wire
 
-When the chip enters STATE 1 (FUCKED), it **permanently ceases driving the bidirectional data pin**. No heartbeat, no slot transitions, nothing. The host's pull-down resistor holds the line at quiescent zero forever.
+When the chip enters STATE 1 (DARK), it **permanently ceases driving the bidirectional data pin**. No heartbeat, no slot transitions, nothing. The host's pull-down resistor holds the line at quiescent zero forever.
 
-A FUCKED PIPE is **wire-level indistinguishable from an absent or unpowered device**. Both look like "no PIPE here" to the host, which prompts identical retry/alert behavior. This is the correct outcome — for the host's purposes there is no functional difference between "chip is broken" and "no chip", because neither produces a usable attestation.
+A DARK PIPE is **wire-level indistinguishable from an absent or unpowered device**. Both look like "no PIPE here" to the host, which prompts identical retry/alert behavior. This is the correct outcome — for the host's purposes there is no functional difference between "chip is broken" and "no chip", because neither produces a usable attestation.
 
-**What triggers FUCKED → silent wire**:
+**What triggers DARK → silent wire**:
 
 | Trigger | Source |
 |---|---|
@@ -236,13 +236,13 @@ All four triggers are **silicon-level truth conditions**, not protocol-driven. *
 
 **Forensic accessibility**: A silent chip's OTP and internal registers remain electrically readable (e.g., via decapsulation + microprobe). The state is preserved, not destroyed. The chip is *silently-bricked-from-the-wire*, not *destroyed*. This matters for failure-mode analysis and for the warranty/RMA pipeline — manufacturers can determine the specific failure mode from a returned silent chip.
 
-**One-line implementation**: in the codec wrapper, `tx_drive_enable = !chip_fucked`, where `chip_fucked = trng.health_fail || otp_byzantine_fail || burn_interrupted_latched`. The codec is otherwise unchanged; silence is just the absence of drive.
+**One-line implementation**: in the codec wrapper, `tx_drive_enable = !chip_dark`, where `chip_dark = trng.health_fail || otp_byzantine_fail || burn_interrupted_latched`. The codec is otherwise unchanged; silence is just the absence of drive.
 
 ## Host asks — enclave answers (no proactive state push)
 
 The enclave **never proactively reports state on the wire**. The heartbeat carries no information beyond "I'm alive enough to drive"; the message layer is purely request-response. This is a deliberate side-channel-elimination measure:
 
-- **Heartbeat layer**: pure idle pattern. Either present (chip alive) or absent (chip FUCKED, unpowered, or unplugged). Three-way ambiguity in the absent case, by design.
+- **Heartbeat layer**: pure idle pattern. Either present (chip alive) or absent (chip DARK, unpowered, or unplugged). Three-way ambiguity in the absent case, by design.
 - **Message layer**: the chip transmits only in direct response to a host-initiated request, and the response is a cryptographic derivation (e.g., domain-separated keyed-BLAKE3 over the request, the relevant state, and `ira` or `wairua`), never raw register fields in the clear.
 - **No periodic state pings**, no wakeup advertisements, no auto-notifications on degradation events. A DEGRADED chip heartbeats identically to a HEALTHY chip from the wire's perspective; the host learns the degradation level only by asking for an attestation, which exposes only an opaque derivation that bakes the state into the cryptographic output but reveals nothing of the input directly.
 

@@ -1,5 +1,5 @@
 // =============================================================================
-// top_pipe_ira.v — first-silicon VIRGIN → HEALTHY ceremony
+// top_pipe_ira.v — first-silicon KORE → HEALTHY ceremony
 // =============================================================================
 //
 // Minimal hardware top for the provisioning ceremony. Press Enter on the
@@ -7,17 +7,17 @@
 // BLAKE3 (~22 ms hash) → TAHU (8 OTP burns) and the LEDs walk through:
 //
 //   T6 (onboard LED, active-low):
-//     OFF                  → power-up VIRGIN (provisionable, idle)
+//     OFF                  → power-up KORE (provisionable, idle)
 //     fast blink           → ceremony_busy (KOHI / BLAKE3 / TAHU running)
 //     solid ON             → HEALTHY / DEGRADED (post-provisioning)
-//     OFF (with T2 lit)    → FUCKED
+//     OFF (with T2 lit)    → DARK
 //
 //   T2 (J4 ext LED):
-//     OFF                  → not FUCKED
-//     solid ON             → FUCKED (silent chip per [[pipe-fucked-state-silent-wire]])
+//     OFF                  → not DARK
+//     solid ON             → DARK (silent chip per [[pipe-dark-state-silent-wire]])
 //
 // OTP state does not persist across power cycles in FPGA emulation — every
-// boot starts VIRGIN, every press provisions a *fresh* ira derived from
+// boot starts KORE, every press provisions a *fresh* ira derived from
 // real ring entropy gathered live.
 //
 // This is the first silicon manifestation of the full IRA ceremony.
@@ -44,7 +44,7 @@ module top_pipe_ira (
     output wire oled_scl,       // SSD1306 I2C clock (P2)
     output wire oled_sda,       // SSD1306 I2C data  (R2)
     output reg  led,            // T6 onboard LED — ceremony status
-    output reg  ext_led         // T2 J4 LED — FUCKED indicator
+    output reg  ext_led         // T2 J4 LED — DARK indicator
 );
 
     // =========================================================================
@@ -288,7 +288,7 @@ module top_pipe_ira (
     );
 
     // =========================================================================
-    // OTP — 8 slots × 256 bits, POR=VIRGIN
+    // OTP — 8 slots × 256 bits, POR=KORE
     // =========================================================================
     wire [2:0]            otp_write_addr;
     wire [255:0]          otp_write_data;
@@ -325,11 +325,11 @@ module top_pipe_ira (
         .reset_n     (reset_n),
         .slot_flat   (all_slots_flat),
         .state_valid (verify_state_valid),
-        .pair_virgin (),
+        .pair_kore (),
         .pair_valid  (),
         .pair_corrupt(),
         .valid_count (),
-        .all_virgin  (),
+        .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
         .state       (chip_state),
@@ -339,7 +339,7 @@ module top_pipe_ira (
     // =========================================================================
     // ira_fsm — the orchestrator
     // =========================================================================
-    wire chip_fucked, ceremony_busy, ceremony_done;
+    wire chip_dark, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -361,7 +361,7 @@ module top_pipe_ira (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_fucked       (chip_fucked),
+        .chip_dark       (chip_dark),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),
         .fsm_state         (fsm_state)
@@ -372,10 +372,10 @@ module top_pipe_ira (
     //   T6 (active-low, so output = ~drive_value):
     //     ceremony_busy → fast blink (every 2^21 cycles ≈ 12 Hz at 25 MHz)
     //     post-HEALTHY   → solid on
-    //     VIRGIN idle    → off
-    //     FUCKED         → off (T2 carries the FUCKED indicator)
+    //     KORE idle    → off
+    //     DARK         → off (T2 carries the DARK indicator)
     //   T2 (active-high, since T2 drives the ext LED through a buffer):
-    //     chip_fucked    → solid on
+    //     chip_dark    → solid on
     //     else           → off
     // =========================================================================
     reg [23:0] blink_div = 24'b0;
@@ -385,7 +385,7 @@ module top_pipe_ira (
     wire chip_alive = (chip_state >= 3'd2);
 
     always @(posedge clk) begin
-        if (chip_fucked) begin
+        if (chip_dark) begin
             led     <= 1'b1;   // OFF (active-low)
             ext_led <= 1'b1;   // ON (T2 buffer logic — match scope convention)
         end else if (ceremony_busy) begin
@@ -395,7 +395,7 @@ module top_pipe_ira (
             led     <= 1'b0;   // solid ON (active-low)
             ext_led <= 1'b0;
         end else begin
-            led     <= 1'b1;   // OFF (VIRGIN, idle)
+            led     <= 1'b1;   // OFF (KORE, idle)
             ext_led <= 1'b0;
         end
     end

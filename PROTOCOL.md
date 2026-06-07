@@ -361,7 +361,7 @@ State block layout (matches `rtl/l3_session_fsm.v`):
 
 | Bits (within mblock) | Width | Field                | Notes                                                            |
 |---------------------:|------:|----------------------|------------------------------------------------------------------|
-|              258:256 |     3 | chip_state           | 0=VIRGIN, 1=FUCKED, 2=DEGRADED-2, 3=DEGRADED-1, 4=HEALTHY        |
+|              258:256 |     3 | chip_state           | 0=KORE, 1=DARK, 2=DEGRADED-2, 3=DEGRADED-1, 4=HEALTHY        |
 |              274:259 |    16 | ring_health_mask     | Per-ring pass bits (16 rings, LSB = ring 0)                      |
 |              279:275 |     5 | ring_health_cnt      | Healthy-ring count (0–16)                                        |
 |              287:280 |     8 | slot_burned_mask     | OTP slot burned bits (8 slots, LSB = slot 0)                     |

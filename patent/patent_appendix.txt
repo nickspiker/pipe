@@ -1,0 +1,2354 @@
+// ============================================================================
+// COMPUTER PROGRAM LISTING APPENDIX
+//
+// Submitted under 37 CFR Section 1.96 in support of the patent application titled:
+//
+//   "Vendor-Free Domain-Separated Cryptographic Device Attestation Using Owner-Initiated Provisioning and Single-Channel Mirror-XOR Line Code"
+//
+// This appendix comprises hardware-description-language (Verilog) source listings for the chip-side embodiment validated in the Experimental Validation subsection of the specification.
+// The listings are exemplary embodiments and are not intended to limit the scope of any claim to the specific signal names, parameter values, bit widths, structural arrangements, technology targets, or synthesis tool flows depicted herein.
+// A person of ordinary skill in the art will recognise that equivalent embodiments may be realised in alternative hardware-description languages (including VHDL, SystemVerilog, Chisel, and Bluespec), on alternative silicon technologies (including application-specific integrated circuit processes at any technology node, structured ASIC, and any field-programmable gate array fabric), and with alternative module decompositions without departing from the scope of the claims.
+//
+// Standard cryptographic primitives invoked by the listings (BLAKE3, X25519, ChaCha20-Poly1305) are represented as port-interface module declarations only; full reference implementations are published and publicly available, are not material to the novelty of the present invention, and are referenced by their published specifications below.
+//
+// CLAIM CORRESPONDENCE MAP
+// ------------------------
+//   Module                          Supports claim(s)
+//   ring_osc.v                      8       (entropy source primitive)
+//   slot_clk.v                      3, 4    (slot timing, slot-counted decode)
+//   codec.v                         3       (mirror-XOR encode/decode)
+//   wire_io.v                       3       (bidirectional channel port)
+//   otp.v                           9       (write-once storage primitive)
+//   inverted_pair_verify.v          9, 8    (byzantine quorum, DARK gate)
+//   trng.v                          8       (noise-detection circuitry, KOHI)
+//   ring_scheduler.v                8       (round-robin per-ring health)
+//   ring_health.v                   8       (RCT + APT + iterated GF(2) tests)
+//   ira_fsm.v                       1, 8    (provisioning ceremony, DARK)
+//   l3_session_fsm.v                2, 5, 6, 7   (per-message wire format, handshake-as-entropy, ira/wairua dichotomy)
+//
+// REFERENCED CRYPTOGRAPHIC PRIMITIVES (stubbed, port-interface only)
+// -----------------------------------------------------------------
+//   blake3.v        BLAKE3 cryptographic hash function. Reference specification: O'Connor, Aumasson, Neves, Wilcox-O'Hearn, "BLAKE3: one function, fast everywhere," 2020, github.com/BLAKE3-team/BLAKE3-specs.
+//   x25519.v        Curve25519 elliptic-curve Diffie-Hellman. Reference: IETF RFC 7748.
+//   chacha20_poly1305.v   Authenticated encryption with associated data. Reference: IETF RFC 8439.
+//
+// FILE COUNT: 14 modules (11 novel + 3 stubs)
+//
+// ============================================================================
+
+
+// ============================================================================
+// FILE: ring_osc.v
+// ============================================================================
+
+// ============================================================================
+// ring_osc.v -- Ring oscillator (the only clock source in the device)
+// ============================================================================
+//
+// Single-inversion ring oscillator.
+// Stage 0 is a logical inverter; stages 1..STAGES-1 are logical buffers.
+// One inversion per loop -- any STAGES >= 1 oscillates.
+// Period scales linearly with STAGES; each gate contributes a process-, voltage-, and temperature-dependent delay characteristic of the underlying silicon technology, ensuring that the ring frequency is not reproducible across manufactured instances and that the per-cycle sample the noise-detection circuitry captures includes a contribution from transient environmental physics (thermal noise, shot noise, voltage and temperature drift) at the moment of sampling.
+//
+// SYNTHESIS NOTE: the `keep` attribute on each loop wire prevents logic optimization from collapsing the buffers (Z = A reduces to a wire) or reducing the loop to a constant.
+// Equivalent attributes exist in every production synthesis tool flow; the specific attribute syntax depicted is non-limiting.
+//
+// PATENT INVARIANT: this module is the sole clock-producing module in the device.
+// No phase-locked loop, no external crystal oscillator, no vendor-supplied clock primitive, and no externally accessible clock input is present anywhere in the chip-side implementation.
+//
+// ============================================================================
+
+`timescale 1ns / 1ps
+
+module ring_osc #(
+    parameter integer STAGES = 5
+) (
+    output wire clk_out
+);
+
+    (* keep = "true" *) wire [STAGES-1:0] ring_q;
+
+    // Stage 0 is the inverter.
+    assign ring_q[0] = ~ring_q[STAGES-1];
+
+    // Stages 1..STAGES-1 are buffers.
+    genvar ri;
+    generate
+        for (ri = 1; ri < STAGES; ri = ri + 1) begin : ring_buf_stage
+            assign ring_q[ri] = ring_q[ri - 1];
+        end
+    endgenerate
+
+    assign clk_out = ring_q[0];
+
+endmodule
+
+// ============================================================================
+// FILE: slot_clk.v
+// ============================================================================
+
+// =============================================================================
+// slot_clk.v -- Bit-slot clock generator for the PIPE wire
+// =============================================================================
+//
+// Divides enclave_clk down to slot_rate. One slot = one bit-time on the wire. At enclave_clk ~ 600 kHz and DIV = 12, slot_rate ~ 50 kbps -- slow enough for a host-side FT232H bit-bang to oversample cleanly, fast enough that the heartbeat is visible on a multimeter / scope without waiting forever.
+//
+// Outputs:
+//   slot_tick   pulses 1 enclave_clk cycle on each slot boundary (the moment
+//               at which TX latches new data onto the wire and RX samples).
+//   my_slot     alternates each tick (1 = our turn to drive, 0 = listen).
+//               POR state: my_slot = OWN_IDLE_FIRST. For the TX-only smoke
+//               test we keep my_slot tied high externally so we drive every
+//               slot; for full bidir later we let it alternate.
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module slot_clk #(
+    parameter integer DIV             = 12,    // enclave_clk cycles per slot
+    parameter         OWN_IDLE_FIRST  = 1'b1
+) (
+    input  wire clk,                            // enclave_clk
+    input  wire reset_n,
+    output reg  slot_tick = 1'b0,
+    output reg  my_slot   = OWN_IDLE_FIRST
+);
+
+    localparam integer CW = (DIV <= 2) ? 1 : $clog2(DIV);
+    reg [CW-1:0] cnt = 0;
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            cnt       <= 0;
+            slot_tick <= 1'b0;
+            my_slot   <= OWN_IDLE_FIRST;
+        end else begin
+            slot_tick <= 1'b0;
+            if (cnt == DIV - 1) begin
+                cnt       <= 0;
+                slot_tick <= 1'b1;
+                my_slot   <= ~my_slot;
+            end else begin
+                cnt <= cnt + 1'b1;
+            end
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// FILE: codec.v
+// ============================================================================
+
+// =============================================================================
+// codec.v -- mirror-XOR line-code codec, one side (asymmetric pull-down)
+// =============================================================================
+//
+// Bit-exact silicon implementation of the encode/decode rules in PROTOCOL.md. Parameterized by `OWN_IDLE` so the same module serves both sides:
+//   enclave instance: OWN_IDLE = 1
+//   host instance:    OWN_IDLE = 0
+//
+// The wire has an external 5 kohm pull-down to GND. Neither side ever actively drives LOW -- they drive HIGH (overriding the pull-down) or release (HIGH-Z, pull-down wins). drive_en is therefore gated on `my_slot AND wire_out`: drive only when (a) it is our slot, and (b) we are trying to put a 1 on the line.
+//
+// The codec is clocked at the slot rate (one posedge per bit-time on the wire). On each tick, the caller asserts `my_slot` to indicate whose turn this slot is. When `my_slot = 1` the codec drives the wire (or releases); when `my_slot = 0` it listens and decodes the other side's bit.
+//
+// Encode (combinational, valid while my_slot = 1):
+//   wire_out = OWN_IDLE  XOR  tx_data  XOR  other_last
+//   drive_en = my_slot AND wire_out
+//
+// Decode (registered, fires when my_slot = 0):
+//   rx_data  = wire_in  XOR  OTHER_IDLE  XOR  own_last
+//
+// State (both initialise to 0 at reset):
+//   own_last   -- last bit this codec transmitted
+//   other_last -- last bit this codec decoded from the other side
+//
+// Idle consequences:
+//   Enclave (OWN_IDLE=1, tx=0, other_last=0): wire_out=1, drive_en=1 -> drives HIGH every even slot. This is the heartbeat.
+//   Host (OWN_IDLE=0, tx=0, other_last=0): wire_out=0, drive_en=0 -> fully passive, zero current. Pull-down holds odd slots LOW.
+//
+// TODO (production silicon, both endpoints): replace the single-point wire_in sample with a slot-width majority vote. Oversample wire_in at >> slot_rate (e.g. 8x or 16x), accumulate via an up/down counter (inc on HIGH sample, dec on LOW sample) across the slot, and at the slot boundary decode rx_data = sign(counter) -- positive -> 1, non-positive -> 0, then reset counter for next slot. For binary samples sign(highs - lows) is mathematically equivalent to median filter of width N, so any glitch shorter than slot/2 is rejected regardless of amplitude. Cost: one up/down counter + one sign-bit register per endpoint; no analog filter, no PLL. Patent Claim 29 covers this technique. FPGA validation used single-point sampling and the line stayed clean enough on the breadboard; production silicon over long traces / noisy channels needs the median filter to maintain bit-error rate under realistic EMI.
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module codec #(
+    parameter OWN_IDLE = 1'b1
+) (
+    input  wire clk,         // slot_clk: one posedge per bit-time
+    input  wire reset_n,     // active-low POR
+    input  wire my_slot,     // 1 = this slot is ours, 0 = other side's slot
+
+    // TX path (sampled at posedge clk when my_slot == 1)
+    input  wire tx_data,
+
+    // RX path
+    input  wire wire_in,     // sampled wire value at the slot boundary
+    output reg  rx_data,     // decoded other-side bit
+    output reg  rx_valid,    // pulse for one slot after a decode
+
+    // Wire driver
+    output wire wire_out,    // logical value to put on the line when driving
+    output wire drive_en     // 1 = actively drive HIGH; 0 = release (HIGH-Z, pull-down holds line LOW)
+);
+
+    localparam OTHER_IDLE = OWN_IDLE ^ 1'b1;
+
+    reg own_last;
+    reg other_last;
+
+    // Combinational TX. Valid for the entire slot during which my_slot = 1.
+    assign wire_out = OWN_IDLE ^ tx_data ^ other_last;
+    // Asymmetric drive: only drive when it's our slot AND we want a HIGH on the wire. Releases (HIGH-Z) otherwise; the external 5kohm pull-down handles LOW.
+    assign drive_en = my_slot && wire_out;
+
+    // NOTE: slot_clk fires `clk` (= slot_tick) AT slot boundary, AND toggles my_slot at the same edge. So at posedge clk, my_slot is the UPCOMING slot's owner, while wire_in (synchronized) reflects the just-ended slot. Decode therefore happens when my_slot toggled to 1 (enclave slot upcoming -> host slot just ended -> wire_in is host's slot value). own_last update happens when my_slot toggled to 0 (host slot upcoming -> enclave slot just ended -> tx_data was what we just drove).
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            own_last   <= 1'b0;
+            other_last <= 1'b0;
+            rx_data    <= 1'b0;
+            rx_valid   <= 1'b0;
+        end else begin
+            rx_valid <= 1'b0;
+            if (my_slot) begin
+                // Enclave slot upcoming -> host slot just ended -> decode host's bit
+                rx_data    <= wire_in ^ OTHER_IDLE ^ own_last;
+                other_last <= wire_in ^ OTHER_IDLE ^ own_last;
+                rx_valid   <= 1'b1;
+            end else begin
+                // Host slot upcoming -> enclave slot just ended -> record what we drove
+                own_last <= tx_data;
+            end
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// FILE: wire_io.v
+// ============================================================================
+
+// ============================================================================
+// wire_io.v -- Bidirectional channel port driver + input synchronizer
+// ============================================================================
+//
+// Wraps the single bidirectional channel port.
+// In an electrical embodiment (depicted here), the port is a tristate input/output pin coupled to a single conductor with an external asymmetric pull-down to ground.
+// In alternative embodiments the port couples to an optical fiber via a paired emitter and detector, to a magnetic coupling coil, or to any other bidirectional coupling structure satisfying the asymmetric-drive requirement of the mirror-XOR line code.
+//
+// The input path is synchronized through two flip-flops into the receiving clock domain.
+// The two endpoints share no clock; every received bit crosses a domain boundary and must be synchronized to avoid metastability propagating into the decode logic.
+//
+// SYNTHESIS NOTE: the tristate behaviour is depicted here as a behavioural `assign pad = drive_en ? wire_out : 1'bz;` for portability.
+// Production synthesis tools may infer this onto a vendor-specific bidirectional buffer primitive; the depicted form does not limit the claim to any particular vendor primitive.
+//
+// ============================================================================
+
+`timescale 1ns / 1ps
+
+module wire_io (
+    input  wire clk,
+    input  wire reset_n,
+    input  wire drive_en,
+    input  wire wire_out,
+    output wire wire_in,
+    inout  wire pad
+);
+
+    // Tristate driver. drive_en = 1 actively drives the pad with wire_out; drive_en = 0 releases the pad (high impedance), and the external asymmetric pull-down holds the channel at its idle state.
+    assign pad = drive_en ? wire_out : 1'bz;
+
+    // Two-flip-flop synchronizer crossing the externally-driven pad value into the local clock domain.
+    reg [1:0] in_sync;
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) in_sync <= 2'b00;
+        else          in_sync <= {in_sync[0], pad};
+    end
+    assign wire_in = in_sync[1];
+
+endmodule
+
+// ============================================================================
+// FILE: otp.v
+// ============================================================================
+
+// =============================================================================
+// otp.v -- 8-slot one-time-programmable storage (FPGA emulator)
+// =============================================================================
+//
+// Storage primitive for the 8-slot inverted-pair `ira` eFuse described in IRA.md Sec."OTP geometry -- 8 slots, 4 inverted pairs". Each slot holds 256 bits; the 8 slots are organized as 4 pairs by the caller:
+//
+//   slot 0 = pair 0 A (ira)        slot 4 = pair 0 B (~ira)
+//   slot 1 = pair 1 A (ira)        slot 5 = pair 1 B (~ira)
+//   slot 2 = pair 2 A (ira)        slot 6 = pair 2 B (~ira)
+//   slot 3 = pair 3 A (ira)        slot 7 = pair 3 B (~ira)
+//
+// This module is the pure storage layer. It knows nothing about pair geometry, `ira`/`~ira` inversion semantics, the 5-state classifier, or the TAHU burn sequence -- those live in `ira_fsm.v` and the shared `inverted_pair_verify.v`.
+// The interface (8-slot byte-flat memory + per-slot burned flag + write-once enforcement) is identical between this FPGA emulator and the silicon eFuse macro that replaces it at tapeout -- only the storage backend changes.
+//
+// Persistence: by default FPGA emulation does NOT persist across power cycles.
+// Every power-on starts with all slots in the KORE state (all zeros, all burned flags clear).
+//
+// The `INIT_FILE` parameter provides a synthesis-time alternative: the bitstream itself carries pre-burned slot contents. This is the FPGA-shaped equivalent of factory-provisioning eFuses: once baked into the bitstream, the slots come up populated at every power-on, just as eFuses come up already-burned every power-on. Used to demonstrate persistence (bake the IRA that came out of one boot's ceremony, then prove identical challenge-response across power cycles) and fault injection (bake deliberately corrupt configurations to exercise the inverted_pair_verify classifier -- partial burns, single-bit errors, etc.).
+//
+// When INIT_FILE is set:
+//   - $readmemh loads 8 lines x 64 hex chars (256 bits/slot) from the file into slot_data at synthesis time
+//   - slot_burned[i] is derived as (slot_data[i] != 0) -- non-zero slots are considered already-burned (write-rejected), all-zero slots remain write-eligible (so partial-burn fixtures can populate only some pairs)
+//   - The reset path no longer clears slot_data / slot_burned, matching eFuse semantics (the fuses are already in their final state and don't un-burn on reset)
+//
+// When INIT_FILE is empty (default): original behavior -- slot_data starts all-zero, slot_burned all-clear, ceremony runs at every boot.
+//
+// Reads are combinational -- same cycle as the address presents. Writes pulse `write_enable` for one cycle; the result (success or rejected-because-burned) is signalled the following cycle via `write_done` / `write_rejected`.
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+// OTP_INIT_FILE may be set via `read_verilog -DOTP_INIT_FILE="<path>"` from the build script to bake slot contents at synthesis. The presence of the define selects the $readmemh path; absence leaves slots at the original KORE-at-boot zero state. The two init paths are mutually exclusive at preprocessor time so yosys's init pass sees only one set of constants.
+
+module otp #(
+    parameter integer SLOT_BITS = 256,
+    parameter integer N_SLOTS   = 8
+) (
+    input  wire                          clk,
+    input  wire                          reset_n,
+    input  wire                          wipe,     // 1 = force-clear slot_data this cycle (dev convenience)
+
+    // Combinational read port -- read_data reflects slot_data[read_addr] in the same cycle the address is presented.
+    input  wire [$clog2(N_SLOTS)-1:0]    read_addr,
+    output wire [SLOT_BITS-1:0]          read_data,
+    output wire                          read_burned,
+
+    // Write/burn port -- pulse write_enable for one cycle. On the next cycle, exactly one of write_done or write_rejected pulses high.
+    input  wire [$clog2(N_SLOTS)-1:0]    write_addr,
+    input  wire [SLOT_BITS-1:0]          write_data,
+    input  wire                          write_enable,
+    output reg                           write_done,
+    output reg                           write_rejected,
+
+    // Inspection: bitmap of slots that have been burned (1 = burned).
+    output wire [N_SLOTS-1:0]            burned_mask,
+
+    // Parallel-slot read port -- all 8 slots concatenated (slot 0 in low bits, slot 7 in high). Continuously valid. Used by inverted_pair_verify in top.v without needing hierarchical references.
+    output wire [N_SLOTS*SLOT_BITS-1:0]  all_slots_flat
+);
+
+    // -------------------------------------------------------------------------
+    // Storage. With 8 slots of 256 bits = 2048 bits, yosys typically infers distributed RAM / registers rather than block RAM (BRAM minimum is 18 Kbit on ECP5, which would be 89% wasted). Either is fine.
+    // -------------------------------------------------------------------------
+    reg [SLOT_BITS-1:0] slot_data [0:N_SLOTS-1];
+
+    // -------------------------------------------------------------------------
+    // Synthesis-time initialization of slot_data -- mutually exclusive paths selected at preprocessor time. With OTP_INIT_FILE defined the bitstream GSR/power-on state is loaded from the hex file (baked IRA or fault fixture); otherwise all slots come up zero (KORE).
+    // -------------------------------------------------------------------------
+`ifdef OTP_INIT_FILE
+    initial begin
+        $readmemh(`OTP_INIT_FILE, slot_data);
+    end
+`else
+    integer init_i;
+    initial begin
+        for (init_i = 0; init_i < N_SLOTS; init_i = init_i + 1) begin
+            slot_data[init_i] = {SLOT_BITS{1'b0}};
+        end
+    end
+`endif
+
+    // slot_burned is derived combinationally from slot_data. A slot is "burned" iff any of its bits is set. This matches the original semantics (slot_burned was set in the same cycle slot_data was written) while allowing yosys's init pass to compute the burned-mask directly from the constant slot_data values without needing a separate reg with its own complex init dependency. The only edge case is writing all-zero data, which leaves the slot looking KORE -- but real IRA values from BLAKE3 are astronomically unlikely to be all-zero, and fault fixtures that want zero slots also want them to look unburned.
+    wire [N_SLOTS-1:0] slot_burned;
+    genvar gb;
+    generate
+        for (gb = 0; gb < N_SLOTS; gb = gb + 1) begin : slot_burned_fanout
+            assign slot_burned[gb] = |slot_data[gb];
+        end
+    endgenerate
+
+    assign read_data   = slot_data[read_addr];
+    assign read_burned = slot_burned[read_addr];
+    assign burned_mask = slot_burned;
+
+    genvar gs;
+    generate
+        for (gs = 0; gs < N_SLOTS; gs = gs + 1) begin : slot_fanout
+            assign all_slots_flat[gs*SLOT_BITS +: SLOT_BITS] = slot_data[gs];
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // Write logic. write_enable is sampled on the rising edge; the result pulses one cycle later.
+    //   - If the target slot is already burned, write is silently dropped and write_rejected pulses (write_done stays low).
+    //   - Otherwise the slot is written, the burned flag is set, and write_done pulses.
+    // -------------------------------------------------------------------------
+    // The reset path intentionally does NOT clear slot_data -- that's initialized by the `initial` block (above) and must persist across reset to match eFuse semantics (a real eFuse can't be "un-burned" by pulsing a reset line). Reset only clears the single-cycle handshake strobes.
+    //
+    // The `wipe` input IS allowed to clear slot_data -- this is the dev- convenience escape hatch driven from the board's user button at top level. It models "you broke open the chip with a needle and zeroed the fuses"; not something the protocol exposes to external attackers.
+    // Asserting wipe drops the chip back to KORE so a fresh ceremony can run without a full power cycle.
+    // Single-write-port slot_data update. The wipe-clear-all is implemented by gating each slot's clock-enable individually, avoiding the multi-write-port memory inference that yosys does when a `for`-loop unrolled all-slot wipe coexists with the dynamic-index slot write (observed to corrupt the high bits of slot 0 on this codebase + yosys version). Explicit per-slot if-trees keep everything as plain regs.
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            write_done     <= 1'b0;
+            write_rejected <= 1'b0;
+        end else begin
+            write_done     <= 1'b0;
+            write_rejected <= 1'b0;
+            if (write_enable && !wipe) begin
+                if (slot_burned[write_addr]) begin
+                    write_rejected <= 1'b1;
+                end else begin
+                    write_done <= 1'b1;
+                end
+            end
+        end
+    end
+
+    // Per-slot clock-enabled storage. Single write port per register:
+    // either wipe forces zero, or write_enable lands write_data when this slot is the addressed one and is currently unburned.
+    genvar gw;
+    generate
+        for (gw = 0; gw < N_SLOTS; gw = gw + 1) begin : slot_writes
+            always @(posedge clk) begin
+                if (wipe) begin
+                    slot_data[gw] <= {SLOT_BITS{1'b0}};
+                end else if (write_enable
+                             && (write_addr == gw[$clog2(N_SLOTS)-1:0])
+                             && !slot_burned[gw]) begin
+                    slot_data[gw] <= write_data;
+                end
+            end
+        end
+    endgenerate
+
+endmodule
+
+// ============================================================================
+// FILE: inverted_pair_verify.v
+// ============================================================================
+
+// =============================================================================
+// inverted_pair_verify.v -- 4-pair classifier (serial-per-bit-position sweep)
+// =============================================================================
+//
+// Combinational-equivalent classifier for the inverted-pair storage geometry described in IRA.md Sec."OTP geometry" / Sec."The five lifelong states". Takes 8 slot values (4 pairs x {A, B}) and produces:
+//
+//   - per-pair classification (kore / valid / corrupt)
+//   - aggregate 5-state machine code (KORE / DARK / DEGRADED-{2,1} / HEALTHY)
+//   - recovered ira value (lowest-indexed valid pair's A slot, or zero)
+//   - byzantine_ok strobe (>=2 valid pairs AND all valid pairs agree on ira)
+//   - state_valid strobe (high after first complete sweep)
+//
+// Outputs are REGISTERED, sampled at the end of each 257-cycle sweep. During the sweep the registered outputs hold their last-latched values; consumers (ira_fsm) read them whenever, with the understanding that any change in slot_flat is reflected at most 2 sweeps later. ira_fsm is responsible for waiting two full sweeps after OTP burns before reading chip_state.
+//
+// Implementation -- serial accumulators, one bit position per cycle:
+//
+//   sweep_addr counts 0..256. At cycle j in [0, 255] we read 8 bits at slot
+//   position j (one bit per slot, via slot[s][sweep_addr]). For each pair k:
+//     all_ones[k]   &= (bit_A_k ^ bit_B_k)      // 1 if XOR was all-ones
+//     has_one_A[k]  |= bit_A_k                   // 0 if slot A all-zero
+//     has_one_B[k]  |= bit_B_k                   // 0 if slot B all-zero
+//   For each ordered pair (i, j) of A-slots with i<j (6 total):
+//     pair_disagree[i,j] |= (bit_A_i ^ bit_A_j) // 1 if A_i ever differed from A_j
+//   For each slot s in 0..7:
+//     popcount[s]   += bit_s                     // running 1-count
+//     toggles[s]    += (bit_s != prev_bit[s])    // running edge count
+//
+// At cycle 256 (end_of_sweep), the running accumulators ARE the complete classifier inputs. Combinational logic on those (no 256-bit-wide ops anywhere) computes pair_kore/pair_valid/pair_corrupt/valid_count/ agreement_ok/state/ira and latches them into the output registers. The sweep then restarts.
+//
+// Cost vs. prior parallel-combinational design: replaces twenty 256-bit- wide operations with single-bit accumulators (~5K LUT savings). Replaces 2K-FF slot_latched + load-mux with zero copy (~2K LUT + 2K FF savings).
+// Total module cost: ~1.5K LUTs / ~600 FFs.
+//
+// Slot layout (caller's responsibility -- this module sees raw 256-bit values):
+//   slot[0..3] = pair 0..3 A (holds ira or wairua)
+//   slot[4..7] = pair 0..3 B (holds ~ira or ~wairua)
+//
+// Per-pair classification:
+//   kore  -> both slots are all-zero (the genuine unburned state)
+//   valid   -> A XOR B == all-ones AND each slot's popcount in [POP_LO, POP_HI]
+//             AND each slot's toggle count >= TOG_MIN
+//   corrupt -> anything else
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module inverted_pair_verify #(
+    parameter integer SLOT_BITS = 256
+) (
+    input  wire                   clk,
+    input  wire                   reset_n,
+
+    input  wire [8*SLOT_BITS-1:0] slot_flat,
+
+    output reg                    state_valid,
+    output reg  [3:0]             pair_kore,
+    output reg  [3:0]             pair_valid,
+    output reg  [3:0]             pair_corrupt,
+    output reg  [2:0]             valid_count,
+    output reg                    all_kore,
+    output reg                    agreement_ok,
+    output reg                    byzantine_ok,
+    output reg  [2:0]             state,
+    output reg  [SLOT_BITS-1:0]   ira
+);
+
+    // -------------------------------------------------------------------------
+    // Unpack the 8 slots -- combinational views of slot_flat.
+    // -------------------------------------------------------------------------
+    wire [SLOT_BITS-1:0] slot [0:7];
+    genvar gs;
+    generate
+        for (gs = 0; gs < 8; gs = gs + 1) begin : unpack
+            assign slot[gs] = slot_flat[SLOT_BITS*gs +: SLOT_BITS];
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // Sweep counter -- 0..SLOT_BITS (0..256). One bit position per cycle for 0..SLOT_BITS-1; cycle SLOT_BITS = "end of sweep", finalize and restart.
+    // -------------------------------------------------------------------------
+    reg [8:0] sweep_addr;
+    wire end_of_sweep = (sweep_addr == SLOT_BITS[8:0]);
+
+    // 8 bits at the current sweep position (one per slot).
+    wire [7:0] bit_now;
+    generate
+        for (gs = 0; gs < 8; gs = gs + 1) begin : extract
+            assign bit_now[gs] = slot[gs][sweep_addr[7:0]];
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // Running per-pair accumulators (reset on each sweep restart).
+    //   all_ones[k]   starts 1; ANDed with (A_bit ^ B_bit) each cycle -> 1 iff
+    //                 every bit position had A_bit != B_bit (XOR all-ones)
+    //   has_one_A[k]  starts 0; ORed with A_bit each cycle -> 0 iff A all-zero
+    //   has_one_B[k]  starts 0; ORed with B_bit each cycle -> 0 iff B all-zero
+    //   pair_disagree[i] starts 0; ORed with (A_p ^ A_q) for the i-th (p, q)
+    //                 pair -> 1 iff A_p ever differed from A_q
+    // -------------------------------------------------------------------------
+    reg [3:0] all_ones;
+    reg [3:0] has_one_A;
+    reg [3:0] has_one_B;
+    reg [5:0] pair_disagree;   // 6 pairs: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3)
+
+    // Per-slot popcount + toggle + prev_bit (for edge detect within the slot).
+    reg [8:0] popcount [0:7];
+    reg [8:0] toggles  [0:7];
+    reg [7:0] prev_bit;
+
+    // -------------------------------------------------------------------------
+    // Per-slot sanity bands.
+    //   POP_LO/HI: 1/8..7/8 of 256 -- accepts up to +/-75% bias
+    //   TOG_MIN:   N/64 -- catches all-zero / all-one / single-transition degeneracies
+    // -------------------------------------------------------------------------
+    localparam [8:0] POP_LO  = 9'd32;
+    localparam [8:0] POP_HI  = 9'd224;
+    localparam [8:0] TOG_MIN = 9'd4;
+
+    wire [3:0] slot_sane_A;
+    wire [3:0] slot_sane_B;
+    genvar gk;
+    generate
+        for (gk = 0; gk < 4; gk = gk + 1) begin : sanity
+            assign slot_sane_A[gk] = (popcount[gk]   >= POP_LO)
+                                   & (popcount[gk]   <= POP_HI)
+                                   & (toggles[gk]    >= TOG_MIN);
+            assign slot_sane_B[gk] = (popcount[gk+4] >= POP_LO)
+                                   & (popcount[gk+4] <= POP_HI)
+                                   & (toggles[gk+4]  >= TOG_MIN);
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // Final classification (combinational on the small accumulators + slot_flat for the ira recovery mux). Latched at end_of_sweep into the output regs.
+    // -------------------------------------------------------------------------
+    wire [3:0] c_pair_kore;
+    wire [3:0] c_pair_valid;
+    wire [3:0] c_pair_corrupt;
+    generate
+        for (gk = 0; gk < 4; gk = gk + 1) begin : classify
+            assign c_pair_kore[gk] = ~has_one_A[gk] & ~has_one_B[gk];
+            assign c_pair_valid[gk]  = all_ones[gk] & slot_sane_A[gk] & slot_sane_B[gk];
+            assign c_pair_corrupt[gk]= ~c_pair_kore[gk] & ~c_pair_valid[gk];
+        end
+    endgenerate
+
+    wire [2:0] c_valid_count = {2'b0, c_pair_valid[0]} + {2'b0, c_pair_valid[1]}
+                              + {2'b0, c_pair_valid[2]} + {2'b0, c_pair_valid[3]};
+    wire c_all_kore = (c_pair_kore == 4'b1111);
+
+    // Agreement check: any (i, j) pair of valid pairs where A_i differs from A_j.
+    wire c_disagree_01 = pair_disagree[0] & c_pair_valid[0] & c_pair_valid[1];
+    wire c_disagree_02 = pair_disagree[1] & c_pair_valid[0] & c_pair_valid[2];
+    wire c_disagree_03 = pair_disagree[2] & c_pair_valid[0] & c_pair_valid[3];
+    wire c_disagree_12 = pair_disagree[3] & c_pair_valid[1] & c_pair_valid[2];
+    wire c_disagree_13 = pair_disagree[4] & c_pair_valid[1] & c_pair_valid[3];
+    wire c_disagree_23 = pair_disagree[5] & c_pair_valid[2] & c_pair_valid[3];
+    wire c_agreement_ok = ~(c_disagree_01 | c_disagree_02 | c_disagree_03
+                          | c_disagree_12 | c_disagree_13 | c_disagree_23);
+    wire c_byzantine_ok = (c_valid_count >= 3'd2) & c_agreement_ok;
+
+    // ira recovery: lowest-indexed valid pair's A. 4-way 256-bit mux -- the one place we still touch full slot widths (combinational at sweep end).
+    wire [SLOT_BITS-1:0] c_ira = c_pair_valid[0] ? slot[0]
+                                : c_pair_valid[1] ? slot[1]
+                                : c_pair_valid[2] ? slot[2]
+                                : c_pair_valid[3] ? slot[3]
+                                : {SLOT_BITS{1'b0}};
+
+    wire [2:0] c_state = c_all_kore    ? 3'd0
+                       : ~c_byzantine_ok ? 3'd1
+                       : (c_valid_count == 3'd2) ? 3'd2
+                       : (c_valid_count == 3'd3) ? 3'd3
+                       :                            3'd4;
+
+    // -------------------------------------------------------------------------
+    // Sweep FSM -- single always block driving all state and outputs.
+    // -------------------------------------------------------------------------
+    integer i;
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            sweep_addr    <= 9'b0;
+            state_valid   <= 1'b0;
+            all_ones      <= 4'b1111;
+            has_one_A     <= 4'b0;
+            has_one_B     <= 4'b0;
+            pair_disagree <= 6'b0;
+            prev_bit      <= 8'b0;
+            pair_kore   <= 4'b0;
+            pair_valid    <= 4'b0;
+            pair_corrupt  <= 4'b0;
+            valid_count   <= 3'b0;
+            all_kore    <= 1'b0;
+            agreement_ok  <= 1'b0;
+            byzantine_ok  <= 1'b0;
+            state         <= 3'b0;
+            ira           <= {SLOT_BITS{1'b0}};
+            for (i = 0; i < 8; i = i + 1) begin
+                popcount[i] <= 9'b0;
+                toggles[i]  <= 9'b0;
+            end
+        end else if (end_of_sweep) begin
+            // Latch the classifier outputs from the matched accumulators.
+            pair_kore  <= c_pair_kore;
+            pair_valid   <= c_pair_valid;
+            pair_corrupt <= c_pair_corrupt;
+            valid_count  <= c_valid_count;
+            all_kore   <= c_all_kore;
+            agreement_ok <= c_agreement_ok;
+            byzantine_ok <= c_byzantine_ok;
+            state        <= c_state;
+            ira          <= c_ira;
+            state_valid  <= 1'b1;
+
+            // Restart the sweep: clear all accumulators.
+            sweep_addr    <= 9'b0;
+            all_ones      <= 4'b1111;
+            has_one_A     <= 4'b0;
+            has_one_B     <= 4'b0;
+            pair_disagree <= 6'b0;
+            prev_bit      <= 8'b0;
+            for (i = 0; i < 8; i = i + 1) begin
+                popcount[i] <= 9'b0;
+                toggles[i]  <= 9'b0;
+            end
+        end else begin
+            // Per-cycle accumulation.
+            prev_bit <= bit_now;
+
+            // Per-pair pair_xor & kore accumulators (only k=0..3).
+            for (i = 0; i < 4; i = i + 1) begin
+                all_ones[i]  <= all_ones[i]  & (bit_now[i] ^ bit_now[i+4]);
+                has_one_A[i] <= has_one_A[i] | bit_now[i];
+                has_one_B[i] <= has_one_B[i] | bit_now[i+4];
+            end
+
+            // 6 pairwise A-vs-A disagreements (for agreement check).
+            pair_disagree[0] <= pair_disagree[0] | (bit_now[0] ^ bit_now[1]);
+            pair_disagree[1] <= pair_disagree[1] | (bit_now[0] ^ bit_now[2]);
+            pair_disagree[2] <= pair_disagree[2] | (bit_now[0] ^ bit_now[3]);
+            pair_disagree[3] <= pair_disagree[3] | (bit_now[1] ^ bit_now[2]);
+            pair_disagree[4] <= pair_disagree[4] | (bit_now[1] ^ bit_now[3]);
+            pair_disagree[5] <= pair_disagree[5] | (bit_now[2] ^ bit_now[3]);
+
+            // Per-slot popcount + toggle (toggle is gated on sweep_addr != 0 since prev_bit isn't meaningful at position 0).
+            for (i = 0; i < 8; i = i + 1) begin
+                popcount[i] <= popcount[i] + {8'b0, bit_now[i]};
+                if (sweep_addr != 9'b0) begin
+                    toggles[i] <= toggles[i] + {8'b0, bit_now[i] ^ prev_bit[i]};
+                end
+            end
+
+            sweep_addr <= sweep_addr + 9'b1;
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// FILE: trng.v
+// ============================================================================
+
+// =============================================================================
+// trng.v -- KOHI entropy gather: round-robin per-ring sampling + layered health
+// =============================================================================
+//
+// Drives a `ring_scheduler` instance that walks the 16 rings sequentially, gathering W=4096 samples per ring (16 x 4096 = 65,536 bits = 8 KB buffer fill). The scheduler runs the layered RCT + APT + iterated GF(2) differencing health check (Claim 3c) on each ring's stream as it goes. After all 16 rings complete, the per-ring verdicts are latched as `ring_health[15:0]` and the Byzantine threshold check decides HEALTHY/DARK.
+//
+// The 16 ring oscillators free-run continuously; `ring_enable` is advisory (top.v decides whether to gate). Each ring's bit-stream feeds the entropy buffer one bit per cycle when `sample_valid` is high.
+//
+// Architecture trade vs original parallel-XOR design:
+//   - 13x fewer LUTs (one shared ring_health instance instead of 16 parallel)
+//   - Same KOHI wall-clock (~110 ms at 600 kHz enclave_clk)
+//   - Per-ring health checked over W=4096 samples instead of 65,536 -- looser tolerance but still catches stuck, biased, near-resonance, and periodic-pattern failure modes
+//   - Entropy per cycle is one ring's bit, not the XOR of all 16; BLAKE3 conditioning over the full 8 KB buffer recovers cryptographic uniformity
+//
+// Phase: this is the KOHI (gather) phase of the IRA ceremony. TATARI (random pre-burn delay) and TAHU (eFuse burn) happen in `ira_fsm.v`.
+//
+// PIPE rule: ring oscillator instances live in top.v, not here. Sampling, accumulation, health-checking, and buffer storage live in this module. The buffer read interface is the seam for the BLAKE3 wrapper.
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module trng #(
+    // SCHED_W is the per-ring gather window. Total bits gathered = 16 * SCHED_W which should equal 65,536 (= 8 KB buffer). For sim, override to a small power-of-two so tests finish fast.
+    parameter integer SCHED_W      = 4096,
+    parameter integer SCHED_RCT_C  = 32,
+    parameter integer SCHED_APT_W  = 256,
+    parameter integer SCHED_APT_T  = 156,
+    // LVL_LO/HI are deliberately wide. NIST SP 800-90B's textbook tolerance (+/-6sigma ~ +/-192 around W/2) assumes high-quality entropy reaching the tester. Raw FPGA ring oscillator samples at this ring-to-clock ratio (~160 MHz ring / 25 MHz sampler ~ 6x) carry systematic low-lag autocorrelation, and rings whose stage count makes their period a near-rational multiple of the sample period produce especially strong level-k popcount skew. BLAKE3 conditioning downstream produces uniform output from this source even at modest entropy per bit, so the health check here only needs to catch HARD failures (stuck rail, dead oscillator, near-100% bias) rather than subtle correlation or harmonic alignment. Bounds [256, 3840] = popcount must be in [6.25%, 93.75%] of W = catches stuck-near-rail patterns at all 7 iter-GF(2) levels.
+    parameter integer SCHED_LVL_LO = 256,
+    parameter integer SCHED_LVL_HI = 3840
+) (
+    input  wire         clk,            // enclave_clk (slow sampler, ~600 kHz)
+    input  wire         reset_n,        // active-low POR
+    input  wire         start,          // 1-cycle pulse to begin a fresh KOHI
+
+    input  wire [15:0]  ring_in,        // 16 free-running ring oscillator outputs
+
+    // Buffer read port for downstream BLAKE3 conditioner.
+    // Address [12:0] selects one of 8192 bytes; data appears next cycle.
+    input  wire [12:0]  buf_raddr,
+    output reg   [7:0]  buf_rdata,
+
+    output reg          busy,           // high during gather + health check
+    output reg          gather_done,    // 1-cycle strobe when buffer ready (>= 8 rings healthy)
+    output reg          health_fail,    // latched when <8 of 16 rings pass -- DARK state
+    output reg  [15:0]  ring_health,    // bitmask of last-gather healthy rings (1=pass)
+    output reg   [4:0]  ring_health_cnt,// count of healthy rings 0..16 (for attestation responses)
+    output wire [15:0]  ring_enable,    // advisory: one-hot mask of currently-active ring
+    // Diagnostic surface (latched after each KOHI; valid after first gather_done or health_fail)
+    output reg  [15:0]   ring_rct_fail,    // bit i = ring i tripped RCT last gather
+    output reg  [15:0]   ring_apt_fail,    // bit i = ring i tripped APT last gather
+    output reg  [111:0]  ring_level_fail   // 7 bits per ring (level 0..6)
+);
+
+    // -------------------------------------------------------------------------
+    // 2-FF synchronizers: each ring crosses from its own free-running domain into clk. Without these, the sampling FFs would see metastability and propagate it into the ring_scheduler's health logic.
+    // -------------------------------------------------------------------------
+    reg [15:0] ring_sync1;
+    reg [15:0] ring_sync2;
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            ring_sync1 <= 16'b0;
+            ring_sync2 <= 16'b0;
+        end else begin
+            ring_sync1 <= ring_in;
+            ring_sync2 <= ring_sync1;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // ring_scheduler: round-robin per-ring health gather (Claim 3c Variant A)
+    // -------------------------------------------------------------------------
+    reg          sched_start;
+    wire         sched_busy;
+    wire         sched_all_done;
+    wire [15:0]  sched_ring_health_mask;
+    wire [4:0]   sched_ring_health_cnt;
+    wire         sched_sample_bit;
+    wire         sched_sample_valid;
+    wire [15:0]  sched_ring_rct_fail;
+    wire [15:0]  sched_ring_apt_fail;
+    wire [111:0] sched_ring_level_fail;
+
+    ring_scheduler #(
+        .N_RINGS      (16),
+        .W            (SCHED_W),
+        .ENABLE_DELAY (8),
+        .RCT_C        (SCHED_RCT_C),
+        .APT_W        (SCHED_APT_W),
+        .APT_T        (SCHED_APT_T),
+        .LVL_LO       (SCHED_LVL_LO),
+        .LVL_HI       (SCHED_LVL_HI)
+    ) sched (
+        .clk              (clk),
+        .reset_n          (reset_n),
+        .start            (sched_start),
+        .ring_in          (ring_sync2),
+        .ring_enable      (ring_enable),
+        .sample_bit       (sched_sample_bit),
+        .sample_valid     (sched_sample_valid),
+        .busy             (sched_busy),
+        .all_done         (sched_all_done),
+        .ring_health_mask (sched_ring_health_mask),
+        .ring_health_cnt  (sched_ring_health_cnt),
+        .ring_rct_fail    (sched_ring_rct_fail),
+        .ring_apt_fail    (sched_ring_apt_fail),
+        .ring_level_fail  (sched_ring_level_fail)
+    );
+
+    // -------------------------------------------------------------------------
+    // FSM
+    // -------------------------------------------------------------------------
+    localparam [1:0]
+        ST_IDLE   = 2'd0,
+        ST_GATHER = 2'd1,
+        ST_CHECK  = 2'd2,
+        ST_DONE   = 2'd3;
+
+    reg [1:0] state;
+
+    // 65,536-bit (= 8 KB) buffer fills bit-by-bit when sample_valid is high.
+    // 16 rings x W=4096 bits each = exactly 65,536 bits when scheduler completes.
+    reg [15:0] bit_cnt;
+    reg [2:0]  bit_idx;
+    reg [7:0]  work_byte;
+
+    // -------------------------------------------------------------------------
+    // BRAM buffer: 8192 x 8 bits = 65,536 bits. Inferred to 4 x DP16KD on ECP5.
+    // Read-after-write semantics: the read port lags by one cycle.
+    // -------------------------------------------------------------------------
+    reg  [7:0]  buffer [0:8191];
+    reg         buf_we;
+    reg  [12:0] buf_waddr;
+    reg  [7:0]  buf_wdata;
+
+    always @(posedge clk) begin
+        if (buf_we) buffer[buf_waddr] <= buf_wdata;
+        buf_rdata <= buffer[buf_raddr];
+    end
+
+    // DARK threshold: 7 or fewer healthy rings. With 8+ of 16, byzantine safety satisfied and entropy remains cryptographically sound (XOR of independent sources via BLAKE3 is uniform whenever any one is uniform).
+    localparam [4:0] HEALTH_MIN = 5'd8;
+
+    // -------------------------------------------------------------------------
+    // Main FSM
+    // -------------------------------------------------------------------------
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            state           <= ST_IDLE;
+            bit_cnt         <= 16'b0;
+            bit_idx         <= 3'b0;
+            work_byte       <= 8'b0;
+            buf_we          <= 1'b0;
+            buf_waddr       <= 13'b0;
+            buf_wdata       <= 8'b0;
+            sched_start     <= 1'b0;
+            busy            <= 1'b0;
+            gather_done     <= 1'b0;
+            health_fail     <= 1'b0;
+            ring_health     <= 16'b0;
+            ring_health_cnt <= 5'b0;
+            ring_rct_fail   <= 16'b0;
+            ring_apt_fail   <= 16'b0;
+            ring_level_fail <= 112'b0;
+        end else begin
+            buf_we      <= 1'b0;
+            gather_done <= 1'b0;
+            sched_start <= 1'b0;
+
+            case (state)
+                ST_IDLE: begin
+                    busy <= 1'b0;
+                    if (start && !health_fail) begin
+                        bit_cnt   <= 16'b0;
+                        bit_idx   <= 3'b0;
+                        work_byte <= 8'b0;
+                        sched_start <= 1'b1;
+                        busy  <= 1'b1;
+                        state <= ST_GATHER;
+                    end
+                end
+
+                ST_GATHER: begin
+                    // Pack sched_sample_bit into work_byte; on every 8th bit, write to BRAM. Advance only when sample_valid.
+                    if (sched_sample_valid) begin
+                        if (bit_idx == 3'd7) begin
+                            buf_we    <= 1'b1;
+                            buf_waddr <= bit_cnt[15:3];
+                            buf_wdata <= {sched_sample_bit, work_byte[7:1]};
+                            bit_idx   <= 3'b0;
+                        end else begin
+                            work_byte <= {sched_sample_bit, work_byte[7:1]};
+                            bit_idx   <= bit_idx + 3'd1;
+                        end
+                        bit_cnt <= bit_cnt + 16'b1;
+                    end
+
+                    if (sched_all_done) begin
+                        state <= ST_CHECK;
+                    end
+                end
+
+                ST_CHECK: begin
+                    // Latch the health snapshot and decide HEALTHY/DEGRADED/DARK.
+                    ring_health     <= sched_ring_health_mask;
+                    ring_health_cnt <= sched_ring_health_cnt;
+                    ring_rct_fail   <= sched_ring_rct_fail;
+                    ring_apt_fail   <= sched_ring_apt_fail;
+                    ring_level_fail <= sched_ring_level_fail;
+                    if (sched_ring_health_cnt < HEALTH_MIN) begin
+                        // <8 rings passed -- DARK. health_fail latches permanently (POR is the only clear path). Downstream gates the wire heartbeat on this so a DARK chip goes silent rather than lying about its capability.
+                        health_fail <= 1'b1;
+                    end else begin
+                        // 8..16 healthy rings -- entropy sound. The buffer can be conditioned; ring_health_cnt feeds attestation so the host learns the degradation level.
+                        gather_done <= 1'b1;
+                    end
+                    state <= ST_DONE;
+                end
+
+                ST_DONE: begin
+                    busy  <= 1'b0;
+                    state <= ST_IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// FILE: ring_scheduler.v
+// ============================================================================
+
+// =============================================================================
+// ring_scheduler.v -- round-robin per-ring health gather (Claim 3c, Variant A)
+// =============================================================================
+//
+// Wraps a single instance of ring_health.v and schedules it across all 16 rings sequentially. For each ring i in 0..15:
+//
+//   1. ring_enable = one-hot(i)            -- enable only ring i
+//   2. wait ENABLE_DELAY cycles            -- let oscillator settle
+//   3. pulse start, wait for done          -- full W=65536 sample gather
+//   4. latch ring_health_mask[i] = healthy
+//   5. advance to ring (i+1) mod 16
+//
+// After ring 15 completes, ring_health_cnt is the sum of the 16 verdicts. all_done pulses one cycle when the full 16-ring schedule completes.
+//
+// Total time per gather: 16 * (W + ENABLE_DELAY + ~3 FSM cycles) ~= 16*W. At enclave_clk = 600 kHz that is ~1.75 s per full KOHI ceremony.
+//
+// Silicon cost is one ring_health.v instance + a small FSM + a 16-bit mask register: roughly an order of magnitude smaller than 16 parallel instances.
+//
+// Sample-stream output: sample_bit / sample_valid feed downstream (BLAKE3 conditioner) one bit per cycle whenever a per-ring gather is in progress. The downstream consumer sees 16*W bits total per KOHI, streamed sequentially per ring.
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module ring_scheduler #(
+    parameter integer N_RINGS      = 16,
+    parameter integer W            = 65536,   // samples per ring
+    parameter integer ENABLE_DELAY = 8,       // cycles between ring_enable and start
+    parameter integer RCT_C        = 32,
+    parameter integer APT_W        = 1024,
+    parameter integer APT_T        = 614,
+    parameter integer LVL_LO       = 32000,
+    parameter integer LVL_HI       = 33536
+) (
+    input  wire                clk,
+    input  wire                reset_n,
+    input  wire                start,         // 1-cycle pulse to begin a full KOHI
+
+    input  wire [N_RINGS-1:0]  ring_in,       // 16 ring oscillator outputs
+    output reg  [N_RINGS-1:0]  ring_enable,   // one-hot mask of currently-active ring
+
+    output wire                sample_bit,    // currently-active ring's sample
+    output wire                sample_valid,  // high while gathering
+
+    output reg                 busy,
+    output reg                 all_done,      // 1-cycle pulse: full schedule done
+    output reg  [N_RINGS-1:0]  ring_health_mask, // bit i = ring i healthy
+    output reg  [4:0]          ring_health_cnt,  // popcount of mask (0..16)
+    // Diagnostic surface -- per-ring failure reasons, valid after all_done
+    output reg  [N_RINGS-1:0]  ring_rct_fail,    // bit i = ring i tripped RCT
+    output reg  [N_RINGS-1:0]  ring_apt_fail,    // bit i = ring i tripped APT
+    output reg  [N_RINGS*7-1:0] ring_level_fail  // 7 bits per ring, K+1=7 levels
+);
+
+    localparam integer IDX_W = (N_RINGS <= 1) ? 1 : $clog2(N_RINGS);
+
+    // -------------------------------------------------------------------------
+    // Shared ring_health instance. Caller (e.g., trng.v) is responsible for 2-FF synchronizing each ring input upstream of `ring_in`.
+    // -------------------------------------------------------------------------
+    reg  [IDX_W-1:0] ring_idx;
+    wire             current_sample = ring_in[ring_idx];
+    reg              rh_start;
+    wire             rh_done;
+    wire             rh_healthy;
+    wire             rh_rct_fail;
+    wire             rh_apt_fail;
+    wire [6:0]       rh_level_fail_mask;
+
+    ring_health #(
+        .W      (W),
+        .RCT_C  (RCT_C),
+        .APT_W  (APT_W),
+        .APT_T  (APT_T),
+        .LVL_LO (LVL_LO),
+        .LVL_HI (LVL_HI)
+    ) rh (
+        .clk             (clk),
+        .reset_n         (reset_n),
+        .start           (rh_start),
+        .sample          (current_sample),
+        .done            (rh_done),
+        .healthy         (rh_healthy),
+        .rct_fail_out    (rh_rct_fail),
+        .apt_fail_out    (rh_apt_fail),
+        .level_fail_mask (rh_level_fail_mask)
+    );
+
+    // -------------------------------------------------------------------------
+    // Scheduler FSM
+    // -------------------------------------------------------------------------
+    localparam [2:0] ST_IDLE   = 3'd0,
+                     ST_SETTLE = 3'd1,
+                     ST_LAUNCH = 3'd2,
+                     ST_GATHER = 3'd3,
+                     ST_LATCH  = 3'd4,
+                     ST_FINISH = 3'd5;
+    reg [2:0]  state;
+    reg [3:0]  settle_cnt;
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            state            <= ST_IDLE;
+            ring_idx         <= {IDX_W{1'b0}};
+            settle_cnt       <= 4'd0;
+            rh_start         <= 1'b0;
+            ring_enable      <= {N_RINGS{1'b0}};
+            ring_health_mask <= {N_RINGS{1'b0}};
+            ring_health_cnt  <= 5'd0;
+            busy             <= 1'b0;
+            all_done         <= 1'b0;
+            ring_rct_fail    <= {N_RINGS{1'b0}};
+            ring_apt_fail    <= {N_RINGS{1'b0}};
+            ring_level_fail  <= {(N_RINGS*7){1'b0}};
+        end else begin
+            rh_start <= 1'b0;
+            all_done <= 1'b0;
+            case (state)
+
+                ST_IDLE: begin
+                    busy <= 1'b0;
+                    if (start) begin
+                        busy             <= 1'b1;
+                        ring_idx         <= {IDX_W{1'b0}};
+                        ring_enable      <= {{(N_RINGS-1){1'b0}}, 1'b1};  // one-hot ring 0
+                        ring_health_mask <= {N_RINGS{1'b0}};
+                        ring_health_cnt  <= 5'd0;
+                        ring_rct_fail    <= {N_RINGS{1'b0}};
+                        ring_apt_fail    <= {N_RINGS{1'b0}};
+                        ring_level_fail  <= {(N_RINGS*7){1'b0}};
+                        settle_cnt       <= ENABLE_DELAY[3:0];
+                        state            <= ST_SETTLE;
+                    end
+                end
+
+                ST_SETTLE: begin
+                    if (settle_cnt == 4'd0) begin
+                        state <= ST_LAUNCH;
+                    end else begin
+                        settle_cnt <= settle_cnt - 4'd1;
+                    end
+                end
+
+                ST_LAUNCH: begin
+                    rh_start <= 1'b1;       // pulse start to ring_health
+                    state    <= ST_GATHER;
+                end
+
+                ST_GATHER: begin
+                    if (rh_done) begin
+                        ring_health_mask[ring_idx] <= rh_healthy;
+                        ring_rct_fail[ring_idx]    <= rh_rct_fail;
+                        ring_apt_fail[ring_idx]    <= rh_apt_fail;
+                        ring_level_fail[ring_idx*7 +: 7] <= rh_level_fail_mask;
+                        state <= ST_LATCH;
+                    end
+                end
+
+                ST_LATCH: begin
+                    if (ring_idx == N_RINGS[IDX_W-1:0] - {{(IDX_W-1){1'b0}}, 1'b1}) begin
+                        // we just finished ring (N_RINGS-1) -- move to FINISH
+                        ring_enable <= {N_RINGS{1'b0}};
+                        state       <= ST_FINISH;
+                    end else begin
+                        ring_idx    <= ring_idx + {{(IDX_W-1){1'b0}}, 1'b1};
+                        ring_enable <= {{(N_RINGS-1){1'b0}}, 1'b1} << (ring_idx + {{(IDX_W-1){1'b0}}, 1'b1});
+                        settle_cnt  <= ENABLE_DELAY[3:0];
+                        state       <= ST_SETTLE;
+                    end
+                end
+
+                ST_FINISH: begin
+                    ring_health_cnt <= popcount_n(ring_health_mask);
+                    all_done        <= 1'b1;
+                    state           <= ST_IDLE;
+                end
+
+                default: state <= ST_IDLE;
+            endcase
+        end
+    end
+
+    // popcount of an N_RINGS-bit vector, returns 5 bits (sufficient for N<=31)
+    function [4:0] popcount_n;
+        input [N_RINGS-1:0] v;
+        integer pi;
+        begin
+            popcount_n = 5'd0;
+            for (pi = 0; pi < N_RINGS; pi = pi + 1)
+                popcount_n = popcount_n + {4'd0, v[pi]};
+        end
+    endfunction
+
+    // -------------------------------------------------------------------------
+    // Sample-stream output
+    // -------------------------------------------------------------------------
+    assign sample_bit   = current_sample;
+    assign sample_valid = (state == ST_GATHER);
+
+endmodule
+
+// ============================================================================
+// FILE: ring_health.v
+// ============================================================================
+
+// =============================================================================
+// ring_health.v -- per-ring TRNG health monitor (Claim 3c, layered)
+// =============================================================================
+//
+// Three concurrent checks per ring. Ring is declared healthy iff all pass:
+//
+//   1. RCT -- NIST SP 800-90B Repetition Count Test. Instantaneous max-run detector. rct_fail latches if any run of identical samples exceeds RCT_C cycles.
+//
+//   2. APT -- NIST SP 800-90B Adaptive Proportion Test. Windowed bias detector with sliding window of APT_W=1024 samples. apt_ref is captured as the first sample of each window; apt_count counts occurrences of apt_ref over the window; apt_fail latches if apt_count > APT_T for any window in the gather.
+//
+//   3. Iterated GF(2) differencing -- K-level predictability detector. level_sample[0] = current sample level_sample[k] = level_sample[k-1] XOR level_prev[k-1]   (for k >= 1) Each level has its own popcount counter; at end-of-gather, every level's popcount must lie in [LVL_LO, LVL_HI]. Periodic patterns of period <= 2^K manifest as a level-k popcount far from W/2 at some k <= K.
+//
+// W samples per gather. First K samples are warmup (level prev chain fills up); popcount accumulators start on cycle K+1. Total accumulated samples per level = W - K = 65530 for default params, statistically indistinguishable from W under +/- 6sigma tolerance.
+//
+// Caller contract:
+//   - `sample` is the already-synchronized ring output (2-FF sync upstream)
+//   - assert `start` for exactly one cycle to begin a gather
+//   - sample is valid every cycle while gather is in progress
+//   - `done` pulses one cycle when gather completes; `healthy` is valid that cycle
+//   - module returns to idle, ready for next `start`
+//
+// Defaults (W=65536, K=6, LVL_LO/HI = W/2 +/- 768) match the existing TRNG gather length in trng.v. Override parameters to retune.
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module ring_health #(
+    parameter integer W       = 65536,    // gather window (samples)
+    parameter integer K       = 6,        // iterated diff levels
+    parameter integer RCT_C   = 32,       // max run length before RCT fails
+    parameter integer APT_W   = 1024,     // APT window
+    parameter integer APT_T   = 614,      // APT cutoff (W=1024, H=1, alpha=2^-30)
+    parameter integer LVL_LO  = 32000,    // level popcount lower bound
+    parameter integer LVL_HI  = 33536     // level popcount upper bound
+) (
+    input  wire clk,
+    input  wire reset_n,
+    input  wire start,                    // 1-cycle pulse to begin gather
+    input  wire sample,                   // 1-bit ring sample this cycle
+    output reg  done,                     // 1-cycle pulse at end of gather
+    output reg  healthy,                  // valid in cycle of done
+    // Diagnostic surface (valid in cycle of done; unused ports default to wire)
+    output reg          rct_fail_out,     // RCT (Repetition Count Test) tripped
+    output reg          apt_fail_out,     // APT (Adaptive Proportion Test) tripped
+    output reg  [K:0]   level_fail_mask   // bit k set if level k popcount out of range
+);
+
+    // -------------------------------------------------------------------------
+    // FSM
+    // -------------------------------------------------------------------------
+    localparam [1:0] ST_IDLE   = 2'd0,
+                     ST_GATHER = 2'd1,
+                     ST_DONE   = 2'd2;
+    reg [1:0]  state;
+    reg [16:0] sample_cnt;
+
+    // -------------------------------------------------------------------------
+    // RCT
+    // -------------------------------------------------------------------------
+    reg [6:0] rct_run;
+    reg       rct_prev;
+    reg       rct_fail;
+
+    // -------------------------------------------------------------------------
+    // APT
+    // -------------------------------------------------------------------------
+    reg [9:0]  apt_pos;
+    reg [10:0] apt_count;
+    reg        apt_ref;
+    reg        apt_fail;
+
+    // -------------------------------------------------------------------------
+    // Iterated GF(2) differencing -- K+1 levels (indices 0..K)
+    // -------------------------------------------------------------------------
+    wire [K:0]  level_sample;
+    reg  [K:0]  level_prev;
+    reg  [16:0] level_pop [0:K];
+    reg  [3:0]  warmup_cnt;
+    wire        warmup_done = (warmup_cnt >= K[3:0]);
+
+    assign level_sample[0] = sample;
+    genvar gk;
+    generate
+        for (gk = 1; gk <= K; gk = gk + 1) begin : g_level_xor
+            assign level_sample[gk] = level_sample[gk-1] ^ level_prev[gk-1];
+        end
+    endgenerate
+
+    // Per-level range check (combinational, valid at end of gather)
+    wire [K:0] level_in_range;
+    generate
+        for (gk = 0; gk <= K; gk = gk + 1) begin : g_level_range
+            assign level_in_range[gk] = (level_pop[gk] >= LVL_LO[16:0])
+                                     && (level_pop[gk] <= LVL_HI[16:0]);
+        end
+    endgenerate
+    wire all_levels_pass = &level_in_range;
+
+    // -------------------------------------------------------------------------
+    // Main always
+    // -------------------------------------------------------------------------
+    integer k_i;
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            state       <= ST_IDLE;
+            sample_cnt  <= 17'd0;
+            rct_run     <= 7'd0;
+            rct_prev    <= 1'b0;
+            rct_fail    <= 1'b0;
+            apt_pos     <= 10'd0;
+            apt_count   <= 11'd0;
+            apt_ref     <= 1'b0;
+            apt_fail    <= 1'b0;
+            level_prev  <= {(K+1){1'b0}};
+            for (k_i = 0; k_i <= K; k_i = k_i + 1)
+                level_pop[k_i] <= 17'd0;
+            warmup_cnt  <= 4'd0;
+            done        <= 1'b0;
+            healthy     <= 1'b0;
+            rct_fail_out    <= 1'b0;
+            apt_fail_out    <= 1'b0;
+            level_fail_mask <= {(K+1){1'b0}};
+        end else begin
+            done <= 1'b0;
+            case (state)
+
+                ST_IDLE: begin
+                    if (start) begin
+                        state       <= ST_GATHER;
+                        sample_cnt  <= 17'd0;
+                        rct_run     <= 7'd0;
+                        rct_prev    <= 1'b0;
+                        rct_fail    <= 1'b0;
+                        apt_pos     <= 10'd0;
+                        apt_count   <= 11'd0;
+                        apt_ref     <= 1'b0;
+                        apt_fail    <= 1'b0;
+                        level_prev  <= {(K+1){1'b0}};
+                        for (k_i = 0; k_i <= K; k_i = k_i + 1)
+                            level_pop[k_i] <= 17'd0;
+                        warmup_cnt  <= 4'd0;
+                        healthy     <= 1'b0;
+                    end
+                end
+
+                ST_GATHER: begin
+                    // ---- RCT ----
+                    if (sample_cnt == 17'd0) begin
+                        // first sample seeds the run
+                        rct_prev <= sample;
+                        rct_run  <= 7'd1;
+                    end else if (sample == rct_prev) begin
+                        rct_run <= rct_run + 7'd1;
+                        if (rct_run + 7'd1 > RCT_C[6:0])
+                            rct_fail <= 1'b1;
+                    end else begin
+                        rct_run  <= 7'd1;
+                        rct_prev <= sample;
+                    end
+
+                    // ---- APT ----
+                    if (apt_pos == 10'd0) begin
+                        // capture new ref, start counting (self matches self)
+                        apt_ref   <= sample;
+                        apt_count <= 11'd1;
+                        apt_pos   <= 10'd1;
+                    end else if (apt_pos == APT_W[9:0]-10'd1) begin
+                        // end of APT window
+                        if (apt_count + ((sample == apt_ref) ? 11'd1 : 11'd0)
+                            > APT_T[10:0])
+                            apt_fail <= 1'b1;
+                        apt_pos <= 10'd0;   // next cycle captures new ref
+                    end else begin
+                        apt_pos   <= apt_pos + 10'd1;
+                        apt_count <= apt_count +
+                                     ((sample == apt_ref) ? 11'd1 : 11'd0);
+                    end
+
+                    // ---- Iterated GF(2) diff ----
+                    // shift current level_sample[*] into level_prev[*]
+                    for (k_i = 0; k_i <= K; k_i = k_i + 1)
+                        level_prev[k_i] <= level_sample[k_i];
+
+                    // accumulate popcounts only after warmup
+                    if (warmup_done) begin
+                        for (k_i = 0; k_i <= K; k_i = k_i + 1)
+                            if (level_sample[k_i])
+                                level_pop[k_i] <= level_pop[k_i] + 17'd1;
+                    end else begin
+                        warmup_cnt <= warmup_cnt + 4'd1;
+                    end
+
+                    // ---- end-of-gather ----
+                    if (sample_cnt == W[16:0] - 17'd1) begin
+                        // evaluate verdict
+                        done    <= 1'b1;
+                        healthy <= !rct_fail
+                                && !apt_fail
+                                && all_levels_pass;
+                        rct_fail_out    <= rct_fail;
+                        apt_fail_out    <= apt_fail;
+                        level_fail_mask <= ~level_in_range;
+                        state   <= ST_DONE;
+                    end else begin
+                        sample_cnt <= sample_cnt + 17'd1;
+                    end
+                end
+
+                ST_DONE: begin
+                    state <= ST_IDLE;
+                end
+
+                default: state <= ST_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// FILE: ira_fsm.v
+// ============================================================================
+
+// =============================================================================
+// ira_fsm.v -- KOHI -> BLAKE3 -> TAHU provisioning orchestrator
+// =============================================================================
+//
+// Top-level state machine that ties together the entropy + conditioner + OTP storage modules into a complete `ira` provisioning ceremony, per IRA.md Sec."KOHI -- gather", Sec."TAHU -- burn".
+//
+// This module owns the *sequencing* of provisioning; it does NOT own:
+//   - the rings (live in top.v, fed into trng.ring_in)
+//   - the trng buffer (lives in trng.v)
+//   - the blake3 core (lives in blake3_tree.v)
+//   - the OTP slot storage (lives in otp.v)
+//   - the pair classification (lives in inverted_pair_verify.v, combinational)
+//
+// It observes `chip_state` from inverted_pair_verify (which sees the OTP slots live) and reacts:
+//
+//   state=0 KORE  + provision_request -> run ceremony
+//   state=1 DARK                       -> assert chip_dark, idle
+//   state>=2 DEGRADED/HEALTHY              -> chip is provisioned; nothing to do
+//
+// First-cut scope (this commit):
+//   - KOHI: pulse trng_start, wait for gather_done or health_fail
+//   - BLAKE3: pulse blake3_start, capture 256-bit ira_seed
+//   - TAHU: burn slots 0..3 (A=ira_seed), then 4..7 (B=~ira_seed)
+//   - No TATARI delay (TODO: add the BLAKE3-derived 256-1280 ms random pause)
+//   - No per-burn read-back verify (the next power cycle's classifier read naturally validates each pair; partial burns surface as DARK next boot)
+//   - No wairua orchestration (separate FSM later, but sharing this module's trng/blake3 instances via the same arbiter pattern)
+//
+// chip_dark is asserted when:
+//   - boot-time state == DARK (e.g., previous TAHU was interrupted), OR
+//   - trng.health_fail latches during this boot's KOHI, OR
+//   - an OTP burn is rejected (write to already-burned slot -- shouldn't happen on a fresh KORE device; latches DARK defensively)
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module ira_fsm (
+    input  wire         clk,                 // enclave_clk
+    input  wire         reset_n,
+
+    // External trigger -- pulse to start provisioning. Honored only when chip_state == KORE. Ignored otherwise (no-op).
+    input  wire         provision_request,
+
+    // Live classifier output (combinational from inverted_pair_verify)
+    input  wire [2:0]   chip_state,          // 0=KORE, 1=DARK, 2..4=operating
+    input  wire         byzantine_ok,
+
+    // trng.v handshake
+    output reg          trng_start,
+    input  wire         trng_busy,
+    input  wire         trng_gather_done,
+    input  wire         trng_health_fail,
+
+    // blake3_tree.v handshake
+    output reg          blake3_start,
+    input  wire         blake3_busy,
+    input  wire         blake3_ira_valid,
+    input  wire [255:0] blake3_ira,
+
+    // otp.v burn interface
+    output reg  [2:0]   otp_write_addr,
+    output reg  [255:0] otp_write_data,
+    output reg          otp_write_enable,
+    input  wire         otp_write_done,
+    input  wire         otp_write_rejected,
+
+    // Outputs to the rest of the chip
+    output reg          chip_dark,         // gate for codec's tx_drive_enable
+    output reg          ceremony_busy,       // high during KOHI/BLAKE3/TAHU
+    output reg          ceremony_done,       // 1-cycle pulse when TAHU completes
+    output reg  [2:0]   fsm_state            // debug observability
+);
+
+    // -------------------------------------------------------------------------
+    // FSM states
+    // -------------------------------------------------------------------------
+    localparam [2:0]
+        ST_OBSERVE  = 3'd0,   // idle; gate chip_dark from chip_state
+        ST_KOHI     = 3'd1,   // trng running
+        ST_BLAKE3   = 3'd2,   // blake3_tree conditioning
+        ST_TAHU_A   = 3'd3,   // burn slots 0..3 (A = ira_seed)
+        ST_TAHU_B   = 3'd4,   // burn slots 4..7 (B = ~ira_seed)
+        ST_DONE     = 3'd5,   // pulse ceremony_done, settle, return to OBSERVE
+        ST_SETTLE   = 3'd6,   // wait for verify to complete fresh post-burn sweeps
+        ST_DARK   = 3'd7;   // latched failure; never leaves until POR
+
+    // Wait long enough after TAHU for inverted_pair_verify to complete at least two full sweeps on the new (post-burn) slot_flat data. Sweep is 257 cycles; 1024 covers four sweeps comfortably and avoids any mid-sweep mismatched-latched-output transient propagating into a false ST_DARK transition.
+    localparam [9:0] SETTLE_CYCLES = 10'd1023;
+    reg [9:0]        settle_cnt;
+
+    // -------------------------------------------------------------------------
+    // Internal registers
+    // -------------------------------------------------------------------------
+    reg [255:0] ira_seed;      // captured from blake3_tree
+    reg [1:0]   burn_idx;      // 0..3 within ST_TAHU_A or ST_TAHU_B
+    reg         awaiting_burn; // high between write_enable pulse and write_done
+
+    // Boot-time DARK detection: if we power up with chip_state == DARK (a previous burn was interrupted), latch chip_dark permanently.
+    // This is observed combinationally from chip_state.
+    wire boot_dark = (chip_state == 3'd1);
+
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            fsm_state        <= ST_OBSERVE;
+            trng_start       <= 1'b0;
+            blake3_start     <= 1'b0;
+            otp_write_addr   <= 3'b0;
+            otp_write_data   <= 256'b0;
+            otp_write_enable <= 1'b0;
+            chip_dark      <= 1'b0;
+            ceremony_busy    <= 1'b0;
+            ceremony_done    <= 1'b0;
+            ira_seed         <= 256'b0;
+            burn_idx         <= 2'b0;
+            awaiting_burn    <= 1'b0;
+            settle_cnt       <= 10'b0;
+        end else begin
+            // Default deassertions (one-cycle strobes)
+            trng_start       <= 1'b0;
+            blake3_start     <= 1'b0;
+            otp_write_enable <= 1'b0;
+            ceremony_done    <= 1'b0;
+
+            case (fsm_state)
+                // ----------------------------------------------------------
+                // ST_OBSERVE: idle. Pass DARK through to chip_dark. If KORE + provision_request, kick off the ceremony.
+                // ----------------------------------------------------------
+                ST_OBSERVE: begin
+                    ceremony_busy <= 1'b0;
+                    chip_dark   <= boot_dark;
+                    if (boot_dark) begin
+                        fsm_state <= ST_DARK;
+                    end else if ((chip_state == 3'd0) && provision_request) begin
+                        // KORE + request -> kick off KOHI
+                        trng_start    <= 1'b1;
+                        ceremony_busy <= 1'b1;
+                        fsm_state     <= ST_KOHI;
+                    end
+                end
+
+                // ----------------------------------------------------------
+                // ST_KOHI: wait for trng.gather_done (success) or trng.health_fail (broken silicon -> DARK).
+                // ----------------------------------------------------------
+                ST_KOHI: begin
+                    if (trng_health_fail) begin
+                        chip_dark <= 1'b1;
+                        fsm_state   <= ST_DARK;
+                    end else if (trng_gather_done) begin
+                        blake3_start <= 1'b1;
+                        fsm_state    <= ST_BLAKE3;
+                    end
+                end
+
+                // ----------------------------------------------------------
+                // ST_BLAKE3: wait for the conditioner to produce ira_seed.
+                // ----------------------------------------------------------
+                ST_BLAKE3: begin
+                    if (blake3_ira_valid) begin
+                        ira_seed <= blake3_ira;
+                        burn_idx <= 2'b0;
+                        fsm_state <= ST_TAHU_A;
+                    end
+                end
+
+                // ----------------------------------------------------------
+                // ST_TAHU_A: burn slots 0, 1, 2, 3 with ira_seed.
+                // For each slot: pulse write_enable, wait write_done.
+                // ----------------------------------------------------------
+                ST_TAHU_A: begin
+                    if (!awaiting_burn) begin
+                        otp_write_addr   <= {1'b0, burn_idx};
+                        otp_write_data   <= ira_seed;
+                        otp_write_enable <= 1'b1;
+                        awaiting_burn    <= 1'b1;
+                    end else if (otp_write_done) begin
+                        awaiting_burn <= 1'b0;
+                        if (burn_idx == 2'd3) begin
+                            burn_idx  <= 2'b0;
+                            fsm_state <= ST_TAHU_B;
+                        end else begin
+                            burn_idx <= burn_idx + 2'd1;
+                        end
+                    end else if (otp_write_rejected) begin
+                        // Slot was already burned -- should be impossible on a fresh KORE chip. Defensive: latch DARK.
+                        chip_dark <= 1'b1;
+                        fsm_state   <= ST_DARK;
+                    end
+                end
+
+                // ----------------------------------------------------------
+                // ST_TAHU_B: burn slots 4, 5, 6, 7 with ~ira_seed.
+                // ----------------------------------------------------------
+                ST_TAHU_B: begin
+                    if (!awaiting_burn) begin
+                        otp_write_addr   <= {1'b1, burn_idx};
+                        otp_write_data   <= ~ira_seed;
+                        otp_write_enable <= 1'b1;
+                        awaiting_burn    <= 1'b1;
+                    end else if (otp_write_done) begin
+                        awaiting_burn <= 1'b0;
+                        if (burn_idx == 2'd3) begin
+                            fsm_state <= ST_DONE;
+                        end else begin
+                            burn_idx <= burn_idx + 2'd1;
+                        end
+                    end else if (otp_write_rejected) begin
+                        chip_dark <= 1'b1;
+                        fsm_state   <= ST_DARK;
+                    end
+                end
+
+                // ----------------------------------------------------------
+                // ST_DONE: ceremony complete. Pulse ceremony_done, then move to SETTLE so the verify module has time to complete fresh post-burn sweeps on the new slot_flat data -- without this, a mid-sweep latched output (mixing OLD all-zero and NEW burned bits) reads as DARK for one sweep period and ST_OBSERVE would latch the chip into ST_DARK on that spurious transient.
+                // ----------------------------------------------------------
+                ST_DONE: begin
+                    ceremony_done <= 1'b1;
+                    settle_cnt    <= SETTLE_CYCLES;
+                    fsm_state     <= ST_SETTLE;
+                end
+
+                // ----------------------------------------------------------
+                // ST_SETTLE: hold off chip_dark / ST_DARK transitions for SETTLE_CYCLES cycles after the last OTP burn, giving inverted_pair_verify time to sweep the new slot data.
+                // chip_state may transiently read DARK during this window -- we ignore it.
+                // ----------------------------------------------------------
+                ST_SETTLE: begin
+                    if (settle_cnt == 10'b0) begin
+                        fsm_state <= ST_OBSERVE;
+                    end else begin
+                        settle_cnt <= settle_cnt - 10'd1;
+                    end
+                end
+
+                // ----------------------------------------------------------
+                // ST_DARK: terminal. Never exits except via POR.
+                // ----------------------------------------------------------
+                ST_DARK: begin
+                    chip_dark   <= 1'b1;
+                    ceremony_busy <= 1'b0;
+                end
+
+                default: fsm_state <= ST_OBSERVE;
+            endcase
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// FILE: l3_session_fsm.v
+// ============================================================================
+
+// =============================================================================
+// l3_session_fsm.v -- PROTOCOL.md Layer 3: session + Message-B exchange
+// =============================================================================
+//
+// Implements the full PROTOCOL.md L3 protocol with health queries (Claim 9c).
+// Replaces chal_resp_fsm.v with the patent-aligned protocol.
+//
+// PROTOCOL FLOW (per PROTOCOL.md):
+//
+//   FRESH SESSION (Message A):
+//     host emits `1, 0, 0, ..., 0` (256 bits)
+//     enclave:
+//       session_secret = wairua  <- KOHI -> BLAKE3-conditioner output
+//       H_req  = BLAKE3(wairua)
+//       H_resp = BLAKE3(~wairua)
+//     enclave emits 256 bits of wairua on its data stream so host syncs
+//
+//   AUTHENTICATED EXCHANGE (Message B), 512 bits each direction:
+//     host ->   X1 = message_req XOR H_req
+//              X2 = BLAKE3(message_req) XOR H_resp        (SESSION)
+//                   ~BLAKE3(message_req) XOR H_resp       (PERMANENT)
+//     enclave  recover message_req = X1 XOR H_req
+//              try both X2 invariants -> matched form determines mode
+//              active_key = wairua (SESSION) | ira (PERMANENT)
+//              [query check (Claim 9c):]
+//                if message_req == BLAKE3("Kei te ora koe?") = c0a6cabf...
+//                  -> numbytes = 64, mblock high half = state vector
+//                else -> numbytes = 32, mblock high half = 0
+//              message_resp = BLAKE3.keyed(active_key, mblock @ numbytes)
+//     enclave -> X1' = message_resp XOR H_req
+//              X2' = BLAKE3(message_resp) XOR H_resp        (SESSION echo)
+//                    ~BLAKE3(message_resp) XOR H_resp       (PERMANENT echo)
+//     both    ratchet: H_req <- BLAKE3(message_req), H_resp <- BLAKE3(message_resp)
+//
+//   ON CORRUPTION (no X2 invariant matched): silently drop exchange.
+//     Do NOT advance pads; host will desync on next exchange and issue
+//     fresh-session -> both sides re-sync.
+//
+// STATE COMPOSITION FOR Q/HEALTH (Claim 9c, "clever" embodiment):
+//
+//   When message_req == Q_HEALTH_IDENT, the chip composes the BLAKE3 input
+//   as a single 64-byte block:
+//
+//     mblock[255:0]   = message_req                (32 bytes)
+//     mblock[511:256] = state_block                (32 bytes, packed below)
+//     numbytes        = 64
+//
+//   This is still one BLAKE3 compression -- q/health responses are no slower
+//   than content commitments. The host verifies by computing the same hash
+//   over the same 64 bytes, in the same byte order.
+//
+//   state_block layout (LSB at bit 256, MSB at bit 511; reserved bits zero):
+//     [258:256] chip_state           (3 bits)
+//     [274:259] ring_health_mask     (16 bits)
+//     [279:275] ring_health_cnt      (5 bits)
+//     [287:280] slot_burned_mask     (8 bits)
+//     [290:288] fsm_state            (3 bits)
+//     [354:291] session_counter      (64 bits)   <- Message B exchanges this session
+//     [418:355] boot_epoch           (64 bits)   <- enclave_clk count since POR
+//     [482:419] drop_counter         (64 bits)   <- DROP events (lifetime)
+//     [511:483] reserved zero        (29 bits)
+//
+//   All counters are 64-bit per user instruction (chain-state visibility +
+//   integrity even during health-check responses). The state block still
+//   has 29 bits of headroom for future additions.
+//
+// =============================================================================
+
+`timescale 1ns / 1ps
+
+module l3_session_fsm (
+    input  wire         clk,
+    input  wire         reset_n,
+    input  wire         chip_alive,        // chip_state >= DEGRADED-2; gates operation
+
+    // -------------------------------------------------------------------------
+    // L2 codec interface (slot-clocked bit stream)
+    // -------------------------------------------------------------------------
+    input  wire         rx_valid,          // host slot pulse, rx_data is decoded host bit
+    input  wire         rx_data,
+    input  wire         tx_slot,           // 1-cycle pulse: enclave's slot is now
+    output reg          tx_data,           // bit to emit this enclave slot
+    output reg          tx_active,         // 1 while emitting message bits; else idle
+
+    // -------------------------------------------------------------------------
+    // Shared BLAKE3 compression core
+    // -------------------------------------------------------------------------
+    output reg  [255:0] b3_chain,
+    output reg  [511:0] b3_mblock,
+    output reg  [31:0]  b3_numbytes,
+    output reg  [31:0]  b3_dflags,
+    output reg          b3_valid,
+    input  wire [511:0] b3_hash,
+    input  wire         b3_done,
+
+    // -------------------------------------------------------------------------
+    // IRA (recovered from OTP by inverted_pair_verify)
+    // -------------------------------------------------------------------------
+    input  wire [255:0] ira_value,
+
+    // -------------------------------------------------------------------------
+    // Wairua-generation pipeline (shared with ira_fsm via top-level mux)
+    // -------------------------------------------------------------------------
+    output reg          trng_start,
+    input  wire         trng_gather_done,
+    input  wire         trng_health_fail,
+    output reg          wairua_gen_start,
+    input  wire [255:0] wairua_gen_result,
+    input  wire         wairua_gen_valid,
+
+    // -------------------------------------------------------------------------
+    // Internal-state vector inputs for q/health composition
+    // -------------------------------------------------------------------------
+    input  wire [2:0]   chip_state_in,
+    input  wire [15:0]  ring_health_mask_in,
+    input  wire [4:0]   ring_health_cnt_in,
+    input  wire [7:0]   slot_burned_mask_in,
+    input  wire [2:0]   fsm_state_in,
+
+    // -------------------------------------------------------------------------
+    // OLED + debug observability (NOT exposed on the wire)
+    //   wairua_disp     -- current wairua hex (mode 4)
+    //   session_counter -- Message B exchanges this session (64 bits; OLED shows low 32)
+    //   boot_epoch      -- enclave_clk cycles since POR (64 bits; OLED shows low 32)
+    //   drop_counter    -- DROP events lifetime (64 bits; OLED shows low 32)
+    //   h_req_finger    -- first 32 bits of current H_req (chain-state fingerprint)
+    //   h_resp_finger   -- first 32 bits of current H_resp
+    //   last_mode_perm  -- 1 if last successful exchange was PERMANENT, 0 if SESSION
+    //   last_was_query  -- 1 if last successful exchange matched Q_HEALTH_IDENT
+    //   session_valid_o -- 1 if pads are derived and ready for Message B
+    //   fsm_state_debug -- current FSM state (one of ST_*)
+    // -------------------------------------------------------------------------
+    output reg  [255:0] wairua_disp,
+    output reg  [63:0]  session_counter,
+    output reg  [63:0]  boot_epoch,
+    output reg  [63:0]  drop_counter,
+    output wire [31:0]  h_req_finger,
+    output wire [31:0]  h_resp_finger,
+    output reg          last_mode_perm,
+    output reg          last_was_query,
+    output wire         session_valid_o,
+    output reg  [4:0]   fsm_state_debug
+);
+
+    assign h_req_finger    = h_req[255:224];   // top 32 bits as fingerprint
+    assign h_resp_finger   = h_resp[255:224];
+    assign session_valid_o = session_valid;
+
+    // =========================================================================
+    // BLAKE3 constants
+    // =========================================================================
+    localparam [255:0] BLAKE3_IV = {
+        32'h5be0cd19, 32'h1f83d9ab, 32'h9b05688c, 32'h510e527f,
+        32'ha54ff53a, 32'h3c6ef372, 32'hbb67ae85, 32'h6a09e667
+    };
+    localparam [31:0] FLG_PLAIN_LEAF  = 32'h0B;   // CHUNK_START|END|ROOT
+    localparam [31:0] FLG_KEYED_LEAF  = 32'h1B;   // | KEYED_HASH
+
+    // BLAKE3("Kei te ora koe?") -- verified across blake3-py, b3sum CLI, and BLAKE3 official test vectors. See patent/claims.md Claim 9c.
+    localparam [255:0] Q_HEALTH_IDENT = {
+        32'hc0a6cabf, 32'h9f69f2af, 32'hf78b5115, 32'h1e9300cd,
+        32'h5bd32dfb, 32'hbecf5506, 32'h00625478, 32'hffee8e80
+    };
+
+    // Fresh-session detection pattern. The wire shape is: frame-1, then 256 zeros. The frame-1 is consumed by ST_IDLE without shifting (Claim 12a leading-edge marker), so rx_buf1 ends up holding the 256-bit payload = all zeros. Probability of a Message-B X1 accidentally matching: 2^-^2^5^6.
+    localparam [255:0] MSG_A_PATTERN = 256'b0;
+
+    // =========================================================================
+    // Session state (PROTOCOL.md L3)
+    // =========================================================================
+    reg [255:0] wairua_reg;
+    reg [255:0] h_req;
+    reg [255:0] h_resp;
+    reg         session_valid;            // 1 = wairua + pads derived
+
+    // =========================================================================
+    // Per-exchange working registers
+    // =========================================================================
+    reg [255:0] rx_buf1;                  // Message A or X1 of Message B
+    reg [255:0] rx_buf2;                  // X2 of Message B
+    reg [255:0] message_req_reg;
+    reg [255:0] message_resp_reg;
+    reg [255:0] tx_buf1;                  // X1' = message_resp XOR H_req
+    reg [255:0] tx_buf2;                  // X2' = BLAKE3(message_resp) XOR H_resp (mode-mirrored)
+    reg [255:0] resp_hash_reg;            // BLAKE3(message_resp), saved for X2' compose + ratchet
+    reg [255:0] req_hash_reg;             // BLAKE3(message_req), saved for ratchet
+    reg         mode_permanent;           // 0 = SESSION, 1 = PERMANENT
+    reg         is_query;
+    reg [8:0]   rx_bit_cnt;
+    reg [9:0]   tx_bit_cnt;
+    reg [8:0]   fs_tx_cnt;                // counter for fresh-session emit of wairua
+    reg         fs_frame_sent;            // 0 until the leading frame-1 has been emitted
+    reg         tx_frame_sent;            // same, for Message B response
+
+    // =========================================================================
+    // FSM
+    // =========================================================================
+    localparam [4:0]
+        ST_IDLE         = 5'd0,
+        ST_RX_BUF1      = 5'd1,
+        ST_DECIDE       = 5'd2,
+        ST_FS_KOHI      = 5'd3,
+        ST_FS_COND      = 5'd4,
+        ST_FS_HREQ_REQ  = 5'd5,    // issue BLAKE3(wairua)
+        ST_FS_HREQ_WAIT = 5'd6,    // wait for done, capture into h_req
+        ST_FS_HRESP_REQ = 5'd7,
+        ST_FS_HRESP_WAIT= 5'd8,
+        ST_FS_EMIT      = 5'd9,
+        ST_RX_BUF2      = 5'd10,
+        ST_MODE_REQ     = 5'd11,   // issue BLAKE3(message_req) for mode detect
+        ST_MODE_WAIT    = 5'd12,   // wait + capture; check both invariants
+        ST_RESP_REQ     = 5'd13,   // issue BLAKE3.keyed(active_key, mblock)
+        ST_RESP_WAIT    = 5'd14,
+        ST_RESPH_REQ    = 5'd15,   // issue BLAKE3(message_resp) for X2'
+        ST_RESPH_WAIT   = 5'd16,
+        ST_TX_EMIT      = 5'd17,   // emit 512 enclave bits
+        ST_RATCHET_QREQ = 5'd18,   // issue BLAKE3(message_req) for new H_req
+        ST_RATCHET_QWAIT= 5'd19,
+        ST_RATCHET_PREQ = 5'd20,   // issue BLAKE3(message_resp) for new H_resp
+        ST_RATCHET_PWAIT= 5'd21,
+        ST_DROP         = 5'd22;
+
+    reg [4:0] state;
+    always @* fsm_state_debug = state;
+
+    // =========================================================================
+    // Derived combinationals
+    // =========================================================================
+    wire is_msg_a    = (rx_buf1 == MSG_A_PATTERN);
+
+    // State block for q/health (Claim 9c clever embodiment).
+    // 32 bytes packed into the high half of the BLAKE3 mblock, low-to-high bit ordering as documented at top of file. All counters 64-bit for chain-state visibility and integrity even during health-check responses -- host verifier can reconstruct exactly.
+    wire [255:0] state_block = {
+        29'b0,                  // [255:227] reserved zero
+        drop_counter,           // [226:163] DROP events lifetime
+        boot_epoch,             // [162:99]  enclave_clk cycles since POR
+        session_counter,        // [98:35]   Message B exchanges this session
+        fsm_state_in,           // [34:32]   fsm_state (3 bits)
+        slot_burned_mask_in,    // [31:24]   slot_burned_mask (8 bits)
+        ring_health_cnt_in,     // [23:19]   ring_health_cnt (5 bits)
+        ring_health_mask_in,    // [18:3]    ring_health_mask (16 bits)
+        chip_state_in           // [2:0]     chip_state (3 bits)
+    };
+
+    // Active-key selector based on detected mode.
+    wire [255:0] active_key = mode_permanent ? ira_value : wairua_reg;
+
+    // Test-and-capture wires for the two X2 invariants.
+    wire [255:0] expected_x2_session    = b3_hash[255:0] ^ h_resp;
+    wire [255:0] expected_x2_permanent  = (~b3_hash[255:0]) ^ h_resp;
+    wire         x2_match_session       = (expected_x2_session   == rx_buf2);
+    wire         x2_match_permanent     = (expected_x2_permanent == rx_buf2);
+
+    // =========================================================================
+    // Main always block
+    // =========================================================================
+    always @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            state             <= ST_IDLE;
+            wairua_reg        <= 256'b0;
+            h_req             <= 256'b0;
+            h_resp            <= 256'b0;
+            session_valid     <= 1'b0;
+            rx_buf1           <= 256'b0;
+            rx_buf2           <= 256'b0;
+            message_req_reg   <= 256'b0;
+            message_resp_reg  <= 256'b0;
+            tx_buf1           <= 256'b0;
+            tx_buf2           <= 256'b0;
+            resp_hash_reg     <= 256'b0;
+            req_hash_reg      <= 256'b0;
+            mode_permanent    <= 1'b0;
+            is_query          <= 1'b0;
+            rx_bit_cnt        <= 9'b0;
+            tx_bit_cnt        <= 10'b0;
+            fs_tx_cnt         <= 9'b0;
+            tx_data           <= 1'b0;
+            tx_active         <= 1'b0;
+            b3_valid          <= 1'b0;
+            b3_chain          <= 256'b0;
+            b3_mblock         <= 512'b0;
+            b3_numbytes       <= 32'b0;
+            b3_dflags         <= 32'b0;
+            trng_start        <= 1'b0;
+            wairua_gen_start  <= 1'b0;
+            wairua_disp       <= 256'b0;
+            session_counter   <= 64'b0;
+            boot_epoch        <= 64'b0;
+            drop_counter      <= 64'b0;
+            last_mode_perm    <= 1'b0;
+            last_was_query    <= 1'b0;
+            fs_frame_sent     <= 1'b0;
+            tx_frame_sent     <= 1'b0;
+        end else begin
+            // Default one-cycle strobes
+            b3_valid           <= 1'b0;
+            trng_start         <= 1'b0;
+            wairua_gen_start   <= 1'b0;
+
+            // Free-running enclave_clk counter for time-since-POR.
+            // 64 bits at 25 MHz = ~23,000 years; will never wrap in practice.
+            boot_epoch <= boot_epoch + 64'd1;
+
+            case (state)
+
+                // -----------------------------------------------------------
+                // IDLE -- wait for chip_alive, then watch host stream for first 1 bit.
+                // -----------------------------------------------------------
+                ST_IDLE: begin
+                    tx_data   <= 1'b0;
+                    tx_active <= 1'b0;
+                    if (chip_alive && rx_valid && rx_data) begin
+                        // Got the framing 1. It is NOT part of the message -- it is Claim 12a's leading-edge marker that says "the host is leaving idle, the next 256/512 bits are the payload." Don't shift it into rx_buf1; just consume it and start the buffer empty.
+                        rx_buf1     <= 256'b0;
+                        rx_bit_cnt  <= 9'd0;
+                        state       <= ST_RX_BUF1;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // RX_BUF1 -- shift in 256 host bits MSB-first.
+                // -----------------------------------------------------------
+                ST_RX_BUF1: begin
+                    if (rx_valid) begin
+                        rx_buf1    <= {rx_buf1[254:0], rx_data};
+                        rx_bit_cnt <= rx_bit_cnt + 9'd1;
+                        if (rx_bit_cnt == 9'd255) begin
+                            state <= ST_DECIDE;
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // DECIDE -- Message A or start of Message B.
+                // -----------------------------------------------------------
+                ST_DECIDE: begin
+                    if (is_msg_a) begin
+                        // Fresh-session. Begin KOHI for wairua.
+                        trng_start <= 1'b1;
+                        state      <= ST_FS_KOHI;
+                    end else begin
+                        // rx_buf1 holds X1 of Message B. Buffer 256 more for X2.
+                        rx_bit_cnt <= 9'b0;
+                        state      <= ST_RX_BUF2;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // FS_KOHI -- wait TRNG gather done; fire conditioner.
+                // -----------------------------------------------------------
+                ST_FS_KOHI: begin
+                    if (trng_health_fail) begin
+                        // Entropy source dead -> silent-wire per Claim 9a.
+                        // Don't actually drive silence here (that's top-level), just drop and stop trying.
+                        state <= ST_DROP;
+                    end else if (trng_gather_done) begin
+                        wairua_gen_start <= 1'b1;
+                        state            <= ST_FS_COND;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // FS_COND -- wait conditioner; capture wairua.
+                // -----------------------------------------------------------
+                ST_FS_COND: begin
+                    if (wairua_gen_valid) begin
+                        wairua_reg  <= wairua_gen_result;
+                        wairua_disp <= wairua_gen_result;
+                        state       <= ST_FS_HREQ_REQ;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // FS_HREQ_REQ -- issue BLAKE3(wairua).
+                // -----------------------------------------------------------
+                ST_FS_HREQ_REQ: begin
+                    b3_chain    <= BLAKE3_IV;
+                    b3_mblock   <= {256'b0, wairua_reg};
+                    b3_numbytes <= 32'd32;
+                    b3_dflags   <= FLG_PLAIN_LEAF;
+                    b3_valid    <= 1'b1;
+                    state       <= ST_FS_HREQ_WAIT;
+                end
+
+                ST_FS_HREQ_WAIT: begin
+                    // Drop b3_valid so the *_REQ state's assertion becomes a one-cycle pulse; gate the latch on (b3_done && !b3_valid) so we don't sample the BLAKE3 core's reset/stale o_valid before it has even seen our i_valid pulse.
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
+                        h_req <= b3_hash[255:0];
+                        state <= ST_FS_HRESP_REQ;
+                    end
+                end
+
+                ST_FS_HRESP_REQ: begin
+                    b3_chain    <= BLAKE3_IV;
+                    b3_mblock   <= {256'b0, ~wairua_reg};
+                    b3_numbytes <= 32'd32;
+                    b3_dflags   <= FLG_PLAIN_LEAF;
+                    b3_valid    <= 1'b1;
+                    state       <= ST_FS_HRESP_WAIT;
+                end
+
+                ST_FS_HRESP_WAIT: begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
+                        h_resp        <= b3_hash[255:0];
+                        session_valid <= 1'b1;
+                        fs_tx_cnt     <= 9'b0;
+                        fs_frame_sent <= 1'b0;
+                        state         <= ST_FS_EMIT;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // FS_EMIT -- leading frame-1 (Claim 12a edge marker), then push wairua onto the enclave data stream, MSB first. Total = 257 enclave slots: 1 frame + 256 wairua.
+                // -----------------------------------------------------------
+                ST_FS_EMIT: begin
+                    tx_active <= 1'b1;
+                    if (tx_slot) begin
+                        if (!fs_frame_sent) begin
+                            tx_data       <= 1'b1;
+                            fs_frame_sent <= 1'b1;
+                        end else begin
+                            tx_data   <= wairua_reg[255 - fs_tx_cnt];
+                            fs_tx_cnt <= fs_tx_cnt + 9'd1;
+                            if (fs_tx_cnt == 9'd255) begin
+                                tx_active <= 1'b0;
+                                state     <= ST_IDLE;
+                            end
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // RX_BUF2 -- buffer 256 more host bits -> X2.
+                // -----------------------------------------------------------
+                ST_RX_BUF2: begin
+                    if (rx_valid) begin
+                        rx_buf2    <= {rx_buf2[254:0], rx_data};
+                        rx_bit_cnt <= rx_bit_cnt + 9'd1;
+                        if (rx_bit_cnt == 9'd255) begin
+                            if (!session_valid) begin
+                                // Got Message B before fresh-session; protocol violation, drop.
+                                state <= ST_DROP;
+                            end else begin
+                                // Decode message_req combinationally; issue BLAKE3(message_req) for mode detect.
+                                message_req_reg <= rx_buf1 ^ h_req;
+                                state           <= ST_MODE_REQ;
+                            end
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // MODE_REQ -- issue BLAKE3(message_req).
+                // -----------------------------------------------------------
+                ST_MODE_REQ: begin
+                    b3_chain    <= BLAKE3_IV;
+                    b3_mblock   <= {256'b0, message_req_reg};
+                    b3_numbytes <= 32'd32;
+                    b3_dflags   <= FLG_PLAIN_LEAF;
+                    b3_valid    <= 1'b1;
+                    state       <= ST_MODE_WAIT;
+                end
+
+                // -----------------------------------------------------------
+                // MODE_WAIT -- detect mode; save BLAKE3(message_req) for ratchet later.
+                // -----------------------------------------------------------
+                ST_MODE_WAIT: begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
+                        req_hash_reg <= b3_hash[255:0]; // save for ratchet
+                        if (x2_match_session) begin
+                            mode_permanent <= 1'b0;
+                            is_query       <= (message_req_reg == Q_HEALTH_IDENT);
+                            state          <= ST_RESP_REQ;
+                        end else if (x2_match_permanent) begin
+                            mode_permanent <= 1'b1;
+                            is_query       <= (message_req_reg == Q_HEALTH_IDENT);
+                            state          <= ST_RESP_REQ;
+                        end else begin
+                            state <= ST_DROP;
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // RESP_REQ -- issue BLAKE3.keyed(active_key, mblock) for response.
+                //   For content commitment: numbytes=32, mblock high half = 0.
+                //   For q/health query:     numbytes=64, mblock high half = state_block.
+                // -----------------------------------------------------------
+                ST_RESP_REQ: begin
+                    b3_chain  <= active_key;
+                    if (is_query) begin
+                        b3_mblock   <= {state_block, message_req_reg};
+                        b3_numbytes <= 32'd64;
+                    end else begin
+                        b3_mblock   <= {256'b0, message_req_reg};
+                        b3_numbytes <= 32'd32;
+                    end
+                    b3_dflags <= FLG_KEYED_LEAF;
+                    b3_valid  <= 1'b1;
+                    state     <= ST_RESP_WAIT;
+                end
+
+                ST_RESP_WAIT: begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
+                        message_resp_reg <= b3_hash[255:0];
+                        // Pre-compute tx_buf1 now; tx_buf2 fills after next hash.
+                        tx_buf1 <= b3_hash[255:0] ^ h_req;
+                        state   <= ST_RESPH_REQ;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // RESPH_REQ -- issue BLAKE3(message_resp) for X2' construction.
+                // -----------------------------------------------------------
+                ST_RESPH_REQ: begin
+                    b3_chain    <= BLAKE3_IV;
+                    b3_mblock   <= {256'b0, message_resp_reg};
+                    b3_numbytes <= 32'd32;
+                    b3_dflags   <= FLG_PLAIN_LEAF;
+                    b3_valid    <= 1'b1;
+                    state       <= ST_RESPH_WAIT;
+                end
+
+                ST_RESPH_WAIT: begin
+                    b3_valid <= 1'b0;
+                    if (b3_done && !b3_valid) begin
+                        resp_hash_reg <= b3_hash[255:0]; // save for ratchet
+                        tx_buf2 <= mode_permanent ? ((~b3_hash[255:0]) ^ h_resp)
+                                                  : (  b3_hash[255:0]  ^ h_resp);
+                        tx_bit_cnt    <= 10'b0;
+                        tx_frame_sent <= 1'b0;
+                        state         <= ST_TX_EMIT;
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // TX_EMIT -- leading frame-1 (Claim 12a edge marker), then 512 enclave bits: tx_buf1 (MSB first) then tx_buf2 (MSB first).
+                // Total = 513 enclave slots.
+                // -----------------------------------------------------------
+                ST_TX_EMIT: begin
+                    tx_active <= 1'b1;
+                    if (tx_slot) begin
+                        if (!tx_frame_sent) begin
+                            tx_data       <= 1'b1;
+                            tx_frame_sent <= 1'b1;
+                        end else begin
+                            if (tx_bit_cnt < 10'd256) begin
+                                tx_data <= tx_buf1[255 - tx_bit_cnt[7:0]];
+                            end else begin
+                                tx_data <= tx_buf2[255 - (tx_bit_cnt[7:0])];
+                            end
+                            tx_bit_cnt <= tx_bit_cnt + 10'd1;
+                            if (tx_bit_cnt == 10'd511) begin
+                                tx_active <= 1'b0;
+                                state     <= ST_RATCHET_QREQ;
+                            end
+                        end
+                    end
+                end
+
+                // -----------------------------------------------------------
+                // Ratchet: H_req <- BLAKE3(message_req) [already saved in req_hash_reg]
+                //          H_resp <- BLAKE3(message_resp) [already saved in resp_hash_reg]
+                // We can just commit these immediately, no new BLAKE3 needed.
+                // -----------------------------------------------------------
+                ST_RATCHET_QREQ: begin
+                    h_req <= req_hash_reg;
+                    state <= ST_RATCHET_PREQ;
+                end
+
+                ST_RATCHET_QWAIT: begin
+                    // unused -- kept reserved for symmetry / future use
+                    state <= ST_RATCHET_PREQ;
+                end
+
+                ST_RATCHET_PREQ: begin
+                    h_resp          <= resp_hash_reg;
+                    session_counter <= session_counter + 64'd1;
+                    last_mode_perm  <= mode_permanent;
+                    last_was_query  <= is_query;
+                    state           <= ST_IDLE;
+                end
+
+                ST_RATCHET_PWAIT: begin
+                    // unused -- kept reserved for symmetry / future use
+                    state <= ST_IDLE;
+                end
+
+                // -----------------------------------------------------------
+                // DROP -- corruption detected: clear working regs, do NOT ratchet, return to IDLE. Host will desync next exchange and issue fresh-session.
+                // -----------------------------------------------------------
+                ST_DROP: begin
+                    rx_buf1            <= 256'b0;
+                    rx_buf2            <= 256'b0;
+                    message_req_reg    <= 256'b0;
+                    message_resp_reg   <= 256'b0;
+                    tx_buf1            <= 256'b0;
+                    tx_buf2            <= 256'b0;
+                    rx_bit_cnt         <= 9'b0;
+                    tx_bit_cnt         <= 10'b0;
+                    drop_counter       <= drop_counter + 64'd1;
+                    state              <= ST_IDLE;
+                end
+
+                default: state <= ST_IDLE;
+
+            endcase
+        end
+    end
+
+endmodule
+
+// ============================================================================
+// FILE: blake3_stub.v
+// ============================================================================
+
+// ============================================================================
+// blake3.v -- BLAKE3 compression core (PORT-INTERFACE STUB)
+// ============================================================================
+//
+// PORT-INTERFACE STUB. The full BLAKE3 reference implementation is published at:
+//
+//   O'Connor, J., Aumasson, J.-P., Neves, S., and Wilcox-O'Hearn, Z., "BLAKE3: one function, fast everywhere," BLAKE3 Team, 2020.
+//   Specification: github.com/BLAKE3-team/BLAKE3-specs
+//   Reference code: github.com/BLAKE3-team/BLAKE3
+//
+// This stub depicts the port interface by which the chip-side modules invoke a single BLAKE3 compression.
+// The full round function (G-mixing function, 7-round Blake2-derived permutation, 256-bit chaining value initialization, tree-hashing chunk concatenation) is omitted from this appendix as it is published prior art not material to the novelty of the present invention.
+//
+// USAGE: assert `valid` together with a 256-bit `chain` chaining value, 512-bit `mblock` message block, 32-bit `numbytes` byte count, and 32-bit `dflags` domain-separation flags.
+// `hash` and `done` are asserted by the core when the compression completes.
+// Multiple compressions are chained by the caller (this stub is a single-compression core; tree-mode concatenation is the caller's responsibility).
+//
+// ============================================================================
+
+`timescale 1ns / 1ps
+
+module blake3 (
+    input  wire         clk,
+    input  wire         reset_n,
+
+    input  wire         valid,
+    input  wire [255:0] chain,
+    input  wire [511:0] mblock,
+    input  wire [31:0]  numbytes,
+    input  wire [31:0]  dflags,
+
+    output wire [511:0] hash,
+    output wire         done
+);
+
+    // Reference implementation omitted. See cited specification.
+    // The hash output is the 512-bit BLAKE3 compression of mblock under chaining value chain, with the specified byte count and domain flags.
+
+endmodule
+
+// ============================================================================
+// FILE: x25519_stub.v
+// ============================================================================
+
+// ============================================================================
+// x25519.v -- Curve25519 scalar multiplication (PORT-INTERFACE STUB)
+// ============================================================================
+//
+// PORT-INTERFACE STUB. The full Curve25519 reference implementation is published at:
+//
+//   IETF RFC 7748: "Elliptic Curves for Security," January 2016.
+//   Bernstein, D. J., "Curve25519: new Diffie-Hellman speed records," PKC 2006.
+//
+// This stub depicts the port interface by which the chip-side modules invoke X25519 scalar multiplication, used to derive an ephemeral session key from the host's ephemeral public key and the chip's per-session private scalar.
+// The Montgomery ladder, field-arithmetic primitives, and constant-time scalar selection are omitted from this appendix as they are published prior art not material to the novelty of the present invention.
+//
+// USAGE: assert `valid` together with a 256-bit `scalar` (the chip's ephemeral private scalar) and a 256-bit `point_in` (the host's ephemeral public key, little-endian per RFC 7748).
+// `point_out` is the 256-bit shared secret, asserted with `done` when the scalar multiplication completes.
+//
+// ============================================================================
+
+`timescale 1ns / 1ps
+
+module x25519 (
+    input  wire         clk,
+    input  wire         reset_n,
+
+    input  wire         valid,
+    input  wire [255:0] scalar,
+    input  wire [255:0] point_in,
+
+    output wire [255:0] point_out,
+    output wire         done
+);
+
+    // Reference implementation omitted. See cited specifications.
+
+endmodule
+
+// ============================================================================
+// FILE: chacha20_poly1305_stub.v
+// ============================================================================
+
+// ============================================================================
+// chacha20_poly1305.v -- AEAD construction (PORT-INTERFACE STUB)
+// ============================================================================
+//
+// PORT-INTERFACE STUB. The full ChaCha20-Poly1305 authenticated-encryption-with-associated-data construction is published at:
+//
+//   IETF RFC 8439: "ChaCha20 and Poly1305 for IETF Protocols," June 2018.
+//
+// This stub depicts the port interface by which the chip-side modules invoke ChaCha20-Poly1305 authenticated encryption and decryption of the per-message ciphertext field following the ephemeral session public key.
+// The ChaCha20 stream cipher quarter-round, the Poly1305 universal-hash authenticator, and the AEAD nonce-handling logic are omitted from this appendix as they are published prior art not material to the novelty of the present invention.
+//
+// USAGE: assert `encrypt_valid` for encrypt-and-authenticate, or `decrypt_valid` for verify-and-decrypt.
+// The 256-bit `key` is the session key derived from the X25519 scalar multiplication of x25519.v.
+//
+// ============================================================================
+
+`timescale 1ns / 1ps
+
+module chacha20_poly1305 #(
+    parameter integer PLAINTEXT_BITS  = 256,
+    parameter integer ASSOC_DATA_BITS = 256
+) (
+    input  wire                          clk,
+    input  wire                          reset_n,
+
+    input  wire [255:0]                  key,
+    input  wire [95:0]                   nonce,
+    input  wire [ASSOC_DATA_BITS-1:0]    assoc_data,
+
+    // Encrypt path
+    input  wire                          encrypt_valid,
+    input  wire [PLAINTEXT_BITS-1:0]     plaintext_in,
+    output wire [PLAINTEXT_BITS-1:0]     ciphertext_out,
+    output wire [127:0]                  tag_out,
+    output wire                          encrypt_done,
+
+    // Decrypt path
+    input  wire                          decrypt_valid,
+    input  wire [PLAINTEXT_BITS-1:0]     ciphertext_in,
+    input  wire [127:0]                  tag_in,
+    output wire [PLAINTEXT_BITS-1:0]     plaintext_out,
+    output wire                          tag_ok,
+    output wire                          decrypt_done
+);
+
+    // Reference implementation omitted. See cited specification.
+
+endmodule

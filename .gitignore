@@ -30,3 +30,11 @@ target/
 
 # Phase-B measurement output is committed (it's data, not artifact)
 !phase_b_results.csv
+
+# LaTeX build artifacts
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz

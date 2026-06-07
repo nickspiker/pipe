@@ -13,7 +13,7 @@
 // OTP_INIT_FILE parameter ($readmemh-loaded slot contents). One bitstream
 // per IRA. For the demo:
 //
-//   v1: OTP_INIT_FILE="" → boots VIRGIN → ceremony generates IRA → displayed
+//   v1: OTP_INIT_FILE="" → boots KORE → ceremony generates IRA → displayed
 //       on OLED. Same boot, host can also send challenges and verify
 //       response = BLAKE3_keyed_hash(IRA, challenge).
 //
@@ -22,7 +22,7 @@
 //       immediately → power cycle → same IRA, same response.
 //
 //   v3.<fault>: OTP_INIT_FILE=<corrupt fixture> → boots into the appropriate
-//       FUCKED/DEGRADED state per inverted_pair_verify, demonstrating
+//       DARK/DEGRADED state per inverted_pair_verify, demonstrating
 //       classifier robustness against realistic eFuse failure modes
 //       (interrupted programming, stuck bits).
 //
@@ -32,7 +32,7 @@
 //
 // LEDs:
 //   T6 (active-low): mirrors ext_led for completeness; hard to see near power LED
-//   T2 (active-high, ext): OFF→VIRGIN; ~12 Hz→busy; solid→HEALTHY; ~1.5 Hz→FUCKED
+//   T2 (active-high, ext): OFF→KORE; ~12 Hz→busy; solid→HEALTHY; ~1.5 Hz→DARK
 //
 // =============================================================================
 
@@ -40,7 +40,7 @@
 
 // Synthesis-time OTP slot contents are controlled by the build script via
 //   `read_verilog -DOTP_INIT_FILE="<path>"` passed to otp.v's read.
-// The macro defaults to "" (VIRGIN) inside otp.v when undefined.
+// The macro defaults to "" (KORE) inside otp.v when undefined.
 
 module top_pipe_meal_lite (
     input  wire clk,            // 25 MHz crystal (P6)
@@ -64,7 +64,7 @@ module top_pipe_meal_lite (
     output reg  ext_led,        // T2 J4 LED — primary status
 
     // User button (R7, active-low, PULLMODE=UP). Held = wipe OTP slots back
-    // to VIRGIN and reset the ceremony FSM so a fresh ceremony can run
+    // to KORE and reset the ceremony FSM so a fresh ceremony can run
     // without a USB power-cycle. Useful for v1 iterative testing.
     input  wire user_btn,
 
@@ -218,8 +218,8 @@ module top_pipe_meal_lite (
     // User button → wipe + ira_fsm reset.
     //
     // The button is active-low (PULLMODE=UP). Held = wipe slots back to
-    // VIRGIN and hold ira_fsm in reset; release = ira_fsm leaves reset and
-    // observes the (now-virgin) chip_state, ready to accept a fresh Enter
+    // KORE and hold ira_fsm in reset; release = ira_fsm leaves reset and
+    // observes the (now-kore) chip_state, ready to accept a fresh Enter
     // press to start the ceremony again.
     //
     // The wipe signal is intentionally kept SEPARATE from the POR reset_n.
@@ -396,7 +396,7 @@ module top_pipe_meal_lite (
     // =========================================================================
     // OTP — emulated 8×256 with optional synthesis-time INIT_FILE.
     //
-    // INIT_FILE="" → boots VIRGIN, ceremony runs (v1).
+    // INIT_FILE="" → boots KORE, ceremony runs (v1).
     // INIT_FILE=<file> → slots pre-populated with baked IRA or fault fixture
     //                    (v2 / v3). slot_burned[i] is auto-derived from
     //                    (slot_data[i] != 0) inside otp.v.
@@ -437,11 +437,11 @@ module top_pipe_meal_lite (
         .reset_n     (reset_n),
         .slot_flat   (all_slots_flat),
         .state_valid (verify_state_valid),
-        .pair_virgin (),
+        .pair_kore (),
         .pair_valid  (),
         .pair_corrupt(),
         .valid_count (),
-        .all_virgin  (),
+        .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
         .state       (chip_state),
@@ -451,7 +451,7 @@ module top_pipe_meal_lite (
     // =========================================================================
     // ira_fsm — KOHI → BLAKE3 → TAHU ceremony orchestrator
     // =========================================================================
-    wire chip_fucked, ceremony_busy, ceremony_done;
+    wire chip_dark, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -473,7 +473,7 @@ module top_pipe_meal_lite (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_fucked       (chip_fucked),
+        .chip_dark       (chip_dark),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),
         .fsm_state         (fsm_state)
@@ -482,10 +482,10 @@ module top_pipe_meal_lite (
     // =========================================================================
     // LED state machine
     //   ext_led (T2 active-high) is primary status:
-    //     ring0-alive blink → VIRGIN idle
+    //     ring0-alive blink → KORE idle
     //     ~12 Hz fast blink → ceremony busy
     //     solid             → HEALTHY (or DEGRADED, still alive)
-    //     ~1.5 Hz slow      → FUCKED
+    //     ~1.5 Hz slow      → DARK
     // =========================================================================
     reg [23:0] blink_div = 24'b0;
     always @(posedge clk) blink_div <= blink_div + 24'd1;
@@ -498,7 +498,7 @@ module top_pipe_meal_lite (
     wire ring0_alive = ring0_div[21];
 
     always @(posedge clk) begin
-        if (chip_fucked) begin
+        if (chip_dark) begin
             led     <= ~blink_slow;
             ext_led <=  blink_slow;
         end else if (ceremony_busy) begin
@@ -580,7 +580,7 @@ module top_pipe_meal_lite (
     // its R_DONE idle state). Previously this was a 1-cycle pulse, which was
     // dropped if a new trigger fired while the renderer was still mid-frame
     // from a previous trigger. Specifically: ceremony_done fires the first
-    // re-render; chip_state transitions VIRGIN→HEALTHY a few hundred cycles
+    // re-render; chip_state transitions KORE→HEALTHY a few hundred cycles
     // later (after inverted_pair_verify finishes its sweep) and fires a
     // second re-render — but the first render is still in progress, so the
     // pulse is missed. Result: OLED shows a stale frame at the leftmost
@@ -591,7 +591,7 @@ module top_pipe_meal_lite (
     reg [3:0] re_render_init_cnt;
     reg [2:0] last_chip_state;
     reg [2:0] last_mode;
-    reg       last_chip_fucked;
+    reg       last_chip_dark;
     reg       last_trng_health_fail;
     reg       last_trng_gather_done_seen;
     reg       re_render_req;
@@ -603,7 +603,7 @@ module top_pipe_meal_lite (
             re_render_req              <= 1'b0;
             last_chip_state            <= 3'd0;
             last_mode                  <= 3'd0;
-            last_chip_fucked           <= 1'b0;
+            last_chip_dark           <= 1'b0;
             last_trng_health_fail      <= 1'b0;
             last_trng_gather_done_seen <= 1'b0;
             last_render_done           <= 1'b1;
@@ -623,12 +623,12 @@ module top_pipe_meal_lite (
             if (ceremony_done)                                       re_render_req <= 1'b1;
             if (chip_state != last_chip_state)                       re_render_req <= 1'b1;
             if (mode != last_mode)                                   re_render_req <= 1'b1;
-            if (chip_fucked && !last_chip_fucked)                    re_render_req <= 1'b1;
+            if (chip_dark && !last_chip_dark)                    re_render_req <= 1'b1;
             if (trng_health_fail && !last_trng_health_fail)          re_render_req <= 1'b1;
             if (trng_gather_done && !last_trng_gather_done_seen)     re_render_req <= 1'b1;
             last_chip_state            <= chip_state;
             last_mode                  <= mode;
-            last_chip_fucked           <= chip_fucked;
+            last_chip_dark           <= chip_dark;
             last_trng_health_fail      <= trng_health_fail;
             last_trng_gather_done_seen <= trng_gather_done;
         end

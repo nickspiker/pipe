@@ -209,7 +209,7 @@ module otp_persistent #(
                 // inverted_pair_verify.v as all-zero, because that classifier
                 // was written against otp.v which uses 0 as the "unburned"
                 // sentinel. Without this translation an erased chip reads as
-                // some non-VIRGIN state and the ceremony silently no-ops on
+                // some non-KORE state and the ceremony silently no-ops on
                 // provision_request.
                 //
                 // Detection: track slot_was_nonff across the 32 bytes; on the
@@ -229,7 +229,7 @@ module otp_persistent #(
                             if (!slot_was_nonff && spi_rdata == 8'hFF) begin
                                 // All 32 bytes were 0xFF → erased → unburned
                                 // → translate to all-zero so inverted_pair_verify
-                                // classifies as VIRGIN.
+                                // classifies as KORE.
                                 slot_data[boot_byte_cnt[7:5]]   <= {SLOT_BITS{1'b0}};
                                 slot_burned[boot_byte_cnt[7:5]] <= 1'b0;
                             end else begin

@@ -24,6 +24,8 @@
 // Idle consequences:
 //   Enclave (OWN_IDLE=1, tx=0, other_last=0): wire_out=1, drive_en=1 → drives HIGH every even slot. This is the heartbeat.
 //   Host (OWN_IDLE=0, tx=0, other_last=0): wire_out=0, drive_en=0 → fully passive, zero current. Pull-down holds odd slots LOW.
+//
+// TODO (production silicon, both endpoints): replace the single-point wire_in sample with a slot-width majority vote. Oversample wire_in at >> slot_rate (e.g. 8x or 16x), accumulate via an up/down counter (inc on HIGH sample, dec on LOW sample) across the slot, and at the slot boundary decode rx_data = sign(counter) — positive → 1, non-positive → 0, then reset counter for next slot. For binary samples sign(highs − lows) is mathematically equivalent to median filter of width N, so any glitch shorter than slot/2 is rejected regardless of amplitude. Cost: one up/down counter + one sign-bit register per endpoint; no analog filter, no PLL. Patent Claim 29 covers this technique. FPGA validation used single-point sampling and the line stayed clean enough on the breadboard; production silicon over long traces / noisy channels needs the median filter to maintain bit-error rate under realistic EMI.
 // =============================================================================
 
 `timescale 1ns / 1ps

@@ -22,9 +22,9 @@ module inverted_pair_verify_tb;
     reg                    reset_n = 0;
     reg  [8*SLOT_BITS-1:0] slot_flat = 0;
     wire                   state_valid;
-    wire [3:0]             pair_virgin, pair_valid, pair_corrupt;
+    wire [3:0]             pair_kore, pair_valid, pair_corrupt;
     wire [2:0]             valid_count, state;
-    wire                   all_virgin, agreement_ok, byzantine_ok;
+    wire                   all_kore, agreement_ok, byzantine_ok;
     wire [SLOT_BITS-1:0]   ira;
 
     inverted_pair_verify #(.SLOT_BITS(SLOT_BITS)) dut (
@@ -32,11 +32,11 @@ module inverted_pair_verify_tb;
         .reset_n     (reset_n),
         .slot_flat   (slot_flat),
         .state_valid (state_valid),
-        .pair_virgin (pair_virgin),
+        .pair_kore (pair_kore),
         .pair_valid  (pair_valid),
         .pair_corrupt(pair_corrupt),
         .valid_count (valid_count),
-        .all_virgin  (all_virgin),
+        .all_kore  (all_kore),
         .agreement_ok(agreement_ok),
         .byzantine_ok(byzantine_ok),
         .state       (state),
@@ -92,20 +92,20 @@ module inverted_pair_verify_tb;
         #25 reset_n = 1;
         @(posedge clk);
 
-        // T1. All slots zero — VIRGIN (state 0)
+        // T1. All slots zero — KORE (state 0)
         set_slots(ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO);
         wait_for_resweep;
-        $display("T1 (all-zero): state=%0d, valid_count=%0d, virgin=%b state_valid=%b",
-                 state, valid_count, pair_virgin, state_valid);
+        $display("T1 (all-zero): state=%0d, valid_count=%0d, kore=%b state_valid=%b",
+                 state, valid_count, pair_kore, state_valid);
         expect_eq("T1.state_valid", {31'b0, state_valid}, 32'd1);
         expect_eq("T1.state",       {29'b0, state},       32'd0);
         expect_eq("T1.valid_count", {29'b0, valid_count}, 32'd0);
-        expect_eq("T1.all_virgin",  {31'b0, all_virgin},  32'd1);
+        expect_eq("T1.all_kore",  {31'b0, all_kore},  32'd1);
 
-        // T2. Pair 0 valid (A=IRA_A, B=~IRA_A), others zero (virgin) → FUCKED
+        // T2. Pair 0 valid (A=IRA_A, B=~IRA_A), others zero (kore) → DARK
         set_slots(IRA_A, ZERO, ZERO, ZERO, ~IRA_A, ZERO, ZERO, ZERO);
         wait_for_resweep;
-        $display("T2 (1 valid + 3 virgin): state=%0d, valid_count=%0d", state, valid_count);
+        $display("T2 (1 valid + 3 kore): state=%0d, valid_count=%0d", state, valid_count);
         expect_eq("T2.state",       {29'b0, state},       32'd1);
         expect_eq("T2.valid_count", {29'b0, valid_count}, 32'd1);
 
@@ -119,7 +119,7 @@ module inverted_pair_verify_tb;
         if (ira === IRA_A) pass_count = pass_count + 1;
         else begin fail_count = fail_count + 1; $display("  FAIL T3.ira"); end
 
-        // T4. Pairs 0,1 valid DISAGREEING → FUCKED
+        // T4. Pairs 0,1 valid DISAGREEING → DARK
         set_slots(IRA_A, IRA_B, ZERO, ZERO, ~IRA_A, ~IRA_B, ZERO, ZERO);
         wait_for_resweep;
         $display("T4 (2 valid disagreeing): state=%0d, agreement=%b", state, agreement_ok);
@@ -168,13 +168,13 @@ module inverted_pair_verify_tb;
         expect_eq("T9.pair0_corrupt",  {31'b0, pair_corrupt[0]}, 32'd1);
         expect_eq("T9.pair0_valid",    {31'b0, pair_valid[0]},   32'd0);
 
-        // T10. A=ones/B=ones → CORRUPT (tightened virgin requires all-zero)
+        // T10. A=ones/B=ones → CORRUPT (tightened kore requires all-zero)
         set_slots(ONES, IRA_A, IRA_A, IRA_A, ONES, ~IRA_A, ~IRA_A, ~IRA_A);
         wait_for_resweep;
-        $display("T10 (A=ones/B=ones pair 0): state=%0d, virgin=%b, corrupt=%b",
-                 state, pair_virgin, pair_corrupt);
+        $display("T10 (A=ones/B=ones pair 0): state=%0d, kore=%b, corrupt=%b",
+                 state, pair_kore, pair_corrupt);
         expect_eq("T10.state",          {29'b0, state},           32'd3);
-        expect_eq("T10.pair0_virgin",   {31'b0, pair_virgin[0]},  32'd0);
+        expect_eq("T10.pair0_kore",   {31'b0, pair_kore[0]},  32'd0);
         expect_eq("T10.pair0_corrupt",  {31'b0, pair_corrupt[0]}, 32'd1);
 
         // T11. Low-popcount slot A (popcount=8 < 32) → CORRUPT

@@ -8,10 +8,7 @@
 //
 //   2. APT — NIST SP 800-90B Adaptive Proportion Test. Windowed bias detector with sliding window of APT_W=1024 samples. apt_ref is captured as the first sample of each window; apt_count counts occurrences of apt_ref over the window; apt_fail latches if apt_count > APT_T for any window in the gather.
 //
-//   3. Iterated GF(2) differencing — K-level predictability detector.
-//      level_sample[0] = current sample
-//      level_sample[k] = level_sample[k-1] XOR level_prev[k-1]   (for k >= 1)
-//      Each level has its own popcount counter; at end-of-gather, every level's popcount must lie in [LVL_LO, LVL_HI]. Periodic patterns of period <= 2^K manifest as a level-k popcount far from W/2 at some k <= K.
+//   3. Iterated GF(2) differencing — K-level predictability detector. level_sample[0] = current sample level_sample[k] = level_sample[k-1] XOR level_prev[k-1]   (for k >= 1) Each level has its own popcount counter; at end-of-gather, every level's popcount must lie in [LVL_LO, LVL_HI]. Periodic patterns of period <= 2^K manifest as a level-k popcount far from W/2 at some k <= K.
 //
 // W samples per gather. First K samples are warmup (level prev chain fills up); popcount accumulators start on cycle K+1. Total accumulated samples per level = W - K = 65530 for default params, statistically indistinguishable from W under +/- 6sigma tolerance.
 //

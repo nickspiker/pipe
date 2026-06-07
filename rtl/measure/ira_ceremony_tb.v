@@ -4,15 +4,15 @@
 //
 // Wires up the actual production modules (trng + blake3_tree + otp +
 // inverted_pair_verify + ira_fsm) and drives the provisioning ceremony
-// from VIRGIN to HEALTHY. Validates that:
-//   - chip_state starts at VIRGIN (0) on power-up (all OTP slots zero)
+// from KORE to HEALTHY. Validates that:
+//   - chip_state starts at KORE (0) on power-up (all OTP slots zero)
 //   - provision_request triggers KOHI
 //   - trng gathers, popcounts all stay in band → no health_fail
 //   - blake3_tree conditions the buffer → 256-bit ira_seed
 //   - ira_fsm burns A-slots then B-slots
 //   - chip_state transitions to HEALTHY (4)
 //   - ceremony_done pulses
-//   - chip_fucked stays low throughout
+//   - chip_dark stays low throughout
 //
 // Rings are simulated by per-ring LFSRs giving each ring a different,
 // ~50/50 bit stream that easily passes the ¼…¾ popcount health check.
@@ -162,11 +162,11 @@ module ira_ceremony_tb;
         .reset_n     (reset_n),
         .slot_flat   (all_slots),
         .state_valid (verify_state_valid),
-        .pair_virgin (),
+        .pair_kore (),
         .pair_valid  (pair_valid),
         .pair_corrupt(),
         .valid_count (),
-        .all_virgin  (),
+        .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
         .state       (chip_state),
@@ -176,7 +176,7 @@ module ira_ceremony_tb;
     // -------------------------------------------------------------------------
     // ira_fsm — the orchestrator
     // -------------------------------------------------------------------------
-    wire chip_fucked, ceremony_busy, ceremony_done;
+    wire chip_dark, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -198,7 +198,7 @@ module ira_ceremony_tb;
         .otp_write_enable (otp_write_enable),
         .otp_write_done   (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_fucked      (chip_fucked),
+        .chip_dark      (chip_dark),
         .ceremony_busy    (ceremony_busy),
         .ceremony_done    (ceremony_done),
         .fsm_state        (fsm_state)
@@ -225,10 +225,10 @@ module ira_ceremony_tb;
         // Wait for the sequential popcount sweep to complete its first pass.
         wait (verify_state_valid);
         @(posedge clk);
-        $display("[t=%0t] After reset + first sweep: chip_state=%0d (expect 0=VIRGIN), chip_fucked=%b",
-                 $time, chip_state, chip_fucked);
+        $display("[t=%0t] After reset + first sweep: chip_state=%0d (expect 0=KORE), chip_dark=%b",
+                 $time, chip_state, chip_dark);
         if (chip_state !== 3'd0)
-            $display("  FAIL: expected VIRGIN at boot, got state=%0d", chip_state);
+            $display("  FAIL: expected KORE at boot, got state=%0d", chip_state);
 
         // Trigger provisioning
         #20;
@@ -267,14 +267,14 @@ module ira_ceremony_tb;
         // Wait for verify to re-sweep on the post-burn slot contents.
         // The sweep is 2049 cycles (low-and-slow); wait 5000 to cover two.
         repeat (5000) @(posedge clk);
-        $display("[t=%0t] Post-ceremony + resweep: chip_state=%0d (expect 4=HEALTHY), chip_fucked=%b",
-                 $time, chip_state, chip_fucked);
+        $display("[t=%0t] Post-ceremony + resweep: chip_state=%0d (expect 4=HEALTHY), chip_dark=%b",
+                 $time, chip_state, chip_dark);
         $display("  pair_valid=%b, byzantine_ok=%b", pair_valid, byzantine_ok);
         $display("  recovered_ira=%h", recovered_ira);
 
-        if (chip_state === 3'd4 && chip_fucked === 1'b0 && byzantine_ok && recovered_ira === blake3_ira) begin
+        if (chip_state === 3'd4 && chip_dark === 1'b0 && byzantine_ok && recovered_ira === blake3_ira) begin
             $display("");
-            $display("  *** PASS ***  VIRGIN → HEALTHY ceremony complete, ira matches");
+            $display("  *** PASS ***  KORE → HEALTHY ceremony complete, ira matches");
         end else begin
             $display("");
             $display("  *** FAIL ***  ceremony did not reach HEALTHY state cleanly");

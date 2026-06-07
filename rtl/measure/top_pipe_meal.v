@@ -16,8 +16,8 @@
 //     core, and transmits the response back with Claim 12a framing.
 //
 // LEDs unchanged from ira:
-//   T6 (onboard, active-low): OFF→VIRGIN; blink→busy; solid→HEALTHY; OFF+T2→FUCKED
-//   T2 (J4 ext): solid→FUCKED (silent chip per pipe-fucked-state-silent-wire)
+//   T6 (onboard, active-low): OFF→KORE; blink→busy; solid→HEALTHY; OFF+T2→DARK
+//   T2 (J4 ext): solid→DARK (silent chip per pipe-dark-state-silent-wire)
 //
 // =============================================================================
 
@@ -42,7 +42,7 @@ module top_pipe_meal (
     output wire oled_scl,       // SSD1306 I2C clock (P2)
     output wire oled_sda,       // SSD1306 I2C data  (R2)
     output reg  led,            // T6 onboard LED — ceremony status
-    output reg  ext_led,        // T2 J4 LED — FUCKED indicator
+    output reg  ext_led,        // T2 J4 LED — DARK indicator
 
     // SPI flash (GD25Q32, post-config user-logic access)
     output wire flash_cs_n,     // N8
@@ -283,7 +283,7 @@ module top_pipe_meal (
     // One blake3.v compression core is driven by EITHER blake3_tree_shared
     // (during the ceremony) OR chal_resp_fsm (during operational challenge-
     // response). The two never run simultaneously — ceremony fires once on
-    // VIRGIN → HEALTHY, chal_resp_fsm only operates after HEALTHY — so the
+    // KORE → HEALTHY, chal_resp_fsm only operates after HEALTHY — so the
     // mux is safe by construction and saves ~10K LUT4s vs two blake3s.
     //
     // Mux select: ceremony_busy. While the ira_fsm has the wheel, route
@@ -360,7 +360,7 @@ module top_pipe_meal (
     assign cr_blake3_valid = b3_shared_done;
 
     // =========================================================================
-    // OTP — 8 slots × 256 bits, POR=VIRGIN
+    // OTP — 8 slots × 256 bits, POR=KORE
     // =========================================================================
     wire [2:0]            otp_write_addr;
     wire [255:0]          otp_write_data;
@@ -451,11 +451,11 @@ module top_pipe_meal (
         .reset_n     (reset_n),
         .slot_flat   (all_slots_flat),
         .state_valid (verify_state_valid),
-        .pair_virgin (),
+        .pair_kore (),
         .pair_valid  (),
         .pair_corrupt(),
         .valid_count (),
-        .all_virgin  (),
+        .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
         .state       (chip_state),
@@ -465,7 +465,7 @@ module top_pipe_meal (
     // =========================================================================
     // ira_fsm — the orchestrator
     // =========================================================================
-    wire chip_fucked, ceremony_busy, ceremony_done;
+    wire chip_dark, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -487,7 +487,7 @@ module top_pipe_meal (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_fucked       (chip_fucked),
+        .chip_dark       (chip_dark),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),
         .fsm_state         (fsm_state)
@@ -498,17 +498,17 @@ module top_pipe_meal (
     //   T6 (active-low, so output = ~drive_value):
     //     ceremony_busy → fast blink (every 2^21 cycles ≈ 12 Hz at 25 MHz)
     //     post-HEALTHY   → solid on
-    //     VIRGIN idle    → off
-    //     FUCKED         → off (T2 carries the FUCKED indicator)
+    //     KORE idle    → off
+    //     DARK         → off (T2 carries the DARK indicator)
     //   T2 (active-high, since T2 drives the ext LED through a buffer):
-    //     chip_fucked    → solid on
+    //     chip_dark    → solid on
     //     else           → off
     // =========================================================================
     reg [23:0] blink_div = 24'b0;
     always @(posedge clk) blink_div <= blink_div + 24'd1;
 
     wire blink_fast = blink_div[20];     // ~12 Hz — busy
-    wire blink_slow = blink_div[23];     // ~1.5 Hz — FUCKED (distinguishable from busy)
+    wire blink_slow = blink_div[23];     // ~1.5 Hz — DARK (distinguishable from busy)
     wire chip_alive = (chip_state >= 3'd2);
 
     // -------------------------------------------------------------------------
@@ -518,8 +518,8 @@ module top_pipe_meal (
     // blink at ~36 Hz (too fast to count individual blinks but clearly NOT
     // a solid LED). If ring 0 is stuck at 0 or 1, the divider stops and
     // the LED stays SOLID — which is the smoking gun for "PnR broke the
-    // rings". Wired to ext_led in DIAGNOSTIC mode (chip_state == VIRGIN
-    // and !chip_fucked AND !ceremony_busy) so it's only visible at idle.
+    // rings". Wired to ext_led in DIAGNOSTIC mode (chip_state == KORE
+    // and !chip_dark AND !ceremony_busy) so it's only visible at idle.
     // -------------------------------------------------------------------------
     reg [21:0] ring0_div = 22'b0;
     always @(posedge ring_out[0]) ring0_div <= ring0_div + 22'd1;
@@ -529,16 +529,16 @@ module top_pipe_meal (
     // LEDs:
     //   ext_led (T2, J4 pin 6 — the keypad LED, active-high). Primary status
     //   indicator since the onboard T6 is hard to see next to the power LED.
-    //     OFF        → VIRGIN (idle, awaiting provision request)
+    //     OFF        → KORE (idle, awaiting provision request)
     //     fast blink → ceremony busy (KOHI / BLAKE3 / TAHU running)
     //     solid ON   → HEALTHY (chip provisioned, ready for challenges)
-    //     slow blink → FUCKED (ring failure or partial-burn corruption)
+    //     slow blink → DARK (ring failure or partial-burn corruption)
     //
     //   led (T6, onboard active-low). Mirrors ext_led for completeness; ignore
     //   if it's hard to see.
     // -------------------------------------------------------------------------
     always @(posedge clk) begin
-        if (chip_fucked) begin
+        if (chip_dark) begin
             led     <= ~blink_slow;      // active-low slow blink
             ext_led <=  blink_slow;      // active-high slow blink (= "I'm broken")
         end else if (ceremony_busy) begin
@@ -549,10 +549,10 @@ module top_pipe_meal (
             ext_led <= 1'b1;             // active-high ON (= HEALTHY, solid)
         end else begin
             led     <= 1'b1;             // active-low OFF
-            // DIAGNOSTIC: while VIRGIN-idle, drive ring 0 (via /2^22) onto
+            // DIAGNOSTIC: while KORE-idle, drive ring 0 (via /2^22) onto
             // the keypad LED. A fast-blinking LED proves ring 0 is alive;
             // a solid LED proves PnR broke the inverter loop. Once we know
-            // the answer this will go back to plain 1'b0 (OFF for VIRGIN).
+            // the answer this will go back to plain 1'b0 (OFF for KORE).
             ext_led <= ring0_alive;
         end
     end

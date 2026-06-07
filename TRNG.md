@@ -76,7 +76,7 @@ After 65,536 cycles (~110 ms):
   if healthy_count ≥ 8:
     output = BLAKE3(buffer)[0..31]                 // 256 bits
   else:
-    abort KOHI permanently — broken silicon → STATE 1 FUCKED, silent wire
+    abort KOHI permanently — broken silicon → STATE 1 DARK, silent wire
 ```
 
 **Memory**: one 65,536-bit buffer (8 KB BRAM) + 16 × 17-bit popcount counters + 16 × 17-bit toggle counters + 16 single-bit sampling FFs + 16 single-bit prev-sample FFs. Total fabric cost: ~8 KB BRAM + ~600 LUT-FF pairs.
@@ -114,7 +114,7 @@ For our target `P_chip < 10⁻¹⁵ per KOHI` (fleet-safe over 10¹² KOHIs/year
 
 **Why XOR'd output stays good with partial-ring health**: XOR of N independent sources is uniform if and only if at least one input is uniform. So even one healthy ring is theoretically sufficient for cryptographic uniformity; the ≥8 threshold is defense-in-depth, not strict necessity. Output ira_seed quality is unaffected by which subset of rings happen to pass.
 
-**On health-check failure: provisioning silently fails.** No retry, no fallback. The chip latches FUCKED, ceases driving its wire forever (host sees indistinguishable-from-absent), and the only paths out are physical destruction or replacement. See [IRA.md §FUCKED-silent](IRA.md#fucked-state--silent-wire) for the wire-level behavior.
+**On health-check failure: provisioning silently fails.** No retry, no fallback. The chip latches DARK, ceases driving its wire forever (host sees indistinguishable-from-absent), and the only paths out are physical destruction or replacement. See [IRA.md §DARK-silent](IRA.md#dark-state--silent-wire) for the wire-level behavior.
 
 ## XOR accumulator
 

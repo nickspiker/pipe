@@ -76,13 +76,13 @@ This empirical match proves the host's BLAKE3 byte-order wrapper computes the sa
 
 **Hardware setup.** Colorlight 5A-75B v8.0 ECP5-25F FPGA running [rtl/measure/top_pipe_meal_lite.v](rtl/measure/top_pipe_meal_lite.v). RP2040-Zero acting as the host bridge over USB-CDC. ECP5 connected to the PIPE wire via GP0; RP2040 connected to the same wire via GP0 with an internal weak pull-down. OLED + dozenal keypad for chip-side observation and input.
 
-**v1 ceremony (no bake) — PASS.** Bitstream built with no `--bake-ira` or `--bake-fault` flag; chip boots VIRGIN (slot_data all-zero, chip_state=0). User presses Enter on the keypad; the chip's `ira_fsm` orchestrates the real on-silicon ceremony:
+**v1 ceremony (no bake) — PASS.** Bitstream built with no `--bake-ira` or `--bake-fault` flag; chip boots KORE (slot_data all-zero, chip_state=0). User presses Enter on the keypad; the chip's `ira_fsm` orchestrates the real on-silicon ceremony:
 
 1. **KOHI** — starts the chip's 16-ring TRNG, gathers ~4096 conditioned bits per ring under round-robin RCT+APT+iterated GF(2) tests (`rtl/ring_scheduler.v`).
 2. **BLAKE3 conditioner** — runs the conditioned TRNG output through the chip's `blake3_tree_shared` core.
 3. **TAHU** — burns the resulting IRA + ~IRA into the 8-slot OTP via the inverted_pair_verify Claim-4 layout.
 
-Within ~3 seconds the LED transitions from the slow ring-0 blink (VIRGIN) through fast blink (CEREMONY BUSY) to solid (HEALTHY). OLED MODE 1 (IRA HEX) populates with the freshly-generated 256-bit IRA. The IRA is the output of real on-silicon TRNG passed through real on-silicon BLAKE3 — every byte of it is silicon-generated.
+Within ~3 seconds the LED transitions from the slow ring-0 blink (KORE) through fast blink (CEREMONY BUSY) to solid (HEALTHY). OLED MODE 1 (IRA HEX) populates with the freshly-generated 256-bit IRA. The IRA is the output of real on-silicon TRNG passed through real on-silicon BLAKE3 — every byte of it is silicon-generated.
 
 Two distinct IRAs were generated across two power-on cycles during the session, confirming the ceremony runs fresh each time (no spurious persistence across power cycles on the no-bake bitstream):
 - `8CBEF3B03729C7539F74ADCEC1F3FF54FDEDFB78F11193E7DC6C53E96C397D7A`
@@ -121,7 +121,7 @@ Each of the FPGA-side implementation choices below is a *strictly easier* proble
 The patent claims describe the protocol and its security properties — not the FPGA implementation. Each piece of patent-evidence is validated at the layer where the claim is articulated:
 
 - **Claim 3c** (chip can produce a fresh identifier per fresh-session): Tests 2, 4, 5 (sim), v1 ceremony (silicon).
-- **Claim 4** (inverted-pair OTP layout): the chip's `inverted_pair_verify` classifier runs every cycle; v1 ceremony goes through this path. v3 fault tests (next session) drive each of FUCKED, DEGRADED-2, DEGRADED-1, HEALTHY classifications.
+- **Claim 4** (inverted-pair OTP layout): the chip's `inverted_pair_verify` classifier runs every cycle; v1 ceremony goes through this path. v3 fault tests (next session) drive each of DARK, DEGRADED-2, DEGRADED-1, HEALTHY classifications.
 - **Claim 5** (per-session secret distinct from permanent identity): Test 5 (SESSION uses WAIRUA, A != C).
 - **Claim 6** (silent wire on corruption): Tests 7, 8 (simulation); on hardware, the chip's drop_counter increments cleanly on every wire-corrupt attempt without ever producing a misleading response — same load-bearing property.
 - **Claim 9c** (q/health single-block embodiment with state-vector commitment): Test 6 (sim), Tests 11, 12 (host crate sim end-to-end).
@@ -131,7 +131,7 @@ The patent claims describe the protocol and its security properties — not the 
 
 ## Fault tolerance — v3 fault-injection evidence on real silicon
 
-In some embodiments the chip's permanent identity is stored across multiple redundant OTP slots arranged as inverted pairs (Claim 4), with a byzantine-threshold classifier that decides at every read whether enough valid pairs remain to reconstitute the identity safely.  The classifier (`rtl/inverted_pair_verify.v`) reports one of five chip-state codes — VIRGIN, FUCKED, DEGRADED-2, DEGRADED-1, HEALTHY — and gates the wire heartbeat on the result so a chip that has fallen below threshold goes silent rather than producing identity-shaped output it cannot trust.
+In some embodiments the chip's permanent identity is stored across multiple redundant OTP slots arranged as inverted pairs (Claim 4), with a byzantine-threshold classifier that decides at every read whether enough valid pairs remain to reconstitute the identity safely.  The classifier (`rtl/inverted_pair_verify.v`) reports one of five chip-state codes — KORE, DARK, DEGRADED-2, DEGRADED-1, HEALTHY — and gates the wire heartbeat on the result so a chip that has fallen below threshold goes silent rather than producing identity-shaped output it cannot trust.
 
 This single mechanism transparently absorbs a wide variety of physical disturbances without protocol-level intervention:
 
@@ -139,7 +139,7 @@ This single mechanism transparently absorbs a wide variety of physical disturban
 - **Cosmic ray / single-event upset (SEU)** — a high-energy particle flips one or more eFuse bits *post-burn*; the inverted-pair check on the affected pair fails, the classifier marks that pair invalid, and remaining pairs reconstitute the identity if quorum holds.
 - **Electromagnetic disturbance (EMF) during operation** — same downstream signature as SEU: bit-level disagreement on an inverted pair, downgraded pair count, classifier judges from remaining pairs.
 - **eFuse manufacturing defects** (stuck-at-0, stuck-at-1, marginal threshold) — silently absorbed if the pair count after rejecting the defective pair still meets quorum.
-- **Interrupted provisioning** — power loss or reset mid-TAHU leaves some pairs in VIRGIN state and others in HEALTHY; the classifier counts virgin pairs separately from valid pairs and reports the verdict via the appropriate degradation level.
+- **Interrupted provisioning** — power loss or reset mid-TAHU leaves some pairs in KORE state and others in HEALTHY; the classifier counts kore pairs separately from valid pairs and reports the verdict via the appropriate degradation level.
 
 The classifier's behaviour was validated end-to-end in simulation (`rtl/inverted_pair_verify.v` is combinational; its truth table is exhaustively exercised by the surrounding test infrastructure) and on real silicon via the v3 fault-injection arc described in [scripts/build_pipe_meal_lite.sh](scripts/build_pipe_meal_lite.sh) `--bake-fault <variant>`.  The build script bakes the corrupt OTP-slot configuration directly into the FPGA bitstream via `$readmemh` — the silicon-equivalent of factory-provisioning eFuses into the faulted state.
 
@@ -147,21 +147,21 @@ Variants exercised:
 
 | Variant | OTP state baked in | Expected chip_state | Patent property |
 |---|---|---|---|
-| `partial_1` | 1 pair valid, 3 virgin | **FUCKED** | byzantine threshold below quorum → silent wire (Claim 6) |
-| `partial_2` | 2 pairs valid, 2 virgin | **DEGRADED-2** | minimum quorum met, operational with reduced redundancy |
-| `partial_3` | 3 pairs valid, 1 virgin | **DEGRADED-1** | one redundant pair short of full, operational |
+| `partial_1` | 1 pair valid, 3 kore | **DARK** | byzantine threshold below quorum → silent wire (Claim 6) |
+| `partial_2` | 2 pairs valid, 2 kore | **DEGRADED-2** | minimum quorum met, operational with reduced redundancy |
+| `partial_3` | 3 pairs valid, 1 kore | **DEGRADED-1** | one redundant pair short of full, operational |
 | `single_bit_one_pair` | 4 pairs burned, 1 bit flipped post-burn | **DEGRADED-1** | single SEU / stuck-eFuse / EMF event → classifier rejects affected pair, others still satisfy quorum |
 | `single_bit_two_pairs` | 4 pairs burned, 2 bits flipped on two distinct pairs | **DEGRADED-2** | two independent SEU / EMF events → still operational at minimum quorum |
 
-Visual evidence is recorded by photographing OLED MODE 0 (PIPE STATUS line 1 = chip_state name) and the LED-blink pattern (slow = FUCKED, solid = HEALTHY/DEGRADED, fast = CEREMONY).
+Visual evidence is recorded by photographing OLED MODE 0 (PIPE STATUS line 1 = chip_state name) and the LED-blink pattern (slow = DARK, solid = HEALTHY/DEGRADED, fast = CEREMONY).
 
 ### Silicon results (2026-06-01)
 
-**`partial_1` (1 valid pair, 3 virgin pairs):**
-- OLED MODE 0 line 1: `FUCKED`
+**`partial_1` (1 valid pair, 3 kore pairs):**
+- OLED MODE 0 line 1: `DARK`
 - OLED line 2: `rings: 0/16`
 - LED: ~1.5 Hz slow blink
-- Verdict: byzantine quorum (1 valid pair < 2-pair minimum) → classifier rejects → ira_fsm latches `chip_fucked` permanently → wire heartbeat suppressed (Claim 6 silent wire on insufficient identity material) — **PASS**
+- Verdict: byzantine quorum (1 valid pair < 2-pair minimum) → classifier rejects → ira_fsm latches `chip_dark` permanently → wire heartbeat suppressed (Claim 6 silent wire on insufficient identity material) — **PASS**
 
 **`single_bit_one_pair` and `single_bit_two_pairs`:** these variants bake all 8 OTP slots non-zero (4 burned pairs plus a post-burn bit flip).  On this development FPGA (Lattice ECP5-25F, ~24 k LUT4), the design hits placement utilisation limits when none of the OTP slots are zero — yosys cannot constant-fold the storage paths through `inverted_pair_verify` that the other variants benefit from.  nextpnr-ecp5 reports `Unable to find legal placement for all cells, design is probably at utilisation limit` across six seeds (1, 2, 3, 7, 13, 42).  In production silicon, OTP storage cells live in a dedicated array, not the same fabric resource that the byzantine classifier and FSM share — so this utilisation collision is an FPGA-only artifact.  The single-bit-fault corrupt-detect logic this variant would have exercised on hardware is independently validated in simulation by iverilog testbench Tests 7 and 8 (bit-flipped X1 / X2 → chip rejects via X2 invariant mismatch → ST_DROP → `drop_counter++` → pads not advanced).  The on-silicon classifier behaviour is therefore proven by the equivalent corrupt-detection event in `partial_1` (insufficient agreement under the byzantine check) and by simulation for the post-burn single-bit case.
 

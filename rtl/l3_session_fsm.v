@@ -156,17 +156,13 @@ module l3_session_fsm (
     localparam [31:0] FLG_PLAIN_LEAF  = 32'h0B;   // CHUNK_START|END|ROOT
     localparam [31:0] FLG_KEYED_LEAF  = 32'h1B;   // | KEYED_HASH
 
-    // BLAKE3("Kei te ora koe?") — verified across blake3-py, b3sum CLI, and
-    // BLAKE3 official test vectors. See patent/claims.md Claim 9c.
+    // BLAKE3("Kei te ora koe?") — verified across blake3-py, b3sum CLI, and BLAKE3 official test vectors. See patent/claims.md Claim 9c.
     localparam [255:0] Q_HEALTH_IDENT = {
         32'hc0a6cabf, 32'h9f69f2af, 32'hf78b5115, 32'h1e9300cd,
         32'h5bd32dfb, 32'hbecf5506, 32'h00625478, 32'hffee8e80
     };
 
-    // Fresh-session detection pattern. The wire shape is: frame-1, then 256
-    // zeros. The frame-1 is consumed by ST_IDLE without shifting (Claim 12a
-    // leading-edge marker), so rx_buf1 ends up holding the 256-bit payload =
-    // all zeros. Probability of a Message-B X1 accidentally matching: 2⁻²⁵⁶.
+    // Fresh-session detection pattern. The wire shape is: frame-1, then 256 zeros. The frame-1 is consumed by ST_IDLE without shifting (Claim 12a leading-edge marker), so rx_buf1 ends up holding the 256-bit payload = all zeros. Probability of a Message-B X1 accidentally matching: 2⁻²⁵⁶.
     localparam [255:0] MSG_A_PATTERN = 256'b0;
 
     // =========================================================================
@@ -233,10 +229,7 @@ module l3_session_fsm (
     wire is_msg_a    = (rx_buf1 == MSG_A_PATTERN);
 
     // State block for q/health (Claim 9c clever embodiment).
-    // 32 bytes packed into the high half of the BLAKE3 mblock, low-to-high
-    // bit ordering as documented at top of file. All counters 64-bit for
-    // chain-state visibility and integrity even during health-check
-    // responses — host verifier can reconstruct exactly.
+    // 32 bytes packed into the high half of the BLAKE3 mblock, low-to-high bit ordering as documented at top of file. All counters 64-bit for chain-state visibility and integrity even during health-check responses — host verifier can reconstruct exactly.
     wire [255:0] state_block = {
         29'b0,                  // [255:227] reserved zero
         drop_counter,           // [226:163] DROP events lifetime
@@ -317,11 +310,7 @@ module l3_session_fsm (
                     tx_data   <= 1'b0;
                     tx_active <= 1'b0;
                     if (chip_alive && rx_valid && rx_data) begin
-                        // Got the framing 1. It is NOT part of the message —
-                        // it is Claim 12a's leading-edge marker that says "the
-                        // host is leaving idle, the next 256/512 bits are the
-                        // payload." Don't shift it into rx_buf1; just consume
-                        // it and start the buffer empty.
+                        // Got the framing 1. It is NOT part of the message — it is Claim 12a's leading-edge marker that says "the host is leaving idle, the next 256/512 bits are the payload." Don't shift it into rx_buf1; just consume it and start the buffer empty.
                         rx_buf1     <= 256'b0;
                         rx_bit_cnt  <= 9'd0;
                         state       <= ST_RX_BUF1;
@@ -362,8 +351,7 @@ module l3_session_fsm (
                 ST_FS_KOHI: begin
                     if (trng_health_fail) begin
                         // Entropy source dead → silent-wire per Claim 9a.
-                        // Don't actually drive silence here (that's top-level),
-                        // just drop and stop trying.
+                        // Don't actually drive silence here (that's top-level), just drop and stop trying.
                         state <= ST_DROP;
                     end else if (trng_gather_done) begin
                         wairua_gen_start <= 1'b1;
@@ -395,10 +383,7 @@ module l3_session_fsm (
                 end
 
                 ST_FS_HREQ_WAIT: begin
-                    // Drop b3_valid so the *_REQ state's assertion becomes a
-                    // one-cycle pulse; gate the latch on (b3_done && !b3_valid)
-                    // so we don't sample the BLAKE3 core's reset/stale o_valid
-                    // before it has even seen our i_valid pulse.
+                    // Drop b3_valid so the *_REQ state's assertion becomes a one-cycle pulse; gate the latch on (b3_done && !b3_valid) so we don't sample the BLAKE3 core's reset/stale o_valid before it has even seen our i_valid pulse.
                     b3_valid <= 1'b0;
                     if (b3_done && !b3_valid) begin
                         h_req <= b3_hash[255:0];
@@ -427,9 +412,7 @@ module l3_session_fsm (
                 end
 
                 // -----------------------------------------------------------
-                // FS_EMIT — leading frame-1 (Claim 12a edge marker), then push
-                // wairua onto the enclave data stream, MSB first. Total = 257
-                // enclave slots: 1 frame + 256 wairua.
+                // FS_EMIT — leading frame-1 (Claim 12a edge marker), then push wairua onto the enclave data stream, MSB first. Total = 257 enclave slots: 1 frame + 256 wairua.
                 // -----------------------------------------------------------
                 ST_FS_EMIT: begin
                     tx_active <= 1'b1;
@@ -457,12 +440,10 @@ module l3_session_fsm (
                         rx_bit_cnt <= rx_bit_cnt + 9'd1;
                         if (rx_bit_cnt == 9'd255) begin
                             if (!session_valid) begin
-                                // Got Message B before fresh-session; protocol
-                                // violation, drop.
+                                // Got Message B before fresh-session; protocol violation, drop.
                                 state <= ST_DROP;
                             end else begin
-                                // Decode message_req combinationally; issue
-                                // BLAKE3(message_req) for mode detect.
+                                // Decode message_req combinationally; issue BLAKE3(message_req) for mode detect.
                                 message_req_reg <= rx_buf1 ^ h_req;
                                 state           <= ST_MODE_REQ;
                             end
@@ -557,8 +538,7 @@ module l3_session_fsm (
                 end
 
                 // -----------------------------------------------------------
-                // TX_EMIT — leading frame-1 (Claim 12a edge marker), then 512
-                // enclave bits: tx_buf1 (MSB first) then tx_buf2 (MSB first).
+                // TX_EMIT — leading frame-1 (Claim 12a edge marker), then 512 enclave bits: tx_buf1 (MSB first) then tx_buf2 (MSB first).
                 // Total = 513 enclave slots.
                 // -----------------------------------------------------------
                 ST_TX_EMIT: begin
@@ -611,9 +591,7 @@ module l3_session_fsm (
                 end
 
                 // -----------------------------------------------------------
-                // DROP — corruption detected: clear working regs, do NOT
-                // ratchet, return to IDLE. Host will desync next exchange and
-                // issue fresh-session.
+                // DROP — corruption detected: clear working regs, do NOT ratchet, return to IDLE. Host will desync next exchange and issue fresh-session.
                 // -----------------------------------------------------------
                 ST_DROP: begin
                     rx_buf1            <= 256'b0;

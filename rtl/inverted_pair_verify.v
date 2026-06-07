@@ -2,21 +2,15 @@
 // inverted_pair_verify.v — 4-pair classifier (serial-per-bit-position sweep)
 // =============================================================================
 //
-// Combinational-equivalent classifier for the inverted-pair storage geometry
-// described in IRA.md §"OTP geometry" / §"The five lifelong states". Takes 8
-// slot values (4 pairs × {A, B}) and produces:
+// Combinational-equivalent classifier for the inverted-pair storage geometry described in IRA.md §"OTP geometry" / §"The five lifelong states". Takes 8 slot values (4 pairs × {A, B}) and produces:
 //
-//   - per-pair classification (virgin / valid / corrupt)
-//   - aggregate 5-state machine code (VIRGIN / FUCKED / DEGRADED-{2,1} / HEALTHY)
+//   - per-pair classification (kore / valid / corrupt)
+//   - aggregate 5-state machine code (KORE / DARK / DEGRADED-{2,1} / HEALTHY)
 //   - recovered ira value (lowest-indexed valid pair's A slot, or zero)
 //   - byzantine_ok strobe (≥2 valid pairs AND all valid pairs agree on ira)
 //   - state_valid strobe (high after first complete sweep)
 //
-// Outputs are REGISTERED, sampled at the end of each 257-cycle sweep. During
-// the sweep the registered outputs hold their last-latched values; consumers
-// (ira_fsm) read them whenever, with the understanding that any change in
-// slot_flat is reflected at most 2 sweeps later. ira_fsm is responsible for
-// waiting two full sweeps after OTP burns before reading chip_state.
+// Outputs are REGISTERED, sampled at the end of each 257-cycle sweep. During the sweep the registered outputs hold their last-latched values; consumers (ira_fsm) read them whenever, with the understanding that any change in slot_flat is reflected at most 2 sweeps later. ira_fsm is responsible for waiting two full sweeps after OTP burns before reading chip_state.
 //
 // Implementation — serial accumulators, one bit position per cycle:
 //
@@ -31,15 +25,9 @@
 //     popcount[s]   += bit_s                     // running 1-count
 //     toggles[s]    += (bit_s != prev_bit[s])    // running edge count
 //
-// At cycle 256 (end_of_sweep), the running accumulators ARE the complete
-// classifier inputs. Combinational logic on those (no 256-bit-wide ops
-// anywhere) computes pair_virgin/pair_valid/pair_corrupt/valid_count/
-// agreement_ok/state/ira and latches them into the output registers. The
-// sweep then restarts.
+// At cycle 256 (end_of_sweep), the running accumulators ARE the complete classifier inputs. Combinational logic on those (no 256-bit-wide ops anywhere) computes pair_kore/pair_valid/pair_corrupt/valid_count/ agreement_ok/state/ira and latches them into the output registers. The sweep then restarts.
 //
-// Cost vs. prior parallel-combinational design: replaces twenty 256-bit-
-// wide operations with single-bit accumulators (~5K LUT savings). Replaces
-// 2K-FF slot_latched + load-mux with zero copy (~2K LUT + 2K FF savings).
+// Cost vs. prior parallel-combinational design: replaces twenty 256-bit- wide operations with single-bit accumulators (~5K LUT savings). Replaces 2K-FF slot_latched + load-mux with zero copy (~2K LUT + 2K FF savings).
 // Total module cost: ~1.5K LUTs / ~600 FFs.
 //
 // Slot layout (caller's responsibility — this module sees raw 256-bit values):
@@ -47,7 +35,7 @@
 //   slot[4..7] = pair 0..3 B (holds ~ira or ~wairua)
 //
 // Per-pair classification:
-//   virgin  → both slots are all-zero (the genuine unburned state)
+//   kore  → both slots are all-zero (the genuine unburned state)
 //   valid   → A XOR B == all-ones AND each slot's popcount ∈ [POP_LO, POP_HI]
 //             AND each slot's toggle count ≥ TOG_MIN
 //   corrupt → anything else
@@ -65,11 +53,11 @@ module inverted_pair_verify #(
     input  wire [8*SLOT_BITS-1:0] slot_flat,
 
     output reg                    state_valid,
-    output reg  [3:0]             pair_virgin,
+    output reg  [3:0]             pair_kore,
     output reg  [3:0]             pair_valid,
     output reg  [3:0]             pair_corrupt,
     output reg  [2:0]             valid_count,
-    output reg                    all_virgin,
+    output reg                    all_kore,
     output reg                    agreement_ok,
     output reg                    byzantine_ok,
     output reg  [2:0]             state,
@@ -88,8 +76,7 @@ module inverted_pair_verify #(
     endgenerate
 
     // -------------------------------------------------------------------------
-    // Sweep counter — 0..SLOT_BITS (0..256). One bit position per cycle for
-    // 0..SLOT_BITS-1; cycle SLOT_BITS = "end of sweep", finalize and restart.
+    // Sweep counter — 0..SLOT_BITS (0..256). One bit position per cycle for 0..SLOT_BITS-1; cycle SLOT_BITS = "end of sweep", finalize and restart.
     // -------------------------------------------------------------------------
     reg [8:0] sweep_addr;
     wire end_of_sweep = (sweep_addr == SLOT_BITS[8:0]);
@@ -145,23 +132,22 @@ module inverted_pair_verify #(
     endgenerate
 
     // -------------------------------------------------------------------------
-    // Final classification (combinational on the small accumulators + slot_flat
-    // for the ira recovery mux). Latched at end_of_sweep into the output regs.
+    // Final classification (combinational on the small accumulators + slot_flat for the ira recovery mux). Latched at end_of_sweep into the output regs.
     // -------------------------------------------------------------------------
-    wire [3:0] c_pair_virgin;
+    wire [3:0] c_pair_kore;
     wire [3:0] c_pair_valid;
     wire [3:0] c_pair_corrupt;
     generate
         for (gk = 0; gk < 4; gk = gk + 1) begin : classify
-            assign c_pair_virgin[gk] = ~has_one_A[gk] & ~has_one_B[gk];
+            assign c_pair_kore[gk] = ~has_one_A[gk] & ~has_one_B[gk];
             assign c_pair_valid[gk]  = all_ones[gk] & slot_sane_A[gk] & slot_sane_B[gk];
-            assign c_pair_corrupt[gk]= ~c_pair_virgin[gk] & ~c_pair_valid[gk];
+            assign c_pair_corrupt[gk]= ~c_pair_kore[gk] & ~c_pair_valid[gk];
         end
     endgenerate
 
     wire [2:0] c_valid_count = {2'b0, c_pair_valid[0]} + {2'b0, c_pair_valid[1]}
                               + {2'b0, c_pair_valid[2]} + {2'b0, c_pair_valid[3]};
-    wire c_all_virgin = (c_pair_virgin == 4'b1111);
+    wire c_all_kore = (c_pair_kore == 4'b1111);
 
     // Agreement check: any (i, j) pair of valid pairs where A_i differs from A_j.
     wire c_disagree_01 = pair_disagree[0] & c_pair_valid[0] & c_pair_valid[1];
@@ -174,15 +160,14 @@ module inverted_pair_verify #(
                           | c_disagree_12 | c_disagree_13 | c_disagree_23);
     wire c_byzantine_ok = (c_valid_count >= 3'd2) & c_agreement_ok;
 
-    // ira recovery: lowest-indexed valid pair's A. 4-way 256-bit mux — the
-    // one place we still touch full slot widths (combinational at sweep end).
+    // ira recovery: lowest-indexed valid pair's A. 4-way 256-bit mux — the one place we still touch full slot widths (combinational at sweep end).
     wire [SLOT_BITS-1:0] c_ira = c_pair_valid[0] ? slot[0]
                                 : c_pair_valid[1] ? slot[1]
                                 : c_pair_valid[2] ? slot[2]
                                 : c_pair_valid[3] ? slot[3]
                                 : {SLOT_BITS{1'b0}};
 
-    wire [2:0] c_state = c_all_virgin    ? 3'd0
+    wire [2:0] c_state = c_all_kore    ? 3'd0
                        : ~c_byzantine_ok ? 3'd1
                        : (c_valid_count == 3'd2) ? 3'd2
                        : (c_valid_count == 3'd3) ? 3'd3
@@ -201,11 +186,11 @@ module inverted_pair_verify #(
             has_one_B     <= 4'b0;
             pair_disagree <= 6'b0;
             prev_bit      <= 8'b0;
-            pair_virgin   <= 4'b0;
+            pair_kore   <= 4'b0;
             pair_valid    <= 4'b0;
             pair_corrupt  <= 4'b0;
             valid_count   <= 3'b0;
-            all_virgin    <= 1'b0;
+            all_kore    <= 1'b0;
             agreement_ok  <= 1'b0;
             byzantine_ok  <= 1'b0;
             state         <= 3'b0;
@@ -216,11 +201,11 @@ module inverted_pair_verify #(
             end
         end else if (end_of_sweep) begin
             // Latch the classifier outputs from the matched accumulators.
-            pair_virgin  <= c_pair_virgin;
+            pair_kore  <= c_pair_kore;
             pair_valid   <= c_pair_valid;
             pair_corrupt <= c_pair_corrupt;
             valid_count  <= c_valid_count;
-            all_virgin   <= c_all_virgin;
+            all_kore   <= c_all_kore;
             agreement_ok <= c_agreement_ok;
             byzantine_ok <= c_byzantine_ok;
             state        <= c_state;
@@ -242,7 +227,7 @@ module inverted_pair_verify #(
             // Per-cycle accumulation.
             prev_bit <= bit_now;
 
-            // Per-pair pair_xor & virgin accumulators (only k=0..3).
+            // Per-pair pair_xor & kore accumulators (only k=0..3).
             for (i = 0; i < 4; i = i + 1) begin
                 all_ones[i]  <= all_ones[i]  & (bit_now[i] ^ bit_now[i+4]);
                 has_one_A[i] <= has_one_A[i] | bit_now[i];
@@ -257,8 +242,7 @@ module inverted_pair_verify #(
             pair_disagree[4] <= pair_disagree[4] | (bit_now[1] ^ bit_now[3]);
             pair_disagree[5] <= pair_disagree[5] | (bit_now[2] ^ bit_now[3]);
 
-            // Per-slot popcount + toggle (toggle is gated on sweep_addr != 0
-            // since prev_bit isn't meaningful at position 0).
+            // Per-slot popcount + toggle (toggle is gated on sweep_addr != 0 since prev_bit isn't meaningful at position 0).
             for (i = 0; i < 8; i = i + 1) begin
                 popcount[i] <= popcount[i] + {8'b0, bit_now[i]};
                 if (sweep_addr != 9'b0) begin

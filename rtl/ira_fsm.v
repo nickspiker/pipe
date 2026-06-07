@@ -2,9 +2,7 @@
 // ira_fsm.v — KOHI → BLAKE3 → TAHU provisioning orchestrator
 // =============================================================================
 //
-// Top-level state machine that ties together the entropy + conditioner +
-// OTP storage modules into a complete `ira` provisioning ceremony, per
-// IRA.md §"KOHI — gather", §"TAHU — burn".
+// Top-level state machine that ties together the entropy + conditioner + OTP storage modules into a complete `ira` provisioning ceremony, per IRA.md §"KOHI — gather", §"TAHU — burn".
 //
 // This module owns the *sequencing* of provisioning; it does NOT own:
 //   - the rings (live in top.v, fed into trng.ring_in)
@@ -13,11 +11,10 @@
 //   - the OTP slot storage (lives in otp.v)
 //   - the pair classification (lives in inverted_pair_verify.v, combinational)
 //
-// It observes `chip_state` from inverted_pair_verify (which sees the OTP
-// slots live) and reacts:
+// It observes `chip_state` from inverted_pair_verify (which sees the OTP slots live) and reacts:
 //
-//   state=0 VIRGIN  + provision_request → run ceremony
-//   state=1 FUCKED                       → assert chip_fucked, idle
+//   state=0 KORE  + provision_request → run ceremony
+//   state=1 DARK                       → assert chip_dark, idle
 //   state≥2 DEGRADED/HEALTHY              → chip is provisioned; nothing to do
 //
 // First-cut scope (this commit):
@@ -25,16 +22,13 @@
 //   - BLAKE3: pulse blake3_start, capture 256-bit ira_seed
 //   - TAHU: burn slots 0..3 (A=ira_seed), then 4..7 (B=~ira_seed)
 //   - No TATARI delay (TODO: add the BLAKE3-derived 256–1280 ms random pause)
-//   - No per-burn read-back verify (the next power cycle's classifier read
-//     naturally validates each pair; partial burns surface as FUCKED next boot)
-//   - No wairua orchestration (separate FSM later, but sharing this module's
-//     trng/blake3 instances via the same arbiter pattern)
+//   - No per-burn read-back verify (the next power cycle's classifier read naturally validates each pair; partial burns surface as DARK next boot)
+//   - No wairua orchestration (separate FSM later, but sharing this module's trng/blake3 instances via the same arbiter pattern)
 //
-// chip_fucked is asserted when:
-//   - boot-time state == FUCKED (e.g., previous TAHU was interrupted), OR
+// chip_dark is asserted when:
+//   - boot-time state == DARK (e.g., previous TAHU was interrupted), OR
 //   - trng.health_fail latches during this boot's KOHI, OR
-//   - an OTP burn is rejected (write to already-burned slot — shouldn't
-//     happen on a fresh VIRGIN device; latches FUCKED defensively)
+//   - an OTP burn is rejected (write to already-burned slot — shouldn't happen on a fresh KORE device; latches DARK defensively)
 //
 // =============================================================================
 
@@ -44,12 +38,11 @@ module ira_fsm (
     input  wire         clk,                 // enclave_clk
     input  wire         reset_n,
 
-    // External trigger — pulse to start provisioning. Honored only when
-    // chip_state == VIRGIN. Ignored otherwise (no-op).
+    // External trigger — pulse to start provisioning. Honored only when chip_state == KORE. Ignored otherwise (no-op).
     input  wire         provision_request,
 
     // Live classifier output (combinational from inverted_pair_verify)
-    input  wire [2:0]   chip_state,          // 0=VIRGIN, 1=FUCKED, 2..4=operating
+    input  wire [2:0]   chip_state,          // 0=KORE, 1=DARK, 2..4=operating
     input  wire         byzantine_ok,
 
     // trng.v handshake
@@ -72,7 +65,7 @@ module ira_fsm (
     input  wire         otp_write_rejected,
 
     // Outputs to the rest of the chip
-    output reg          chip_fucked,         // gate for codec's tx_drive_enable
+    output reg          chip_dark,         // gate for codec's tx_drive_enable
     output reg          ceremony_busy,       // high during KOHI/BLAKE3/TAHU
     output reg          ceremony_done,       // 1-cycle pulse when TAHU completes
     output reg  [2:0]   fsm_state            // debug observability
@@ -82,20 +75,16 @@ module ira_fsm (
     // FSM states
     // -------------------------------------------------------------------------
     localparam [2:0]
-        ST_OBSERVE  = 3'd0,   // idle; gate chip_fucked from chip_state
+        ST_OBSERVE  = 3'd0,   // idle; gate chip_dark from chip_state
         ST_KOHI     = 3'd1,   // trng running
         ST_BLAKE3   = 3'd2,   // blake3_tree conditioning
         ST_TAHU_A   = 3'd3,   // burn slots 0..3 (A = ira_seed)
         ST_TAHU_B   = 3'd4,   // burn slots 4..7 (B = ~ira_seed)
         ST_DONE     = 3'd5,   // pulse ceremony_done, settle, return to OBSERVE
         ST_SETTLE   = 3'd6,   // wait for verify to complete fresh post-burn sweeps
-        ST_FUCKED   = 3'd7;   // latched failure; never leaves until POR
+        ST_DARK   = 3'd7;   // latched failure; never leaves until POR
 
-    // Wait long enough after TAHU for inverted_pair_verify to complete at
-    // least two full sweeps on the new (post-burn) slot_flat data. Sweep is
-    // 257 cycles; 1024 covers four sweeps comfortably and avoids any
-    // mid-sweep mismatched-latched-output transient propagating into a
-    // false ST_FUCKED transition.
+    // Wait long enough after TAHU for inverted_pair_verify to complete at least two full sweeps on the new (post-burn) slot_flat data. Sweep is 257 cycles; 1024 covers four sweeps comfortably and avoids any mid-sweep mismatched-latched-output transient propagating into a false ST_DARK transition.
     localparam [9:0] SETTLE_CYCLES = 10'd1023;
     reg [9:0]        settle_cnt;
 
@@ -106,10 +95,9 @@ module ira_fsm (
     reg [1:0]   burn_idx;      // 0..3 within ST_TAHU_A or ST_TAHU_B
     reg         awaiting_burn; // high between write_enable pulse and write_done
 
-    // Boot-time FUCKED detection: if we power up with chip_state == FUCKED
-    // (a previous burn was interrupted), latch chip_fucked permanently.
+    // Boot-time DARK detection: if we power up with chip_state == DARK (a previous burn was interrupted), latch chip_dark permanently.
     // This is observed combinationally from chip_state.
-    wire boot_fucked = (chip_state == 3'd1);
+    wire boot_dark = (chip_state == 3'd1);
 
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
@@ -119,7 +107,7 @@ module ira_fsm (
             otp_write_addr   <= 3'b0;
             otp_write_data   <= 256'b0;
             otp_write_enable <= 1'b0;
-            chip_fucked      <= 1'b0;
+            chip_dark      <= 1'b0;
             ceremony_busy    <= 1'b0;
             ceremony_done    <= 1'b0;
             ira_seed         <= 256'b0;
@@ -135,16 +123,15 @@ module ira_fsm (
 
             case (fsm_state)
                 // ----------------------------------------------------------
-                // ST_OBSERVE: idle. Pass FUCKED through to chip_fucked. If
-                // VIRGIN + provision_request, kick off the ceremony.
+                // ST_OBSERVE: idle. Pass DARK through to chip_dark. If KORE + provision_request, kick off the ceremony.
                 // ----------------------------------------------------------
                 ST_OBSERVE: begin
                     ceremony_busy <= 1'b0;
-                    chip_fucked   <= boot_fucked;
-                    if (boot_fucked) begin
-                        fsm_state <= ST_FUCKED;
+                    chip_dark   <= boot_dark;
+                    if (boot_dark) begin
+                        fsm_state <= ST_DARK;
                     end else if ((chip_state == 3'd0) && provision_request) begin
-                        // VIRGIN + request → kick off KOHI
+                        // KORE + request → kick off KOHI
                         trng_start    <= 1'b1;
                         ceremony_busy <= 1'b1;
                         fsm_state     <= ST_KOHI;
@@ -152,13 +139,12 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_KOHI: wait for trng.gather_done (success) or
-                // trng.health_fail (broken silicon → FUCKED).
+                // ST_KOHI: wait for trng.gather_done (success) or trng.health_fail (broken silicon → DARK).
                 // ----------------------------------------------------------
                 ST_KOHI: begin
                     if (trng_health_fail) begin
-                        chip_fucked <= 1'b1;
-                        fsm_state   <= ST_FUCKED;
+                        chip_dark <= 1'b1;
+                        fsm_state   <= ST_DARK;
                     end else if (trng_gather_done) begin
                         blake3_start <= 1'b1;
                         fsm_state    <= ST_BLAKE3;
@@ -195,10 +181,9 @@ module ira_fsm (
                             burn_idx <= burn_idx + 2'd1;
                         end
                     end else if (otp_write_rejected) begin
-                        // Slot was already burned — should be impossible on
-                        // a fresh VIRGIN chip. Defensive: latch FUCKED.
-                        chip_fucked <= 1'b1;
-                        fsm_state   <= ST_FUCKED;
+                        // Slot was already burned — should be impossible on a fresh KORE chip. Defensive: latch DARK.
+                        chip_dark <= 1'b1;
+                        fsm_state   <= ST_DARK;
                     end
                 end
 
@@ -219,19 +204,13 @@ module ira_fsm (
                             burn_idx <= burn_idx + 2'd1;
                         end
                     end else if (otp_write_rejected) begin
-                        chip_fucked <= 1'b1;
-                        fsm_state   <= ST_FUCKED;
+                        chip_dark <= 1'b1;
+                        fsm_state   <= ST_DARK;
                     end
                 end
 
                 // ----------------------------------------------------------
-                // ST_DONE: ceremony complete. Pulse ceremony_done, then move
-                // to SETTLE so the verify module has time to complete fresh
-                // post-burn sweeps on the new slot_flat data — without this,
-                // a mid-sweep latched output (mixing OLD all-zero and NEW
-                // burned bits) reads as FUCKED for one sweep period and
-                // ST_OBSERVE would latch the chip into ST_FUCKED on that
-                // spurious transient.
+                // ST_DONE: ceremony complete. Pulse ceremony_done, then move to SETTLE so the verify module has time to complete fresh post-burn sweeps on the new slot_flat data — without this, a mid-sweep latched output (mixing OLD all-zero and NEW burned bits) reads as DARK for one sweep period and ST_OBSERVE would latch the chip into ST_DARK on that spurious transient.
                 // ----------------------------------------------------------
                 ST_DONE: begin
                     ceremony_done <= 1'b1;
@@ -240,11 +219,8 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_SETTLE: hold off chip_fucked / ST_FUCKED transitions for
-                // SETTLE_CYCLES cycles after the last OTP burn, giving
-                // inverted_pair_verify time to sweep the new slot data.
-                // chip_state may transiently read FUCKED during this window
-                // — we ignore it.
+                // ST_SETTLE: hold off chip_dark / ST_DARK transitions for SETTLE_CYCLES cycles after the last OTP burn, giving inverted_pair_verify time to sweep the new slot data.
+                // chip_state may transiently read DARK during this window — we ignore it.
                 // ----------------------------------------------------------
                 ST_SETTLE: begin
                     if (settle_cnt == 10'b0) begin
@@ -255,10 +231,10 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_FUCKED: terminal. Never exits except via POR.
+                // ST_DARK: terminal. Never exits except via POR.
                 // ----------------------------------------------------------
-                ST_FUCKED: begin
-                    chip_fucked   <= 1'b1;
+                ST_DARK: begin
+                    chip_dark   <= 1'b1;
                     ceremony_busy <= 1'b0;
                 end
 

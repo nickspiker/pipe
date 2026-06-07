@@ -1,0 +1,572 @@
+\documentclass[12pt,letterpaper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+\usepackage[top=1in,bottom=1in,left=1in,right=1in]{geometry}
+\usepackage[document]{ragged2e}
+\usepackage{setspace}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{textcomp}
+\usepackage{etoolbox}
+\usepackage{hyperref}
+
+\hypersetup{
+    colorlinks=false,
+    pdfborder={0 0 0},
+    pdftitle={Method and Apparatus for Vendor-Free Domain-Separated Device Attestation},
+    pdfauthor={Nick Spiker},
+    pdfsubject={Non-Provisional Patent Application}
+}
+
+\onehalfspacing
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7em}
+
+\renewcommand{\baselinestretch}{1.5}
+
+% Paragraph numbering [0001]
+\newcounter{para}
+\newcommand{\padzero}{%
+  \ifnum\value{para}<10 000\else%
+  \ifnum\value{para}<100 00\else%
+  \ifnum\value{para}<1000 0\else%
+  \fi\fi\fi}
+\newcommand{\para}{%
+  \refstepcounter{para}\noindent\textbf{[\padzero\arabic{para}]}\hspace{0.5em}\ignorespaces}
+
+% USPTO-style centered all-caps section headings
+\makeatletter
+\renewcommand{\section}{\@startsection{section}{1}{0pt}%
+  {2em}{1em}%
+  {\centering\normalfont\normalsize\bfseries\MakeUppercase}}
+\renewcommand{\subsection}{\@startsection{subsection}{2}{0pt}%
+  {1.5em}{0.5em}%
+  {\normalfont\normalsize\bfseries}}
+\makeatother
+
+\begin{document}
+
+\thispagestyle{empty}
+
+\begin{center}
+\textbf{METHOD AND APPARATUS FOR VENDOR-FREE\\
+DOMAIN-SEPARATED DEVICE ATTESTATION\\
+VIA OWNER-INITIATED CRYPTOGRAPHIC PROVISIONING}
+\end{center}
+
+\vspace{2em}
+
+\begin{flushleft}
+Inventor: Nick Spiker\\
+Contact: \texttt{fractaldecoder@proton.me}\\
+Filing: Non-Provisional Patent Application
+\end{flushleft}
+
+\vspace{1em}
+
+\section{Cross-Reference to Related Applications}
+
+\para This application is one of four related filings establishing a complete stack of user-sovereign computing infrastructure. The related applications are: SPIRIX (filed 2025), directed to a two's complement floating-point arithmetic format providing cross-platform deterministic computation; ISOMEM (provisional filed March 2026), directed to hardware memory protection architecture using base-limit register pairs with cryptographically indistinguishable invalid access responses; and TOKEN (filed concurrently with the present application), directed to user-sovereign human identity, threshold reconstitution, billing attestation, mobile virtual network operator network provisioning, and physics-anchored temporal sovereignty. The dependencies among these applications are described in the cross-reference section near the end of this specification.
+
+\section{Statement Regarding Federally Sponsored Research or Development}
+
+\para Not applicable.
+
+\section{Background of the Invention}
+
+\subsection{Field of the Invention}
+
+\para The present invention relates to hardware-rooted cryptographic device identity, hardware identity element design, single-channel bidirectional communication protocols, line coding, true-random-number generation, write-once cryptographic storage, and domain-separated cryptographic attestation. More specifically, the present invention pertains to a chip architecture wherein the chip's permanent cryptographic identifier originates from physical entropy sampled by noise-detection circuitry resident on the chip's silicon at the unrepeatable moment of an owner-initiated provisioning event, the sampled entropy comprising transient physical phenomena present at and within the chip's silicon at the moment of sampling, the unrepeatability of the entropy deriving jointly from the owner's choice of triggering moment and from the unrepeatable physical state present at that moment; is never transmitted, exposed, or otherwise made accessible to any party outside the chip by any non-destructive means; and functions only as a key for keyed cryptographic commitments produced inside the chip and emitted to requesting applications as domain-separated derivatives carried over a single bidirectional communication channel, the channel comprising any of an electrical conductor, an optical fiber coupled to paired light emitters and detectors, a magnetic or inductive coupling element, a capacitive coupling element, a radio-frequency near-field link, or an acoustic link, such that the chip's identifier has no issuing authority and the chip's external behaviour does not enable cross-application correlation of the device.
+
+\para The present invention does not address human identity, user authentication, account systems, or service authorization. Those concerns are the subject of the related TOKEN application identified above and are outside the scope of the present filing.
+
+\subsection{Description of the Related Art}
+
+\para A purchaser of an integrated-circuit hardware identity device does not, in current commercial practice, purchase the device's cryptographic identity. Every hardware identity element commercially distributed in the past fifteen years has a cryptographic key whose value was known to the chip's manufacturer prior to the purchaser's acquisition of the chip, or whose value is subject to certification by a certificate authority controlled by the chip's manufacturer, or both. Commercial implementations of this pattern include the Apple Secure Enclave, the Google Titan and Titan M security chips, the Microsoft Pluton security processor, the ARM TrustZone CPU operating mode, the Qualcomm QSEE environment, the Intel SGX enclave system, and Trusted Platform Modules conforming to the Trusted Computing Group TPM 2.0 specification. In each such implementation, the chip's manufacturer occupies a position in the trust path during identity creation, attestation signing, certificate authority operation, or destruct command authority. The user, who purchased the chip and holds the chip physically, does not occupy any of these positions in the trust path.
+
+\para A second structural problem affects prior art devices independently of the first. Even when the chip's manufacturer were entirely honest, and even when the manufacturer never used or disclosed its knowledge of the chip's key, the chip in prior art implementations answers cryptographic identity queries using a single fingerprint-stable key. Two unrelated services querying the same prior art chip with the same question receive answers that any third party can correlate, by inspection of the answers, without requiring access to either service's secret material. The chip thereby functions as a structural surveillance surface. Cross-service correlation of users does not require a manufacturer's cooperation; it requires only that the operators of multiple services maintain logs of the chip-attested values they have received, and that those logs be joined on the fingerprint field. The FIDO2 specification family partially addresses this property within FIDO authentication flows thru the use of per-relying-party keys derived from a master device key; however, the master device key is generated under manufacturer-signed firmware, the attestation root certificate is manufacturer-controlled, and the per-relying-party domain separation does not extend to uses of the device's identity outside FIDO authentication flows.
+
+\para The pattern is consistent across the prior art. Chip identity, as the prior art implements it, is a permission granted by the chip's manufacturer and revocable by the chip's manufacturer; the chip's user is a tenant in the manufacturer's identity infrastructure rather than the owner of the chip's identity. Furthermore, prior art chip identity answers every cryptographic query with a structurally correlatable value, rendering the chip a single fingerprint regardless of the consent of the chip's user to such correlation.
+
+\para Specific prior art systems and their limitations are summarized as follows. The Apple Secure Enclave provides per-chip unique identifiers generated at fabrication and signed by Apple's certificate authority; Apple retains provisioning records, can revoke device attestation, and the single per-chip identifier enables fingerprint correlation across all services that receive Apple-attested device assertions. Google Titan and Titan M security chips provide functionally equivalent vendor-attested keys under Google's certificate authority, with the same structural properties. Trusted Platform Modules conforming to TPM 2.0 provide an endorsement key (EK) generated at manufacture and certified by the TPM vendor; the EK cannot be replaced; the EK certificate identifies the manufacturer and the chip model; the Storage Root Key and Attestation Identity Keys are derived from the EK; and the manufacturer's signature serves as the trust root for all subsequent attestations.
+
+\para ARM TrustZone provides a CPU operating mode, not a physically isolated enclave, and therefore shares physical resources (caches, branch predictors, memory buses, and power rails) with the rich execution environment; this property has resulted in repeated side-channel compromise (including the Foreshadow, Spectre, and \AE PIC vulnerability families). Microsoft Pluton is provisioned by original equipment manufacturers under Microsoft attestation, exhibiting the same vendor trust path structure. Intel SGX enclaves are attested by the Intel Attestation Service; the SGX system has been compromised via side channels and was structurally retired from Intel's consumer chip product lines in 2021, with the consequence that every user who had based identity infrastructure on SGX had that infrastructure revoked by Intel as a corporate decision.
+
+\para FIDO2 hardware token products including YubiKey, Solokey, Trezor, and Nitrokey, provide per-device cryptographic keys generated on the device; however, the firmware controlling the device is signed by the device vendor, the attestation root certificate is vendor-controlled, and the per-relying-party key separation operates only within FIDO authentication flows. For any non-FIDO use of the device key (including TPM remote attestation, automotive vehicle identity binding, and IoT device registration), the single-fingerprint property of the underlying device key returns.
+
+\para Hardware identity element products including the STMicroelectronics STSAFE family, the NXP A71CH, the Infineon OPTIGA family, and the Microchip ATECC family, provide factory-injected keys and vendor-signed device certificates. The chip ships with the key already provisioned by the manufacturer.
+
+\para Single-wire bidirectional communication prior art (including the Dallas / Maxim 1-Wire family and the Philips I${}^2$C bus) provides physical-layer prior art for single-conductor bidirectional signaling but does not include cryptographic protocols, domain separation mechanisms, entropy semantics in the handshake, or silent-on-corruption behaviour at the wire level. Line-coding prior art for direct-current balance and clock recovery (including Manchester encoding, 8b/10b coding, and NRZ-I) requires dedicated overhead bits and explicit encoder and decoder hardware, and does not deliver protocol semantics within the line code itself.
+
+\para Cryptographic prior art for elliptic-curve Diffie-Hellman ephemeral-static handshake (including the Signal Protocol, the Noise Protocol Framework, and WireGuard) provides individual instances of any one of the five protocol functions claimed in the present invention's leading-key field, but does not combine all five protocol functions within a single transmitted field at the wire level. Cryptographic prior art for keyed cryptographic commitment functions (including BLAKE3 keyed hash, HKDF, HMAC, and the Poly1305 authenticator) provides commitment function prior art alone, but does not combine such functions with hardware-isolated permanent identifiers wherein use of the commitment function is enforced at the silicon level rather than the software level.
+
+\para Physical Unclonable Function (PUF) prior art (including Verayo Vera M4H, Intrinsic ID SRAM PUF technology, and Maxim PUF-based cryptographic cells) provides hardware-rooted identity derived from manufacturing-process variation. PUF identities in commercial use are typically read out at provisioning time and enrolled in a vendor-controlled database, the stated purpose of the enrolment being to enable subsequent vendor certification of the chip's identity; the structural effect of such enrolment, irrespective of stated purpose, is that the vendor retains a queryable record of the chip's identity and therefore remains in the trust path. SRAM PUF embodiments operated without enrolment retain the single-fingerprint property and do not provide domain separation.
+
+\para Trusted Computing Group Direct Anonymous Attestation (DAA) provides a cryptographic scheme allowing a Trusted Platform Module to prove possession of a vendor-signed key without disclosing the key, and provides some unlinkability between attestations. The DAA scheme requires a vendor-issued Endorsement Key as input; the vendor's signature serves as the trust root; and cross-issuer correlation remains possible thru the vendor's view of issued endorsements.
+
+\para All identified prior art systems share two foundational architectural assumptions: first, that a party other than the chip's owner participates in the trust path during identity creation; and second, that the device answers identity queries with a structurally correlatable fingerprint, regardless of whether partial unlinkability schemes operate above the wire layer. The present invention rejects both assumptions at the silicon level.
+
+\section{Brief Summary of the Invention}
+
+\para The present invention provides a chip and protocol for vendor-free domain-separated cryptographic device attestation. The chip's permanent identity credential is generated from physical entropy captured by noise-detection circuitry resident on the chip's silicon at the moment of an owner-initiated one-time provisioning ceremony, denoted herein as the \emph{ihi}. The unrepeatability of the entropy derives jointly from the owner's choice of triggering moment, the choice being unpredictable to any party other than the owner, and from the transient physical phenomena present at and within the chip's silicon at the moment of triggering, the phenomena including thermal noise, shot noise, quantum mechanical fluctuations, and ambient electromagnetic and temperature conditions. The captured entropy is conditioned thru an on-chip cryptographic conditioner and burned to write-once storage before any external interface of the chip is capable of transmitting it. No external party witnesses the ceremony, signs the resulting identity, or holds a record of it. The chip's permanent identity therefore has no upstream issuing authority and exists nowhere except inside the chip in which it was created.
+
+\para The chip's external interface comprises exactly one bidirectional communication port. In an electrical embodiment, the port comprises a single bidirectional input/output pin coupled to a single conductor; in an optical embodiment, the port comprises a paired light emitter and light detector coupled to a single optical fiber; in a magnetic or inductive embodiment, the port comprises one or more coupling coils; and in capacitive, radio-frequency near-field, and acoustic embodiments, analogous bidirectional coupling structures apply. The protocol carried on the port uses a mirror-XOR line code wherein both endpoints encode each transmitted bit as the exclusive-or of an own-idle bias, a transmit-data value, and the most recently decoded bit received from the other endpoint. The line code produces automatic direct-current balance, free clock recovery from one logic gate, and asymmetric drive that enables tristate idling without bus contention. A leading-edge framing convention announces every message with a single binary one bit transmitted as the channel's transition out of the idle state into active transmission, said leading bit serving as the frame edge for receiver synchronisation. The N-bit message payload follows immediately. Trailing binary zero bits of the payload are not actively transmitted; the channel returns to its idle state by passive biasing once the last actively driven binary one bit has been transmitted, and the receiver reconstructs trailing zeros by slot-counting against the known message length and decoding non-actively-driven slots as binary zero. The framing cost is therefore exactly one channel slot per message irrespective of payload length, and the framing savings are the trailing zeros of the payload that the sender omits. For a payload whose bits are statistically uniform the expected number of trailing zeros is one, such that the leading frame bit and the omitted trailing zeros offset on average and the total transmitted slots equal the payload length in expectation. The maximum total transmitted slots is the payload length plus one; the minimum is one slot when the payload is all zeros; the framing never introduces a second dedicated framing slot. The decode operation is a slot-counted shift register requiring no framing-symbol detection logic. The per-message channel format places an ephemeral session key at the leading position of every payload, simultaneously providing key transport, decryption authority, message authentication, frame leading edge, and direct-current balance: five protocol functions delivered by one transmitted field.
+
+\para External attestations are produced as keyed cryptographic commitments over the chip's permanent identifier and a domain identifier supplied by the querying application. Two queries with distinct domain identifiers produce cryptographically independent attestations whose correlation requires an information-theoretically infeasible preimage attack on the commitment function. The chip's permanent identifier is not exposed in any attestation. Cross-application correlation of the device is therefore not structurally enabled by the architecture; correlation requires the chip's voluntary participation in producing attestations for both correlating domains, which in turn requires user-mediated consent.
+
+\para The chip maintains two distinct identifiers: a permanent identifier denoted \emph{ira} (burned once during the provisioning ceremony) and a per-session secret denoted \emph{wairua} (captured fresh at each handshake by the chip's noise-detection circuitry sampling transient physical phenomena present at and within the chip's silicon at the moment of the handshake). Neither identifier alone authorizes operations requiring proof of identity-plus-liveness. A handshake bit from the host doubles as a true-random-number-generation request; the resulting fresh entropy constitutes the chip's response. No separate ``request entropy'' command exists in the protocol.
+
+\para The chip's permanent identifier is stored as multiple cryptographic-inverse pairs in write-once cells, with byzantine quorum required at each chip reset. Single-event upset, manufacturing defect, electromagnetic disturbance, and partial provisioning failure are absorbed silently below the quorum-failure boundary. Below quorum, or upon any cryptographic verification failure, true-random-number-generation health failure, or non-operational condition of the chip's finite-state machine, the chip enters the DARK state, wherein wire output is gated off and the wire's idle behaviour is indistinguishable from a chip not physically present. No error code, failure indicator, or distinguishing signal is emitted on the wire under any failure condition.
+
+\para The chip's only clock source is a free-running ring oscillator internal to the chip. The chip has no external clock input, no host-authenticated destruct command, no firmware update path, no method of in-circuit identity replacement, and no in-system mechanism by which an attacker possessing the chip can extract its permanent identity, force it to use entropy from any source other than the chip's noise-detection circuitry sampling at the moment of the triggering event, or substitute a different identity. State transitions are forward-only and enforced by silicon physics rather than by software.
+
+\para The resulting device-identity primitive is application-agnostic. Downstream use cases include, but are not limited to: Internet-of-Things device identity without manufacturer involvement after initial provisioning; hardware wallets without factory-injected keys; user-sovereign identity binding as described in the related TOKEN application; automotive secure boot identity surviving ownership transfer; medical device patient-private binding; industrial control vendor-independent attestation; and defense supply-chain post-fabrication substitution detection.
+
+\section{Brief Description of the Drawings}
+
+\para FIG. 1 is a cross-sectional schematic of a chip configured according to the present invention, shown at the moment of the provisioning ceremony, illustrating the flow of physical entropy from on-chip true-random-number-generation primitives thru an on-chip cryptographic conditioner to a write-once storage array, with no external party shown in the figure.
+
+\para FIG. 2 is a state-machine diagram showing the chip's lifetime trajectory thru the five operational states (KORE, KOHI, BLAKE3, TAHU, HEALTHY) connected by forward-only state transitions, illustrating the irreversibility of the provisioning ceremony.
+
+\para FIG. 3 is a two-panel circuit schematic showing the encode and decode logic of the mirror-XOR line code at the chip endpoint and at the host endpoint, including the asymmetric pull-down resistor on the wire and a wire-state timing diagram illustrating one full slot cycle of mirror-XOR idle.
+
+\para FIG. 4 is a message wire-format diagram showing the leading framing bit, the ephemeral session public key field, the ciphertext field, and the trailing termination bit, with annotation callouts identifying the five protocol functions performed by the ephemeral session public key field.
+
+\para FIG. 5 is a diagram of the chip's write-once storage array, illustrating the inverted-pair layout, the per-pair validity check, the byzantine classifier circuit, and the failure mode in which a single bit flip in one cell of one pair leaves the chip operational under byzantine quorum.
+
+\para FIG. 6 is a cross-sectional schematic of the chip package showing the physical isolation domain enclosing all internal circuitry, with exactly one bidirectional communication interface crossing the boundary (depicted as an input/output pin in the electrical embodiment, but representable as an optical port, magnetic coupling coil, or other bidirectional channel terminus in alternative embodiments), illustrating the absence of all other external interfaces including external clock input, debug port, firmware update interface, and destruct command port.
+
+\para FIG. 7 is a comparison diagram showing three wire-voltage waveforms over identical timescales corresponding to: a chip in the HEALTHY state at idle; a chip in the DARK state; and a chip physically removed from the system. The waveforms for the DARK state and for the chip-removed state are identical.
+
+\para FIG. 8 is a diagram showing the chip configured to produce domain-separated attestations in response to queries from a plurality of applications, illustrating that each application receives a cryptographically independent attestation derived from the chip's permanent identifier and the application-supplied domain identifier, and that no application can derive another application's attestation without performing an information-theoretically infeasible preimage attack on the commitment function.
+
+\para FIG. 9 is a diagram illustrating a specific embodiment of the domain-separated attestation in which the domain identifier is a state-query identifier and the commitment input is extended with a packed state vector representing the chip's current operational state, such that the attestation simultaneously commits to the chip's identity, the requesting application's domain, and the chip's operational state.
+
+\para FIG. 10 is an application surface diagram showing a chip configured according to the present invention at the centre, with a plurality of downstream applications radiating outward, illustrating that the device-identity primitive provided by the chip is application-agnostic.
+
+\section{Detailed Description of the Invention}
+
+\subsection{Terminology}
+
+\para The present specification uses certain te reo M\=aori terms for the chip's identity primitives, ceremony events, and operational states. The terms are used with the following meanings: \emph{ihi} denotes the ceremony in which the chip's permanent identifier is brought into existence from physical entropy captured by noise-detection circuitry resident on the chip's silicon at the moment of an owner-initiated triggering event; the \emph{ihi} is owner-initiated, irreversible, and witnessed only by the chip itself. \emph{ira} denotes the permanent identifier resulting from the \emph{ihi}, and serves as the chip's lifelong device identity. \emph{wairua} denotes the per-session secret drawn from fresh physical entropy at each handshake, and is distinct from \emph{ira}. KOHI denotes a sub-step of the \emph{ihi} comprising gathering entropy from on-chip true-random-number-generation primitives. TAHU denotes a sub-step of the \emph{ihi} comprising writing the conditioned entropy to write-once storage. KORE denotes the chip's pre-provisioning operational state, the te reo M\=aori word signifying the primordial void or absence of form, used herein to designate the state in which the chip's write-once storage cells are all zero and the chip possesses no identity. \emph{motuhake} denotes a canonical test domain identifier used in protocol exercises.
+
+\para The chip's five operational state codes are designated as follows. KORE designates the state in which the chip's write-once storage cells are all zero, no \emph{ihi} has been performed, and the chip has no identity. HEALTHY designates the state in which the \emph{ihi} has completed and the chip's identity is recoverable from all redundant storage pairs. DEGRADED-1 designates the state in which one redundancy pair has become invalid and the chip's identity is recoverable from the remaining valid pairs. DEGRADED-2 designates the state in which two redundancy pairs have become invalid and the chip's identity is recoverable at minimum byzantine quorum. DARK designates the state entered upon any of the following conditions: byzantine quorum failure of the storage, cryptographic verification failure, true-random-number-generation health failure, or any non-operational condition of the chip's finite-state machine. In the DARK state, the wire output is gated off and the wire's behaviour is indistinguishable from that of a chip not physically present.
+
+\subsection{The Provisioning Ceremony}
+
+\para The chip arrives in the KORE state. The chip's write-once storage cells are all zero. The chip's finite-state machine reports a chip\_state value of KORE. The chip has no identity in this state. The chip cannot attest to anything in this state because the chip has no material with which to attest. The chip's manufacturer, having shipped the chip in this state, possesses no information concerning the chip's identity, because the chip's identity does not exist.
+
+\para An owner of the chip initiates the \emph{ihi} by transmitting a single-bit provisioning request signal to the chip's external bidirectional pin. In response to the provisioning request, the chip's finite-state machine transitions from the KORE state to the KOHI state.
+
+\para In the KOHI state, the chip's noise-detection circuitry samples transient physical phenomena present at and within the chip's silicon at the moment of the sampling. The phenomena include, in various embodiments, thermal noise (Johnson-Nyquist noise arising from the silicon's instantaneous temperature), shot noise (arising from the quantization of electron flow at the moment of sampling), quantum mechanical fluctuations in metastable resolution, ambient electromagnetic field conditions, and other transient environmental physical noise sources present at and within the chip. The unrepeatability of the resulting entropy derives jointly from the owner's choice of triggering moment, the choice being unpredictable to any party other than the owner, and from the unrepeatable physical state present at that moment. The chip's noise-detection circuitry comprises, in some embodiments, a plurality of free-running ring oscillators sampled thru statistical entropy-extraction tests including, in some embodiments, the repetition count test, the adaptive proportion test, and an iterated derivative test specified by NIST Special Publication 800-90B; in some embodiments, one or more transition-effect ring oscillators; in some embodiments, one or more metastable arbitration circuits; in some embodiments, one or more subthreshold-inverter shot-noise samplers or thermal-noise amplifiers; or in some embodiments, any combination of the foregoing operated in parallel. The combination of detection circuits is a matter of implementation choice; the requirement is that the sampling be performed by circuitry resident on the chip's silicon and that no entropy be introduced from outside the chip.
+
+\para The chip gathers entropy until on-chip health diagnostics confirm sufficient entropy quality. If the health diagnostics report failure, the chip enters the DARK state and the \emph{ihi} is aborted. In this case, the chip silently refuses to provision rather than provisioning with insufficient entropy. The chip cannot be coerced into using external entropy because no external entropy input exists. If the silicon's true-random-number generator is broken, the chip refuses to claim an identity it cannot defensibly attest under.
+
+\para Upon successful completion of KOHI, the finite-state machine transitions to the BLAKE3 state. In this state, the gathered entropy is conditioned thru an on-chip cryptographic hash function implemented in hardware logic. In some embodiments, the hash function is BLAKE3 operating in tree-hash mode. The output of the conditioner is a 256-bit cryptographic-quality value, deterministic with respect to the gathered entropy and resistant to bias from any non-uniformity in the entropy source. The conditioner circuit is part of the chip's mask design and is therefore known to the chip's manufacturer; however, the manufacturer does not know the conditioner's input on any specific chip, because the input is the entropy gathered in KOHI on that specific chip.
+
+\para Upon completion of BLAKE3 conditioning, the finite-state machine transitions to the TAHU state. In this state, the conditioned 256-bit value is written to the chip's write-once storage cells according to the inverted-pair layout described in connection with FIG. 5. The write operation is electrically irreversible: the cells transition from an unwritten state to a written state, and the chip's mask design provides no path by which they can return to the unwritten state. The write occurs before the chip's external interface is capable of transmitting the conditioned identifier. After TAHU completes, no signal path exists between the storage cells and the external pin that exposes the cells' contents in plaintext.
+
+\para Upon completion of TAHU, the finite-state machine transitions to the HEALTHY state. The chip is provisioned. The chip's identity exists. The chip will not reveal the identity to any external party, including the chip's owner, the chip's manufacturer, or any authority that may compel disclosure at any future time. The identity is a quantity inside silicon that no party outside the silicon observes.
+
+\subsection{The Single Bidirectional Interface}
+
+\para The chip's external interface comprises exactly one bidirectional communication port. The chip does not include a separate clock input, a debug interface, a JTAG tap, an in-circuit firmware update mechanism, an out-of-band manufacturer access path, a destruct port, or any other interface that crosses the chip's package boundary. The architectural decision to provide a single bidirectional port is not aesthetic; each interface absent from the chip is a class of attack absent from the chip.
+
+\para The physical embodiment of the single bidirectional port may vary by application. In an electrical embodiment, the port comprises a single bidirectional input/output pin coupled to a single conductor, with an external pull-down resistor (or, in some embodiments, an external pull-up resistor) coupled to the conductor establishing the conductor's idle electrical state. In an optical embodiment, the port comprises a paired light emitter and light detector at the chip side and a corresponding paired emitter and detector at the host side, with both pairs coupled to a single optical fiber operating as a bidirectional channel; the channel's idle state is established by an optical bias source or by passive emitter quiescence with detector thresholding. In a magnetic or inductive embodiment, the port comprises one or more coupling coils, with the channel operating thru near-field magnetic coupling and the channel's idle state established by a quiescent flux level. Capacitive, radio-frequency near-field, and acoustic embodiments employ analogous structures. References herein to ``wire,'' ``conductor,'' ``drive,'' ``pull-down,'' ``high logic level,'' ``low logic level,'' and similar electrical terminology are used to describe the line code clearly in the electrical embodiment; in non-electrical embodiments, the corresponding analog structures and signal states apply, and the term ``channel'' is used herein when the description applies generally to any physical embodiment.
+
+\para The absence of a JTAG interface eliminates in-system invasive probing of the chip's internal state. The absence of a firmware update mechanism eliminates the possibility of future vendor-pushed identity replacement. The absence of a debug interface eliminates any manufacturer access path designated as a service mode. The absence of a destruct pin eliminates any host-authenticated wipe that an attacker possessing the chip could trigger. The absence of an external clock input eliminates clock-glitching attacks against the chip's finite-state machine.
+
+\para The chip's only clock source is a free-running ring oscillator internal to the chip. The frequency of the ring oscillator varies with temperature, voltage, and process variations; the protocol described in the present specification tolerates this variation thru automatic clock recovery in the line code. The host endpoint does not share an external clock signal with the chip. The host endpoint derives the chip's slot timing from observing the chip's wire transitions during the heartbeat phase of the protocol. A single chip can therefore be installed in any host that implements the protocol, regardless of the host's own clock, without provisioning a clock relationship between the chip and the host.
+
+\para The chip's finite-state machine transitions are forward-only. State transitions are enforced by combinational logic in the chip's mask design that physically does not provide a backward transition. The transition from KORE to KOHI is unidirectional. The transition from KOHI to BLAKE3 is unidirectional. The transition from BLAKE3 to TAHU is unidirectional. The transition from TAHU to HEALTHY is unidirectional. The DARK state, once entered, is recoverable only by power-on reset and only if the underlying failure condition is no longer present. The chip's mask design provides no software-controlled path by which an attacker could cause the chip to traverse its state graph in reverse.
+
+\subsection{The Mirror-XOR Line Code}
+
+\para The mirror-XOR line code carries the present protocol over the single bidirectional channel coupled to the chip's external port. The following description is presented in terms of an electrical embodiment for clarity; the same encode and decode logic applies to optical, magnetic, inductive, capacitive, radio-frequency, and acoustic embodiments with the corresponding analog signal states substituted for the electrical signal states. Each endpoint encodes each transmitted bit as the exclusive-or of three values: the endpoint's own idle bias, the bit value to be transmitted, and the bit value most recently decoded by the endpoint from the other endpoint's transmission. Each endpoint decodes each received bit as the exclusive-or of three values: the observed channel value at the bit's sample point, the other endpoint's idle bias, and the bit value the endpoint most recently transmitted. The chip endpoint uses an own-idle bias value of binary 1. The host endpoint uses an own-idle bias value of binary 0.
+
+\para The drive logic at each endpoint computes a drive-enable signal as the logical AND of the endpoint's own slot ownership indicator and the endpoint's computed wire output value. Each endpoint drives the wire to a high logic level when the drive-enable signal is asserted. Each endpoint releases the wire to a high-impedance state when the drive-enable signal is deasserted. The wire is held at a low logic level in the absence of drive by an external pull-down resistor coupled to the conductor. Neither endpoint drives the wire to the low logic level. Bus contention between the endpoints during simultaneous transmission slots is structurally impossible because both endpoints' slot ownership indicators cannot be simultaneously asserted.
+
+\para The line code produces three properties without dedicated hardware support. First, direct-current balance over the wire emerges from the encoding. Over any sequence of slots in which the transmitted bits are statistically uniform, the wire's mean voltage is approximately centred between the high logic level and the low logic level. The ephemeral session keys of the per-message wire format ensure such statistical uniformity. No bias resistor, decoupling capacitor, or explicit balance encoding is required.
+
+\para Second, free clock recovery emerges from the encoding. Each transition in the wire's state is a clock edge for the receiving endpoint. In the heartbeat phase of the protocol, the wire alternates between the high and low logic levels at the slot rate, providing the receiver with a transition per slot for clock synchronisation. During data transmission, the statistical randomness of the data ensures that wire transitions occur with sufficient density to maintain receiver clock lock. The clock recovery hardware comprises one logic gate and a slot counter; no dedicated phase-locked loop, delay-locked loop, or explicit synchronisation pattern is required.
+
+\para Third, the asymmetric drive property enables silent-on-corruption behaviour. The chip endpoint never drives the wire to the low logic level. Gating off the chip's drive-enable signal causes the wire to fall to the low logic level under the action of the external pull-down resistor. The chip does not actively transmit a silence signal; the chip merely stops driving. This property enables the DARK state to produce wire behaviour indistinguishable from the chip's physical absence: the chip stops driving, the wire returns to its pull-down idle, and an external observer cannot distinguish a chip that is present but has stopped driving from a chip that is not present.
+
+\para Each endpoint samples the channel state at a sampling rate substantially higher than the slot rate and accumulates the samples across the slot width by means of an up/down counter. The counter is incremented on each sample of the channel at the high logic level and decremented on each sample of the channel at the low logic level. At the slot boundary the receiving endpoint decodes the slot's bit value as the sign of the accumulated counter: a positive accumulated value decodes as binary 1, and a non-positive accumulated value decodes as binary 0. The counter is then reset for the next slot. For binary-valued channel samples, the sign-of-sum operation is mathematically equivalent to a majority vote across the samples of the slot, and is therefore equivalent to a median filter of width equal to the number of samples per slot. The receiver consequently tolerates noise events shorter in duration than one half of the slot width without bit error, irrespective of the noise event's amplitude, because such noise events flip fewer than one half of the slot's samples and therefore cannot change the sign of the accumulated counter. The sampling architecture comprises one up/down counter and one sign-bit register per endpoint; no analog filter, equalizer, or feedback loop is required. The same architecture is used at both endpoints.
+
+\para The per-message wire format places an ephemeral session public key at the leading position of every authenticated message. The same field simultaneously performs five protocol functions that conventional cryptographic protocols deliver via separate fields.
+
+\para The first function is cryptographic key transport. The ephemeral session public key is the sending endpoint's contribution to an ephemeral-static key agreement protocol. In some embodiments, the key agreement protocol is elliptic-curve Diffie-Hellman over Curve25519, such that the sender publishes a fresh X25519 public key and the receiver combines that public key with the receiver's long-term private key to derive a shared session key.
+
+\para The second function is decryption authority. The session key derived from the key agreement of the first function is used as the symmetric key for authenticated encryption with associated data (AEAD) of the ciphertext that follows the ephemeral session public key in the message. The presence of the ephemeral session public key in the message authorizes the receiver to derive the decryption key.
+
+\para The third function is message authentication. The authenticator tag produced by the AEAD operation of the second function (in some embodiments, a Poly1305 tag) is computed over the ephemeral session public key and the ciphertext under the session key. Any modification of either the ephemeral session public key or the ciphertext invalidates the authenticator tag and is detected by the receiver.
+
+\para The fourth function is the frame leading edge. A single binary one bit is transmitted before every message as the wire's transition out of the idle state into active transmission, the receiver synchronising message-start detection to said transition. The leading frame bit is not a bit of the message payload; it is one additional channel slot per message regardless of payload length, occupying the slot immediately preceding the first bit of the ephemeral session public key field.
+
+\para Concomitantly, trailing zeros of the message payload are not actively driven onto the channel. The sender ceases active transmission after the last actively driven binary one bit of the payload, and the channel returns to its idle low state by passive biasing. The receiver reconstructs the trailing zeros by slot-counting N slots after the leading frame bit, where N is the known fixed payload length, and decoding each non-actively-driven slot as binary zero. The decode operation is therefore a slot-counted shift register without dedicated framing-symbol detection logic: each slot is sampled, and any slot not actively driven by the remote endpoint is decoded as zero.
+
+\para The combination of the leading frame bit with the omitted-trailing-zeros convention produces an asymptotic average overhead of zero channel slots per message: the leading frame bit costs one slot, and the omitted trailing zeros save a variable number of slots whose statistical expectation, for a payload whose bits are statistically uniform, is one slot (the number of trailing zeros in a uniformly random bit string being geometrically distributed with mean one). The two effects offset on average. The maximum total channel slots transmitted is the payload length plus one (when the last bit of the payload is a one and no trailing zeros are present to omit). The minimum is one slot (when the payload is all zeros, only the leading frame bit being transmitted). The framing never introduces a second dedicated framing slot beyond the leading frame bit; in particular, no trailing end-of-message marker, no length prefix, and no inter-message gap signaling is present in the wire-level protocol. The same channel-idle state at the end of transmission also serves as the silent-on-corruption indicator described in the failure-mode subsection: a chip in the DARK state and a chip having completed transmission both present an undriven channel; the receiver disambiguates by message-length accounting and timeout, not by additional wire signaling. The same channel-idle state also serves as the silent-on-corruption indicator described in the failure-mode subsection: a chip in the DARK state and a chip having completed transmission both present an undriven channel; the receiver disambiguates by message-length accounting and timeout, not by additional wire signaling.
+
+\para The fifth function is automatic direct-current balance. The ephemeral session public key, being the output of a cryptographically uniform process such as X25519 public key generation from a random scalar, has an approximately uniform bit distribution. The 256 bits of the ephemeral session public key contribute approximately 128 high transitions and 128 low transitions to the line code, satisfying the direct-current balance requirement without a dedicated balance encoding field.
+
+\para No prior art cryptographic protocol combines all five of the foregoing functions in a single transmitted field at the wire level. Individual protocols provide subsets of the five functions thru separate fields. The combination of all five functions in one transmitted field, with the ephemeral session public key serving as the universal carrier, is novel.
+
+\subsection{Domain-Separated Per-Application Attestation}
+
+\para The chip produces an attestation in response to a query received from a requesting application. The query includes a domain identifier supplied by the requesting application. The domain identifier may be any value the application selects, such as a service uniform resource locator, an application name, a randomly generated handle, a hash of the application's identity, or a domain-specific identifier such as a use-case label. The chip does not constrain the structure of the domain identifier.
+
+\para The attestation produced by the chip is a keyed cryptographic commitment derived under an active commitment key and computed over an input that includes the domain identifier supplied by the requester. The active commitment key is selected from among \emph{ira} and \emph{wairua} according to the identity dichotomy described in a subsequent section. In some embodiments, the keyed cryptographic commitment is a BLAKE3 keyed hash, and the attestation is computed substantially in accordance with the relation: attestation equals BLAKE3 keyed hash of (active key, domain identifier).
+
+\para The requesting application verifies the attestation by recomputing the keyed cryptographic commitment under a previously-established public commitment derived from the chip. The chip's public commitment is a 256-bit value derived from the chip's permanent identifier and shared at the time the chip was first registered with the application. The public commitment does not reveal the chip's permanent identifier; it is sufficient for the application to verify subsequent attestations produced by the chip.
+
+\para Two queries with distinct domain identifiers produce cryptographically independent attestations. To correlate the chip across two such queries, a third party would be required to compute one query's attestation from the other's, which requires either a preimage attack on the keyed cryptographic commitment (which is information-theoretically infeasible against cryptographically secure commitment functions including BLAKE3) or the chip's voluntary participation in producing both attestations. The chip produces an attestation only in response to a query that supplies the corresponding domain identifier. The chip does not produce attestations spontaneously. The chip's user controls which queries are delivered to the chip. Cross-application correlation of the chip is therefore not a structural property of the architecture; correlation requires the user to consent to allowing both correlating applications to query the chip.
+
+\para This property distinguishes the present invention from prior art device-identity primitives commercially available in 2026. Trusted Platform Module endorsement keys, Apple Secure Enclave unique identifiers, Google Titan keys, and per-chip identifiers from hardware identity element manufacturers including STMicroelectronics, NXP, Infineon, and Microchip, answer device-identity queries with values that any third party can correlate by inspection. The present invention answers device-identity queries with values that are cryptographically independent across distinct domain identifiers. The privacy property is enforced at the silicon level rather than by a policy layer above the silicon.
+
+\para The Q\_HEALTH state-query embodiment described in connection with FIG. 9 is one specific application of the present domain-separation mechanism. In this embodiment, the domain identifier is the cryptographic hash of a state-query phrase, and the commitment input is extended with a packed state vector representing the chip's current operational state, such that the resulting attestation simultaneously commits to the chip's permanent identifier, the requesting application's domain, and the chip's current operational state. The verifying application recomputes the same hash over an asserted state vector under the chip's previously-established public commitment, thereby confirming the chip's identity and the chip's operational state under a single commitment. The Q\_HEALTH embodiment is one of many possible embodiments of the present domain-separation mechanism.
+
+\subsection{The Permanent-Plus-Session Identity Dichotomy}
+
+\para The chip maintains two distinct identifier values inside the chip. The first identifier, \emph{ira}, is generated by the provisioning ceremony described above and is stored in the chip's write-once storage. The second identifier, \emph{wairua}, is regenerated at the beginning of each new session by the chip's noise-detection circuitry sampling transient physical phenomena present at and within the chip's silicon at the moment of the handshake, and is discarded at session end.
+
+\para Each identifier alone is insufficient for the security property the chip provides. \emph{ira} alone is replay-vulnerable: any attestation the chip produces under \emph{ira} may be captured and replayed to any application that holds the chip's public commitment. Without per-session freshness, attestations under \emph{ira} would be durable artifacts subject to lift-and-reuse attacks. \emph{wairua} alone is not bound to the chip's permanent identity: any true-random-number-generation primitive coupled with a cryptographic conditioner can produce \emph{wairua}-equivalent attestations; without binding to a permanent identifier, such attestations do not prove that the producer is the same chip across distinct sessions.
+
+\para The architecture combines the two identifiers. \emph{wairua} provides per-session freshness; \emph{ira} provides identity-permanence. The active commitment key for each specific exchange is selected by a cryptographic invariant carried in the host's message rather than by a plaintext mode indicator. In some embodiments, the cryptographic invariant comprises a comparison of a verification field in the host's message against two candidate expected values, one expected value being a keyed hash of the host's recovered message and the other expected value being the bitwise complement of the keyed hash, with the polarity of the matching candidate determining the active commitment key selection.
+
+\para Selection of the active commitment key by cryptographic invariant rather than by plaintext mode indicator provides an additional privacy property. The mode of any specific exchange is part of the protected payload rather than part of the wire-observable framing. An attacker observing the wire cannot determine whether a given exchange used \emph{ira} or \emph{wairua} as the active commitment key without breaking the underlying cryptographic invariant.
+
+\subsection{The Silent-On-Corruption Failure Mode}
+
+\para The chip's response to any failure condition is silence at the wire. The wire driver's drive-enable signal is gated off; the wire returns to its pull-down idle; and the chip emits no other signal at the chip's external pin.
+
+\para Failure conditions detected by the chip's combinational logic include: a cryptographic verification failure on a received message; a byzantine quorum failure of the chip's identity storage; a true-random-number-generation health failure; and any non-operational condition of the chip's finite-state machine not enumerated above. The fourth condition is a catch-all for any internal state of the chip not anticipated as operational by the chip's mask design, including a bus stall, an undefined state code, or a coherency failure in the cryptographic conditioner.
+
+\para The chip does not emit an error code, a status byte, a corruption indicator, or any other distinguishing signal at the wire under any failure condition. Any signal the chip emitted at the wire would be observable by any party with access to the wire. A chip that distinguished its failure modes thru its wire output would make its failure modes observable to parties from whom such information should not be available. An attacker who could distinguish a chip present but with failed byzantine quorum from a chip not present learns information about the chip's storage state; an attacker who could distinguish a chip with failed true-random-number-generation diagnostics from a healthy chip learns information about the chip's entropy source; an attacker who could distinguish a chip in DARK due to cryptographic verification failure from a chip not in the system learns information about the chip's protocol exchange history. None of these distinctions assists the chip's owner; all of them assist an attacker.
+
+\para The DARK state collapses all failure conditions to a single externally-observable state: silence. The wire is at the low logic level. Whether the chip is in the HEALTHY state and idle, in the DARK state, unpowered, or physically removed from the system, the wire is at the low logic level. The chip's owner may distinguish among these conditions by means other than the wire (a power indicator, a physical inspection, or a recovery procedure); an external observer accessing only the wire cannot distinguish among them.
+
+\para The implementation of the DARK state at the wire driver comprises an AND gate computing the drive-enable signal as the logical AND of three signals: a chip-alive status signal, derived combinationally from the byzantine quorum check; a slot ownership indicator; and the endpoint's computed wire output value. When the chip-alive signal is at logic low, the drive-enable signal is at logic low, the wire driver does not drive the wire, and the wire is held at the low logic level by the external pull-down resistor. The mechanism is structurally simple and is enforced by the chip's mask design.
+
+\subsection{Inverted-Pair Write-Once Identity Storage}
+
+\para The chip's permanent identifier is stored in a plurality of write-once storage groups, each group comprising at least two cryptographically-related write-once cells. In some embodiments, each storage group comprises two cells, with the chip's permanent identifier stored in one cell of the group and the bitwise complement of the permanent identifier stored in the paired cell. In some embodiments, four such storage groups are provided.
+
+\para The validity check applied to each storage group requires that the bitwise exclusive-or of the cells in the group equals the all-ones value, and that neither cell in the group is at the all-zero state. The first condition confirms that the cells contain cryptographic inverses. The second condition excludes the unprovisioned (KORE) state in which both cells are at the all-zero state, distinguishing a properly provisioned storage group from a never-provisioned storage group and from a partially provisioned storage group.
+
+\para The byzantine quorum threshold in some embodiments is two valid storage groups out of a total of four storage groups, with all valid storage groups required to agree on the recovered identifier. In some embodiments, the threshold may be configured to other values based on the chip's intended deployment population and acceptable failure probability. The thresholds may be derived from population failure-rate calculations, including the calculation that, for an embodiment with four storage groups and a quorum of two, a per-pair failure probability of approximately 0.79 percent yields a whole-chip failure probability below 10${}^{-15}$, which is suitable for population-scale deployment.
+
+\para The inverted-pair storage layout absorbs several classes of corruption silently below the quorum-failure boundary. A single-event upset, such as a cosmic-ray-induced bit flip in one cell of one storage group, invalidates that group thru the validity check, leaving the remaining groups operational; if three groups remain valid, the chip operates in the DEGRADED-1 state. A latent manufacturing defect that manifests after provisioning, such as a marginal eFuse cell or a cell with reduced retention, appears as a single-group invalidity and is treated identically to a single-event upset. An electromagnetic disturbance of sufficient magnitude to flip bits in one or more cells invalidates the affected groups; the remaining valid groups continue to support chip operation. A partial provisioning failure, in which power loss during the TAHU sub-step of the \emph{ihi} leaves some storage groups burned and others kore, results in a mixed-kore-with-burned state that the classifier rejects as a security precaution; a chip whose provisioning was interrupted does not operate, because the identity it would attest under may not be the identity the owner intended to provision.
+
+\para No external signal sequence at the chip's external port can alter, replace, or extract the contents of the write-once storage cells. The cells are coupled to internal silicon paths and to the chip's finite-state machine, but not to the external port in any path that exposes the cells' contents in plaintext or in any reversible encoding. The chip's permanent identifier is therefore non-destructively inviolable from outside, in the sense that an attacker possessing the chip and operating the chip's external interface has no means by which to extract, substitute, or modify the chip's permanent identifier. The permanent identifier participates in cryptographic operations inside the chip only as a key for keyed cryptographic commitments; the commitments emitted at the chip's external port are functions of the identifier under preimage-resistant cryptographic hash, and an external party in possession of any quantity of such commitments cannot recover the identifier itself by any non-destructive computational means.
+
+\para Recovery of the chip's permanent identifier by an attacker would require physical invasive analysis of the chip's silicon, including but not limited to: decapping of the chip package and layer-by-layer mechanical or chemical removal of the chip's metal layers to expose the write-once storage cells for optical or electron-microscope readout; focused ion beam milling to probe internal silicon nets; laminographic X-ray imaging of the chip's internal structure; or other destructive techniques. The chip's mask design may, in some embodiments, further frustrate such physical invasive analysis through one or more anti-invasive features, including: a top-metal active mesh covering the write-once storage cells and the cryptographic conditioner, the mesh configured to detect penetration and cause the chip to enter the failure-response state described above; one or more passive shielding layers comprising metallization patterns configured to obstruct laminographic X-ray imaging of the chip's internal structure; an irradiation-detection circuit configured to cause the chip to enter the failure-response state upon detection of an attempt at invasive analysis using charged-particle or photon-based probes; one or more dummy circuit blocks resembling but not implementing the cryptographic functions of the chip, the dummy circuits configured to mislead reverse-engineering effort; and a tamper-evident package coating configured to render decapping observable to the chip's owner. The choice and combination of anti-invasive features is a matter of implementation; the protocol described in the present specification is independent of the chosen anti-invasive features and is enforced at the silicon level regardless of which combination is selected.
+
+\subsection{Application Surface of the Device-Identity Primitive}
+
+\para The device-identity primitive provided by the present invention is application-agnostic. The chip's identity is created in the chip's own silicon; the chip's identity is expressed only thru domain-separated commitments; and the chip's identity is owned by the chip. What the device-identity primitive is used for downstream is a matter outside the chip's concern and outside the scope of the present claims. The breadth of the application surface is the breadth of the market for the primitive.
+
+\para In an Internet-of-Things device identity application, a device originally provisioned with a per-device certificate signed by the device vendor or by a third-party identity service is replaced by a device provisioned in accordance with the present invention. The third-party identity service or device vendor is removed from the trust path; the device's identity is created in the device's own silicon at first power-on by the device's owner (which may be the original equipment manufacturer integrating the chip, or the end user if the original equipment manufacturer defers provisioning to the end user); and the Internet-of-Things platform receives the device's public commitment at registration time and verifies subsequent attestations without further third-party involvement.
+
+\para In a hardware-wallet application, a cryptographic wallet seed is derived from the chip's permanent identifier thru one or more domain-separated derivations, eliminating any factory-injected key from the wallet's seed chain.
+
+\para In a user-sovereign identity binding application as described in the related TOKEN application, the chip's permanent identifier serves as the device-side input to a device-to-user binding derivation, with the user's TOKEN handle serving as the user-side input. The binding derivation is the subject of the TOKEN application and is outside the scope of the present claims.
+
+\para In an automotive secure boot application, a vehicle's electronic control unit is provisioned with a chip configured in accordance with the present invention; the chip's identity survives ownership transfer of the vehicle without re-provisioning, because the chip's identity is owned by the chip rather than by the vehicle's current owner.
+
+\para In a medical device patient-private binding application, a medical device holding patient-private data is provisioned with a chip configured in accordance with the present invention by the patient or by the patient's care provider, eliminating any device-manufacturer involvement in the chip's data-stream identity.
+
+\para In an industrial control attestation application, an industrial control system is provisioned with chips configured in accordance with the present invention by the operating entity (a utility, a refinery, a power plant, or another operator skeptical of vendor trust), eliminating any device-vendor certificate authority from the trust path.
+
+\para In a defense supply-chain post-fabrication substitution detection application, a chip configured in accordance with the present invention is provisioned by the defense supplier at a known time and place; any subsequent substitution of the chip would require the substituted chip to possess a permanent identifier created in the original chip's silicon, which is information-theoretically impossible because the original chip's identity was created in silicon-native entropy that no other chip can replicate.
+
+\subsection{Experimental Validation}
+
+\para The protocol described in the present specification has been implemented and validated on hardware. A non-limiting example implementation comprises a Lattice ECP5-25F field-programmable gate array configured to perform the chip-side protocol, coupled by a single conductor to a Raspberry Pi RP2040 microcontroller configured to perform the host-side protocol. A nine-test simulation testbench exercises the chip-side finite-state machine thru the provisioning ceremony, two repeated permanent-mode authenticated exchanges (to demonstrate determinism within a session), a session-mode authenticated exchange (to demonstrate mode separation), a state-query authenticated exchange (to exercise the Q\_HEALTH state-vector commitment embodiment), and two single-bit-fault exchanges (to exercise the silent-on-corruption failure mode). All nine simulation tests passed without modification of the protocol implementation. A twelve-test host-side implementation crate exercises the host-side protocol and passes all twelve tests, including end-to-end exchange of the canonical test vector thru an in-process chip emulator. The chip-side cryptographic hash computation has been independently validated by cross-comparison against the host-side cryptographic hash computation on real silicon: a fingerprint of the chip's session pad observed on the field-programmable gate array's output display was matched exactly against the host-side computation, confirming that the byte-order convention of the cryptographic hash is independently validated on real silicon rather than only being self-consistent within a simulator.
+
+\para Two distinct permanent-identifier values were generated by the field-programmable gate array on two power cycles during the validation session, each value produced by the field-programmable gate array's on-die true-random-number generator passed thru the on-die cryptographic conditioner during the chip-internal provisioning ceremony. The two values are cryptographically independent of each other and represent the chip's own entropy rather than entropy injected from outside the chip. The mirror-XOR line code was previously validated bit-exact in a prior validation session: 256 of 256 bidirectional round-trip exchanges completed without bit error over the single conductor between the field-programmable gate array and the microcontroller.
+
+\para A fault-injection bitstream that bakes a single storage pair as burned and three storage pairs as kore was loaded onto the field-programmable gate array to simulate an interrupted provisioning. The chip's classifier identified the state correctly: chip\_state reported DARK, wire output was gated off, the LED indicator confirmed the failure mode by a slow-blink pattern, and the mirror-XOR heartbeat was absent from the wire. The byzantine quorum was below threshold; the chip refused to operate; the wire was silent. The observed behaviour matches the DARK state property recited in Claim 8 on real silicon.
+
+\para A Computer Program Listing Appendix is submitted herewith pursuant to 37 CFR \S 1.96 and is hereby incorporated by reference into the present specification. The appendix comprises hardware-description-language source listings for the chip-side embodiment validated in the foregoing experimental validation, including the mirror-XOR encode and decode logic of Claim 3, the leading-edge framing and slot-counting decode of Claim 4, the inverted-pair write-once storage and byzantine quorum classifier of Claim 9, the provisioning ceremony finite-state machine of Claim 1, the challenge-response finite-state machine implementing the per-message wire format of Claim 5 and the handshake-as-entropy-request behaviour of Claim 6, and the on-chip noise-detection circuitry and ring-health classifier supporting the entropy-source health requirement of Claim 8. Standard cryptographic primitives invoked by the listings (including BLAKE3, X25519, and ChaCha20-Poly1305) are referenced by their published specifications and represented in the listings as port-interface module declarations rather than as full implementations, the full implementations being publicly available reference code not material to the novelty of the present invention. The listings are exemplary embodiments and are not intended to limit the scope of any claim to the specific signal names, parameter values, bit widths, structural arrangements, technology targets, or synthesis tool flows depicted therein; a person of ordinary skill in the art will recognise that equivalent embodiments may be realised in alternative hardware-description languages, on alternative silicon technologies, and with alternative module decompositions without departing from the scope of the claims.
+
+\subsection{Implementation Variations}
+
+\para Validation on field-programmable gate array fabric, as described in the preceding section, employs implementation choices that are strictly easier problems on production application-specific integrated circuit silicon. The validation evidence is therefore a lower bound on what production silicon may achieve.
+
+\para With respect to true-random-number generation primitives, the field-programmable gate array implementation uses ring-oscillator primitives only. Field-programmable gate array fabric does not natively support the metastability-based, transition-effect-ring-oscillator-based, or subthreshold-inverter-shot-noise-based primitives that production complementary metal-oxide semiconductor silicon supports. Production silicon embodiments may include any combination of the foregoing primitives in addition to ring oscillators, providing additional physics-grade entropy sources beyond what the field-programmable gate array can exercise.
+
+\para With respect to write-once storage, the field-programmable gate array implementation emulates the inverted-pair storage layout using bitstream-initialized registers. Production silicon embodiments employ literal write-once storage cells, such as electrically programmable fuses, antifuses, mask read-only memory, or other write-once technologies, and provide electrical irreversibility by physical mechanism rather than by policy.
+
+\para With respect to wire input/output, the field-programmable gate array development arrangement uses the field-programmable gate array's general-purpose input/output with internal weak pull-down as an approximation to the asymmetric drive arrangement. Production silicon embodiments provide a dedicated pin with a properly sized analog pull-down resistor.
+
+\para With respect to slot rate, the field-programmable gate array implementation operates at a slot rate of approximately 50 kilohertz, this rate being the highest rate at which the microcontroller's clock and data recovery routine reliably locks. Production silicon embodiments include dedicated physical-layer logic with no equivalent slot-rate ceiling.
+
+\para With respect to power gating of true-random-number generation primitives, field-programmable gate array fabric does not provide block-level power gating. Production silicon embodiments power-gate the true-random-number generation primitive domain, eliminating static power leakage and side-channel emanation of the primitive's oscillation frequency between entropy events.
+
+\newpage
+
+\section{Claims}
+
+What is claimed is:
+
+\medskip
+
+1. A method of cryptographic device identity creation, comprising:
+
+receiving, at an external interface of an integrated-circuit chip, an owner-initiated provisioning request signal;
+
+drawing, in response to the provisioning request signal, a quantity of physical entropy by sampling, with one or more noise-detection circuits resident on the chip's silicon, transient physical phenomena present at and within the chip's silicon at the moment of the receiving of the provisioning request signal;
+
+processing the physical entropy thru one or more cryptographic conditioners internal to the chip to produce a cryptographic-quality permanent identifier;
+
+writing the permanent identifier to one or more write-once storage cells inside the chip before any external interface of the chip is capable of transmitting the permanent identifier;
+
+wherein the permanent identifier is not transmitted outside the chip, in plaintext or in any reversible encoding, at any point during or after the provisioning;
+
+wherein the provisioning is initiated solely by an owner of the chip, and no third party, chip vendor, certificate authority, or provisioning service participates in, authorizes, witnesses, or signs the provisioning;
+
+wherein no record of the permanent identifier is created or transmitted outside the chip during the provisioning; and
+
+wherein cryptographic operations involving the permanent identifier subsequent to the provisioning produce only commitments, signatures, or domain-separated derivatives of the permanent identifier, and never the permanent identifier itself.
+
+\medskip
+
+2. A method of device attestation, comprising:
+
+receiving, at an external interface of an integrated-circuit chip having a permanent identifier produced according to claim 1, a query from a requesting application, the query comprising a domain identifier supplied by the requesting application;
+
+producing, in response to the query, a cryptographic attestation derived as a keyed cryptographic commitment over the chip's permanent identifier and over the domain identifier supplied by the query;
+
+transmitting the cryptographic attestation as the chip's response to the query;
+
+wherein two queries supplying distinct domain identifiers produce cryptographically independent attestations whose correlation requires a preimage attack on the keyed cryptographic commitment function;
+
+wherein the chip's permanent identifier is not exposed in the cryptographic attestation; and
+
+wherein cross-application correlation of the chip across a plurality of requesting applications is not structurally enabled by the chip's architecture, in that such correlation requires the chip's voluntary participation in producing attestations for both correlating domain identifiers, which participation requires user-mediated consent.
+
+\medskip
+
+3. A method of bidirectional digital communication between an integrated-circuit chip and a host endpoint over a single electrical conductor, comprising:
+
+encoding, at each of the chip and the host endpoint, each transmitted bit as the exclusive-or of an endpoint-specific idle bias value, a bit value to be transmitted, and a bit value most recently decoded by the endpoint from the other endpoint's transmission, wherein the chip uses an idle bias value of binary 1 and the host endpoint uses an idle bias value of binary 0;
+
+decoding, at each of the chip and the host endpoint, each received bit as the exclusive-or of an observed wire value at a sample point of the received bit, the other endpoint's idle bias value, and a bit value the endpoint most recently transmitted;
+
+driving the single electrical conductor to a high logic level during a transmission slot of each endpoint when the encoded bit value of the endpoint evaluates to binary 1; and releasing the single electrical conductor to a high-impedance state otherwise;
+
+wherein an external pull-down resistor coupled to the single electrical conductor establishes a low logic level at the wire as the wire's idle electrical state;
+
+wherein direct-current balance over the single electrical conductor emerges from the encoding without dedicated balance overhead bits; and
+
+wherein clock recovery at a receiving endpoint is performed by detecting transitions in the wire's state, without dedicated clock recovery hardware beyond a single logic gate.
+
+\medskip
+
+4. A method of message framing in a single-wire bidirectional protocol, comprising:
+
+transmitting, at the beginning of every message from each endpoint of the protocol, a single binary 1 bit as a leading frame bit, the leading frame bit being transmitted as a transition of the wire's state out of an idle state into active transmission;
+
+transmitting, immediately following the leading frame bit, an N-bit message payload of fixed or otherwise known length N;
+
+ceasing active transmission after the last actively driven binary 1 bit of the payload, the wire returning to its idle state by passive biasing, such that trailing binary 0 bits of the payload are not actively driven onto the wire;
+
+reconstructing, at a receiving endpoint, the trailing binary 0 bits of the payload by slot-counting N slots after the leading frame bit and decoding each non-actively-driven slot as binary 0;
+
+wherein the framing cost is exactly one channel slot per message irrespective of payload length, the framing savings are the count of trailing binary 0 bits of the payload that are not actively driven, and for a payload whose bits are statistically uniform the leading frame bit and the omitted trailing zeros offset on average such that the total channel slots transmitted equal the payload length in expectation; and
+
+wherein the maximum total channel slots transmitted per message is the payload length plus one, the framing never introducing a second dedicated framing slot, and the decode operation is a slot-counted shift register requiring no framing-symbol detection logic.
+
+\medskip
+
+5. A method of cryptographic message formatting in a single-wire protocol, comprising:
+
+constructing an authenticated message comprising a leading framing bit, an ephemeral session public key produced by a sending endpoint, a ciphertext encrypting a payload of the authenticated message under a key derived from the ephemeral session public key and a long-term key held by a receiver of the authenticated message, and a trailing termination bit;
+
+transmitting the authenticated message over the single-wire protocol of claim 3;
+
+wherein the ephemeral session public key simultaneously provides (a) cryptographic key transport between the sending endpoint and the receiver, (b) decryption authority for the ciphertext, (c) message authentication of the authenticated message thru cryptographic binding of the ciphertext to the ephemeral session public key under the long-term key, (d) the frame leading edge for receiver synchronisation according to claim 4, and (e) automatic direct-current balance thru the statistical randomness of the ephemeral session public key's bit distribution; and
+
+wherein the five protocol functions identified in the preceding clause are delivered by the ephemeral session public key field of the authenticated message rather than by five independently transmitted fields.
+
+\medskip
+
+6. A method of cryptographic session initiation between a host endpoint and an integrated-circuit chip, comprising:
+
+receiving, at an external interface of the chip, a single bit transmitted from the host endpoint;
+
+interpreting the single bit simultaneously as a session-initiation request and as a true-random-number-generation request;
+
+drawing, in response to the single bit, a quantity of cryptographic-quality entropy by sampling, with one or more noise-detection circuits resident on the chip's silicon, transient physical phenomena present at and within the chip's silicon at the moment of the receiving of the single bit;
+
+emitting the cryptographic-quality entropy as the chip's response to the single bit;
+
+wherein no separate request-entropy command exists in the protocol, the handshake bit invariably producing fresh entropy as its response.
+
+\medskip
+
+7. A method of cryptographic identity expression in an integrated-circuit chip, comprising:
+
+maintaining inside the chip a permanent identifier generated by the provisioning method of claim 1 and stored in write-once storage cells of the chip;
+
+regenerating, at the beginning of each new session, a per-session secret identifier from fresh physical entropy according to the method of claim 6, and discarding the per-session secret identifier at session end;
+
+receiving, at an external interface of the chip, an authenticated message from a host endpoint;
+
+selecting, in response to a cryptographic invariant carried by the authenticated message, an active commitment key from among the permanent identifier and the per-session secret identifier; and
+
+producing a response to the authenticated message as a keyed cryptographic commitment under the selected active commitment key;
+
+wherein the selection of the active commitment key is conveyed by the cryptographic invariant rather than by any plaintext mode indicator in the authenticated message.
+
+\medskip
+
+8. A method of failure response in an integrated-circuit chip, comprising:
+
+monitoring, by combinational logic of the chip, for one or more failure conditions including: failure of a cryptographic verification check on a received message; failure of the chip's permanent-identifier storage to satisfy a byzantine quorum check; failure of the chip's true-random-number-generation primitives to satisfy on-chip health diagnostics; and any non-operational condition of the chip's finite-state machine;
+
+gating off, upon detection of any failure condition, a drive-enable signal of the chip's wire driver such that an external wire interface of the chip is rendered high-impedance for a duration of the failure condition;
+
+allowing the wire's idle electrical state to be established by an external pull-down resistor coupled to the wire, such that the wire's behaviour during the failure condition is indistinguishable from the wire's behaviour when the chip is not physically present in the system;
+
+wherein no error code, status flag, or distinguishing signal other than the wire's pull-down idle is emitted at the wire under any failure condition.
+
+\medskip
+
+9. A method of cryptographic identity storage in an integrated-circuit chip, comprising:
+
+allocating within the chip a plurality of write-once storage groups, each storage group comprising at least two cryptographically-related write-once cells;
+
+storing the chip's permanent identifier across the storage groups, wherein storing the permanent identifier in each storage group comprises storing the permanent identifier in one cell of the storage group and storing a bitwise complement of the permanent identifier in a paired cell of the storage group;
+
+performing, at chip reset and optionally during scheduled storage-integrity audits, a byzantine quorum check across the storage groups, the byzantine quorum check requiring agreement among a configured minimum number of valid storage groups on the recovered identifier;
+
+recovering the chip's permanent identifier from the contents of a valid storage group when the byzantine quorum check passes;
+
+entering the failure-response state of claim 8 when the byzantine quorum check fails;
+
+wherein corruption affecting fewer than a failure-threshold number of storage groups is absorbed below a quorum-failure boundary without protocol-level intervention; and
+
+wherein no external signal sequence at the chip's external interface alters, replaces, or extracts the permanent identifier from the storage groups.
+
+\medskip
+
+10. A system, comprising an integrated-circuit chip configured to implement the methods of claims 1 thru 9, the chip comprising:
+
+a noise-detection circuit configured to sample transient physical phenomena present at and within the chip's silicon at the moment of triggering events, the noise-detection circuit comprising any one or more of: a ring oscillator sampler, a transition-effect ring oscillator, a subthreshold-inverter shot-noise sampler, a metastable arbitration circuit, and a thermal-noise amplifier;
+
+a cryptographic conditioner circuit configured to condition the physical entropy into the chip's permanent identifier and the chip's per-session secret identifier;
+
+a write-once storage array configured to store the chip's permanent identifier according to the method of claim 9;
+
+a finite-state machine configured to implement the provisioning ceremony of claim 1, the attestation method of claim 2, the handshake method of claim 6, the identity dichotomy of claim 7, the failure-response method of claim 8, and the storage method of claim 9;
+
+a wire driver circuit configured to implement the line code of claim 3 and the framing of claim 4, the wire driver circuit being gated by the failure-response mechanism of claim 8;
+
+exactly one bidirectional input/output pin constituting the chip's only external communication interface with a system in which the chip is installed; and
+
+a free-running ring oscillator internal to the chip and serving as the chip's only clock source;
+
+wherein the chip has no external clock input, no host-authenticated destruct command, no firmware update mechanism, no debug interface, and no in-circuit identity-replacement mechanism;
+
+wherein the chip's finite-state machine transitions are forward-only and enforced by silicon physics rather than by software.
+
+\medskip
+
+11. A non-transitory computer-readable medium storing instructions that, when executed by one or more processors of a host endpoint communicating with the chip of claim 10, cause the host endpoint to perform:
+
+encoding outgoing host-side bits and decoding incoming chip-side bits according to the line code of claim 3, with the host endpoint configured to use an idle bias value of binary 0;
+
+framing outgoing messages and parsing incoming messages according to the framing convention of claim 4;
+
+constructing outgoing authenticated messages and verifying incoming authenticated messages according to the message format of claim 5;
+
+issuing handshake bits to trigger the entropy-request behaviour of claim 6 and consuming the chip's entropy response;
+
+issuing attestation queries with application-supplied domain identifiers according to claim 2 and verifying the chip's attestation responses against a previously-established public commitment derived from the chip; and
+
+detecting the chip's failure-response state of claim 8 by observing absence of expected wire heartbeat or absence of expected message response, and treating the failure-response state as indistinguishable from the chip's physical absence for application-level purposes.
+
+\medskip
+
+12. The method of claim 1, wherein the one or more true-random-number-generation primitives comprise any one or more of: a plurality of free-running ring oscillators with statistical-test entropy extraction; one or more transition-effect ring oscillators; one or more subthreshold-inverter shot-noise sources; one or more metastable arbitration circuits; and one or more thermal-noise amplifier circuits.
+
+\medskip
+
+13. The method of claim 1, wherein the one or more cryptographic conditioners comprise a BLAKE3 cryptographic hash function operating in tree-hash mode over the gathered entropy.
+
+\medskip
+
+14. The method of claim 1, wherein the one or more write-once storage cells comprise any one of: electrically-programmable fuses; antifuses; mask-programmed read-only memory cells; floating-gate cells; write-once magnetic cells; and polymer write-once cells.
+
+\medskip
+
+15. The method of claim 2, wherein the keyed cryptographic commitment comprises a BLAKE3 keyed hash computation under an active commitment key according to claim 7, and wherein an input to the commitment further comprises a state vector representing internal chip state including a session counter, a lifetime-corruption counter, a storage-integrity classification, and a free-running boot-epoch timestamp, such that the attestation simultaneously commits to the chip's identity, to the requesting application's domain identifier, and to the chip's operational state at the time of the query.
+
+\medskip
+
+16. The method of claim 15, wherein the boot-epoch timestamp is expressed in oscillation counts of the hydrogen-1 hyperfine transition according to the temporal framework described in the related TOKEN application identified in the cross-reference section of the present specification.
+
+\medskip
+
+17. The method of claim 3, wherein the single electrical conductor comprises any one of: an electrical single-conductor with external pull-down; an optical fiber with optical bias; an inductively-coupled link; a capacitively-coupled link; a radio-frequency link with biased idle state; and an acoustic link.
+
+\medskip
+
+18. The method of claim 3, wherein a bit rate of the line code is established by the chip's free-running ring oscillator and is recovered by the host endpoint by means of the automatic clock-recovery property of the line code, such that the chip and the host endpoint do not share an external clock reference.
+
+\medskip
+
+19. The method of claim 3, wherein the external pull-down resistor is replaced by an external pull-up resistor, the wire's idle state is at a high logic level, both endpoints release the wire during the other endpoint's slot, and both endpoints invert the idle bias values relative to the method of claim 3, thereby providing an alternative analog electrical configuration without changing the protocol semantics.
+
+\medskip
+
+20. The method of claim 5, wherein the ephemeral session public key comprises an elliptic-curve Diffie-Hellman public key over Curve25519, the ciphertext is encrypted using ChaCha20-Poly1305 authenticated encryption, the message authentication is satisfied by the Poly1305 authenticator tag, the frame leading edge is the most significant bit of the ephemeral session public key, and the direct-current balance is satisfied by the bit distribution of the ephemeral session public key.
+
+\medskip
+
+21. The method of claim 7, wherein the cryptographic invariant comprises a comparison of a verification field in the authenticated message against two candidate expected values, one expected value being a keyed hash of a recovered message under session pads of the chip and the other expected value being a bitwise complement of the keyed hash, the polarity of the matching expected value determining the selection of the active commitment key between the permanent identifier and the per-session secret identifier.
+
+\medskip
+
+22. The method of claim 8, wherein the drive-enable signal is computed as the logical AND of a chip-alive status signal derived combinationally from the byzantine quorum check of claim 9, a slot ownership indicator of the endpoint, and a logical wire output value of the endpoint.
+
+\medskip
+
+23. The method of claim 9, wherein the configured minimum number of valid storage groups for the byzantine quorum check is at least two valid storage groups out of a total of four storage groups, with the recovered identifier required to be in cryptographic agreement across all storage groups satisfying the validity check.
+
+\medskip
+
+24. The method of claim 9, wherein the validity check applied to each storage group requires that a bitwise exclusive-or of the cells in the storage group equals an all-ones value, and that neither cell in the storage group is at an all-zero state.
+
+\medskip
+
+25. The system of claim 10, wherein the chip is fabricated in a complementary metal-oxide semiconductor process technology with a feature size of any one of: 350 nanometer, 180 nanometer, 130 nanometer, 90 nanometer, 65 nanometer, 40 nanometer, 28 nanometer, or smaller; and wherein the chip's die area excluding pads is between approximately 0.1 square millimeters and approximately 4.0 square millimeters.
+
+\medskip
+
+26. The system of claim 10, wherein the chip provides device-identity attestation services to one or more downstream applications selected from: Internet-of-Things device identity without manufacturer involvement after initial provisioning; hardware-wallet seed storage with no factory-injected keys; user-sovereign identity binding as one input to a device-binding function described in the related TOKEN application identified in the cross-reference section of the present specification; automotive secure-boot identity surviving ownership transfer without re-provisioning; medical device patient-private binding; industrial control attestation in environments skeptical of vendor trust; and defense supply-chain post-fabrication substitution detection.
+
+\medskip
+
+27. The non-transitory computer-readable medium of claim 11, wherein the host endpoint is implemented in any one of: a microcontroller communicating with the chip over a single-channel bus; a general-purpose computer with a single-channel interface adapter; a field-programmable gate array with a soft single-channel driver; an application-specific integrated circuit with a hardened single-channel interface; and a mobile device with a single-channel near-field interface; and wherein the host endpoint is configured to simultaneously serve a plurality of applications that hold independent domain identifiers and that produce independent attestations from a single chip.
+
+\medskip
+
+28. The system of claim 10, further comprising one or more anti-invasive features selected from: a top-metal active mesh covering the write-once storage cells and the cryptographic conditioner, the mesh configured to detect penetration and to cause the chip's finite-state machine to enter the failure-response state of claim 8; one or more passive shielding layers comprising metallization patterns configured to obstruct laminographic X-ray imaging of the chip's internal structure; an irradiation-detection circuit configured to cause the chip's finite-state machine to enter the failure-response state of claim 8 upon detection of an attempt at invasive analysis using charged-particle or photon-based probes; one or more dummy circuit blocks resembling but not implementing the cryptographic functions of the chip; and a tamper-evident package coating configured to render decapping observable.
+
+\medskip
+
+29. The method of claim 3, wherein a receiving endpoint of the line code samples the channel state at a sampling rate substantially higher than the slot rate and accumulates the samples across the slot width by means of an up/down counter, the counter being incremented on each sample at the channel's high logic level and decremented on each sample at the channel's low logic level, and wherein the receiving endpoint decodes each slot's bit value as the sign of the accumulated counter at the slot boundary, said sign-of-sum decode being mathematically equivalent to a binary majority vote across the samples of the slot and therefore to a median filter of width equal to the number of samples per slot, such that channel noise events of duration shorter than one half of the slot width are filtered out without bit error irrespective of noise event amplitude.
+
+\newpage
+
+\section{Abstract of the Disclosure}
+
+A method and apparatus for vendor-free domain-separated cryptographic device attestation. An integrated-circuit chip generates a permanent cryptographic identifier from physical entropy captured by noise-detection circuitry resident on the chip's silicon at the moment of an owner-initiated one-time provisioning ceremony, the entropy comprising transient physical phenomena present at and within the chip's silicon at the moment of the ceremony, the unrepeatability of the entropy deriving jointly from the owner's choice of triggering moment and the unrepeatable physical state present at that moment. The chip conditions the entropy thru an on-chip cryptographic function and writes the result to write-once storage before any external interface can transmit it. No third party witnesses or signs the provisioning. The chip exposes its identity only thru keyed cryptographic commitments over a domain identifier supplied by each requesting application, producing cryptographically independent attestations across applications and preventing structural cross-application correlation of the device. The chip's only interface is a single bidirectional pin carrying a mirror-XOR line code with leading-edge framing. The chip's permanent identifier is stored in inverted-pair write-once cells with byzantine quorum recovery and is silent at the wire under any failure condition.
+
+\end{document}

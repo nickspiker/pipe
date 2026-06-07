@@ -55,8 +55,7 @@ module ring_scheduler #(
     localparam integer IDX_W = (N_RINGS <= 1) ? 1 : $clog2(N_RINGS);
 
     // -------------------------------------------------------------------------
-    // Shared ring_health instance. Caller (e.g., trng.v) is responsible for
-    // 2-FF synchronizing each ring input upstream of `ring_in`.
+    // Shared ring_health instance. Caller (e.g., trng.v) is responsible for 2-FF synchronizing each ring input upstream of `ring_in`.
     // -------------------------------------------------------------------------
     reg  [IDX_W-1:0] ring_idx;
     wire             current_sample = ring_in[ring_idx];
