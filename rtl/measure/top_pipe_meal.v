@@ -10,14 +10,14 @@
 //     via the USRMCLK primitive (SCK) + MFIO pins (CS/MOSI/MISO).
 //
 //   - Challenge-response over the PIPE wire via chal_resp_fsm.v. After
-//     ceremony reaches HEALTHY, the FSM tristates the wire, listens for a
+//     ceremony reaches ORA, the FSM tristates the wire, listens for a
 //     bridge-driven sync + 256-bit challenge, computes
 //     response = BLAKE3_keyed_hash(IRA, challenge) on a dedicated blake3
 //     core, and transmits the response back with Claim 12a framing.
 //
 // LEDs unchanged from ira:
-//   T6 (onboard, active-low): OFF→KORE; blink→busy; solid→HEALTHY; OFF+T2→DARK
-//   T2 (J4 ext): solid→DARK (silent chip per pipe-dark-state-silent-wire)
+//   T6 (onboard, active-low): OFF→KORE; blink→busy; solid→ORA; OFF+T2→NGARO
+//   T2 (J4 ext): solid→NGARO (silent chip per pipe-ngaro-state-silent-wire)
 //
 // =============================================================================
 
@@ -42,7 +42,7 @@ module top_pipe_meal (
     output wire oled_scl,       // SSD1306 I2C clock (P2)
     output wire oled_sda,       // SSD1306 I2C data  (R2)
     output reg  led,            // T6 onboard LED — ceremony status
-    output reg  ext_led,        // T2 J4 LED — DARK indicator
+    output reg  ext_led,        // T2 J4 LED — NGARO indicator
 
     // SPI flash (GD25Q32, post-config user-logic access)
     output wire flash_cs_n,     // N8
@@ -283,7 +283,7 @@ module top_pipe_meal (
     // One blake3.v compression core is driven by EITHER blake3_tree_shared
     // (during the ceremony) OR chal_resp_fsm (during operational challenge-
     // response). The two never run simultaneously — ceremony fires once on
-    // KORE → HEALTHY, chal_resp_fsm only operates after HEALTHY — so the
+    // KORE → ORA, chal_resp_fsm only operates after ORA — so the
     // mux is safe by construction and saves ~10K LUT4s vs two blake3s.
     //
     // Mux select: ceremony_busy. While the ira_fsm has the wheel, route
@@ -441,7 +441,8 @@ module top_pipe_meal (
     // =========================================================================
     // inverted_pair_verify — combinational classifier
     // =========================================================================
-    wire [2:0]   chip_state;
+    wire [1:0]   chip_state;
+    wire         chip_state_ngaro;
     wire         byzantine_ok;
     wire [255:0] recovered_ira;
 
@@ -458,6 +459,7 @@ module top_pipe_meal (
         .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
+        .chip_ngaro  (chip_state_ngaro),
         .state       (chip_state),
         .ira         (recovered_ira)
     );
@@ -465,7 +467,7 @@ module top_pipe_meal (
     // =========================================================================
     // ira_fsm — the orchestrator
     // =========================================================================
-    wire chip_dark, ceremony_busy, ceremony_done;
+    wire chip_ngaro, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -473,6 +475,7 @@ module top_pipe_meal (
         .reset_n           (reset_n),
         .provision_request (provision_request),
         .chip_state        (chip_state),
+        .chip_state_ngaro  (chip_state_ngaro),
         .byzantine_ok      (byzantine_ok),
         .trng_start        (trng_start),
         .trng_busy         (trng_busy),
@@ -487,7 +490,7 @@ module top_pipe_meal (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_dark       (chip_dark),
+        .chip_ngaro       (chip_ngaro),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),
         .fsm_state         (fsm_state)
@@ -497,19 +500,19 @@ module top_pipe_meal (
     // LED state machine
     //   T6 (active-low, so output = ~drive_value):
     //     ceremony_busy → fast blink (every 2^21 cycles ≈ 12 Hz at 25 MHz)
-    //     post-HEALTHY   → solid on
+    //     post-ORA   → solid on
     //     KORE idle    → off
-    //     DARK         → off (T2 carries the DARK indicator)
+    //     NGARO         → off (T2 carries the NGARO indicator)
     //   T2 (active-high, since T2 drives the ext LED through a buffer):
-    //     chip_dark    → solid on
+    //     chip_ngaro    → solid on
     //     else           → off
     // =========================================================================
     reg [23:0] blink_div = 24'b0;
     always @(posedge clk) blink_div <= blink_div + 24'd1;
 
     wire blink_fast = blink_div[20];     // ~12 Hz — busy
-    wire blink_slow = blink_div[23];     // ~1.5 Hz — DARK (distinguishable from busy)
-    wire chip_alive = (chip_state >= 3'd2);
+    wire blink_slow = blink_div[23];     // ~1.5 Hz — NGARO (distinguishable from busy)
+    wire chip_operational = (chip_state >= 2'd1);
 
     // -------------------------------------------------------------------------
     // RING OSCILLATOR DIAGNOSTIC — divide ring_out[0] by 2^22 so we can SEE
@@ -519,7 +522,7 @@ module top_pipe_meal (
     // a solid LED). If ring 0 is stuck at 0 or 1, the divider stops and
     // the LED stays SOLID — which is the smoking gun for "PnR broke the
     // rings". Wired to ext_led in DIAGNOSTIC mode (chip_state == KORE
-    // and !chip_dark AND !ceremony_busy) so it's only visible at idle.
+    // and !chip_ngaro AND !ceremony_busy) so it's only visible at idle.
     // -------------------------------------------------------------------------
     reg [21:0] ring0_div = 22'b0;
     always @(posedge ring_out[0]) ring0_div <= ring0_div + 22'd1;
@@ -531,22 +534,22 @@ module top_pipe_meal (
     //   indicator since the onboard T6 is hard to see next to the power LED.
     //     OFF        → KORE (idle, awaiting provision request)
     //     fast blink → ceremony busy (KOHI / BLAKE3 / TAHU running)
-    //     solid ON   → HEALTHY (chip provisioned, ready for challenges)
-    //     slow blink → DARK (ring failure or partial-burn corruption)
+    //     solid ON   → ORA (chip provisioned, ready for challenges)
+    //     slow blink → NGARO (ring failure or partial-burn corruption)
     //
     //   led (T6, onboard active-low). Mirrors ext_led for completeness; ignore
     //   if it's hard to see.
     // -------------------------------------------------------------------------
     always @(posedge clk) begin
-        if (chip_dark) begin
+        if (chip_ngaro) begin
             led     <= ~blink_slow;      // active-low slow blink
             ext_led <=  blink_slow;      // active-high slow blink (= "I'm broken")
         end else if (ceremony_busy) begin
             led     <= ~blink_fast;      // active-low fast blink
             ext_led <=  blink_fast;      // active-high fast blink (= "I'm working")
-        end else if (chip_alive) begin
+        end else if (chip_operational) begin
             led     <= 1'b0;             // active-low ON (solid)
-            ext_led <= 1'b1;             // active-high ON (= HEALTHY, solid)
+            ext_led <= 1'b1;             // active-high ON (= ORA, solid)
         end else begin
             led     <= 1'b1;             // active-low OFF
             // DIAGNOSTIC: while KORE-idle, drive ring 0 (via /2^22) onto
@@ -624,6 +627,7 @@ module top_pipe_meal (
         .mode            (mode),
         .ira             (recovered_ira),
         .chip_state      (chip_state),
+        .chip_state_ngaro  (chip_state_ngaro),
         .ring_health_cnt (trng_ring_health_cnt),
         .slot_flat       (all_slots_flat),
         .ring_rct_fail   (16'b0),
@@ -638,7 +642,7 @@ module top_pipe_meal (
     // screen renders.
     // -------------------------------------------------------------------------
     reg [3:0] re_render_init_cnt;
-    reg [2:0] last_chip_state;
+    reg [1:0] last_chip_state;
     reg [1:0] last_mode;
     reg       re_render_req;
     always @(posedge clk or negedge reset_n) begin
@@ -694,7 +698,7 @@ module top_pipe_meal (
     // PIPE wire — bidirectional I/O for the challenge-response protocol.
     //
     // chal_resp_fsm takes ownership of wire_out / drive_en after the chip is
-    // HEALTHY. Until then drive_en is 0 (tristate), wire is pulled DOWN by
+    // ORA. Until then drive_en is 0 (tristate), wire is pulled DOWN by
     // the LPF PULLMODE=DOWN — wire idle = LOW. ira_fsm doesn't currently use
     // the wire, so there's no contention with the ceremony state.
     // =========================================================================
@@ -712,7 +716,7 @@ module top_pipe_meal (
     );
 
     // =========================================================================
-    // Challenge-response FSM. Listens on the wire when chip_alive; on each
+    // Challenge-response FSM. Listens on the wire when chip_operational; on each
     // received 256-bit challenge produces BLAKE3_keyed_hash(IRA, challenge)
     // and ships it back with Claim 12a framing.
     //
@@ -725,7 +729,7 @@ module top_pipe_meal (
     chal_resp_fsm u_chal_resp (
         .clk             (clk),
         .reset_n         (reset_n),
-        .chip_healthy    (chip_alive),
+        .chip_ora    (chip_operational),
         .wire_in_sync    (wire_in_synced),
         .wire_out        (wire_out_internal),
         .drive_en        (drive_en_internal),

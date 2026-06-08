@@ -10,7 +10,7 @@ PIPE has **two parallel 4-inverted-pair structures**, identical in layout and ve
 
 | Name | Storage | Lifetime | Failure recovery |
 |---|---|---|---|
-| **`ira_set`** | eFuse (8 slots, 4 inverted pairs) | Permanent — burned at provisioning, never modified | XOR-check failure on boot → STATE 1 (DARK), refuse all operation |
+| **`ira_set`** | eFuse (8 slots, 4 inverted pairs) | Permanent — burned at provisioning, never modified | XOR-check failure on boot → STATE 1 (NGARO), refuse all operation |
 | **`wairua_set`** | RAM (8 slots, 4 inverted pairs) | Ephemeral — established per session via handshake, destroyed on power-off | XOR-check failure mid-session → brick session, refuse all messages, require power-cycle to re-handshake |
 
 The Māori pairing: `ira` is the gene/essence of the device — its persistent identity burned into silicon. `wairua` is the spirit — the ephemeral animating force of each session, alive only while powered. Body and spirit, persistent and transient, sharing the same 4-pair inverted-XOR verification machinery to defend against cosmic-ray bit flips on either side.
@@ -67,10 +67,10 @@ PIPE has exactly five states reachable from power-on reset. State transitions ha
 | State | Name | Condition | Behavior |
 |---|---|---|---|
 | **0** | KORE | All 4 pairs have `A=B=0` (XOR = 0) | Enter provisioning mode (KOHI → TATARI → TAHU) |
-| **1** | DARK | 0 or 1 valid pairs, OR multiple valid pairs disagree on `ira` | Refuse to operate. OTP preserved for diagnosis. |
-| **2** | DEGRADED-2 | Exactly 2 valid pairs, agreeing on `ira` | Operate. Status byte reports `pair_valid_count=2` (MARGINAL) — host warns user to retire chip. |
-| **3** | DEGRADED-1 | Exactly 3 valid pairs, agreeing on `ira` | Operate. Status byte reports `pair_valid_count=3` (DEGRADED). |
-| **4** | HEALTHY | All 4 pairs valid, all agreeing on `ira` | Operate. Status byte reports `pair_valid_count=4` (HEALTHY). |
+| **1** | NGARO | 0 or 1 valid pairs, OR multiple valid pairs disagree on `ira` | Refuse to operate. OTP preserved for diagnosis. |
+| **2** | WHARA | Exactly 2 valid pairs, agreeing on `ira` | Operate. Status byte reports `pair_valid_count=2` (MARGINAL) — host warns user to retire chip. |
+| **3** | HARA | Exactly 3 valid pairs, agreeing on `ira` | Operate. Status byte reports `pair_valid_count=3` (HARA). |
+| **4** | ORA | All 4 pairs valid, all agreeing on `ira` | Operate. Status byte reports `pair_valid_count=4` (ORA). |
 
 There is no STATE 5 (deliberate-destruct), no transient-failure-counter, no scorch indicator. See "Indestructible from outside" below for why.
 
@@ -153,12 +153,12 @@ The 4-pair design's operating threshold is "≥ 2 valid pairs agreeing on `ira`.
 
 | Failures (worst-case distribution) | Result |
 |---|---|
-| 1 slot | STATE 3 (DEGRADED-1, operates) |
+| 1 slot | STATE 3 (HARA, operates) |
 | 2 slots | STATE 2 or 3 (operates) |
-| 3 slots distributed across 3 different pairs | STATE 1 (DARK, brick) |
-| 4 slots distributed 1-per-pair | STATE 1 (DARK, brick) |
+| 3 slots distributed across 3 different pairs | STATE 1 (NGARO, brick) |
+| 4 slots distributed 1-per-pair | STATE 1 (NGARO, brick) |
 | 4 slots clustered in 2 pairs (both A and B die in same pair) | STATE 2 (operates) |
-| 5+ slots distributed | STATE 1 (DARK) |
+| 5+ slots distributed | STATE 1 (NGARO) |
 
 **Guaranteed-survival number: 2 slot failures** (any distribution).
 
@@ -200,7 +200,7 @@ The chip naturally computes its state on every boot. Expose it through a status 
 
 ```
 struct chip_status {
-    state:                       u3,  // 0=KORE, 1=DARK, 2/3/4=operating health levels
+    state:                       u3,  // 0=KORE, 1=NGARO, 2/3/4=operating health levels
     layer1_retries_this_boot:    u4,  // 0=clean, higher=read flakiness rising
     reserved:                    u1
 }
@@ -213,17 +213,17 @@ Hosts get full visibility:
 - `state=1`: device bricked; host stops trying
 - `state=0`: device not yet provisioned
 
-`layer1_retries_this_boot` tracks how many of the 8 slot-reads needed majority-vote disagreement to resolve. Healthy chips report 0; chips with rising aging report 1+. Host can track this metric over time to predict failure.
+`layer1_retries_this_boot` tracks how many of the 8 slot-reads needed majority-vote disagreement to resolve. Ora chips report 0; chips with rising aging report 1+. Host can track this metric over time to predict failure.
 
 No fuses spent on status. It's a live readout the chip computes anyway.
 
-## DARK state — silent wire
+## NGARO state — silent wire
 
-When the chip enters STATE 1 (DARK), it **permanently ceases driving the bidirectional data pin**. No heartbeat, no slot transitions, nothing. The host's pull-down resistor holds the line at quiescent zero forever.
+When the chip enters STATE 1 (NGARO), it **permanently ceases driving the bidirectional data pin**. No heartbeat, no slot transitions, nothing. The host's pull-down resistor holds the line at quiescent zero forever.
 
-A DARK PIPE is **wire-level indistinguishable from an absent or unpowered device**. Both look like "no PIPE here" to the host, which prompts identical retry/alert behavior. This is the correct outcome — for the host's purposes there is no functional difference between "chip is broken" and "no chip", because neither produces a usable attestation.
+A NGARO PIPE is **wire-level indistinguishable from an absent or unpowered device**. Both look like "no PIPE here" to the host, which prompts identical retry/alert behavior. This is the correct outcome — for the host's purposes there is no functional difference between "chip is broken" and "no chip", because neither produces a usable attestation.
 
-**What triggers DARK → silent wire**:
+**What triggers NGARO → silent wire**:
 
 | Trigger | Source |
 |---|---|
@@ -236,15 +236,15 @@ All four triggers are **silicon-level truth conditions**, not protocol-driven. *
 
 **Forensic accessibility**: A silent chip's OTP and internal registers remain electrically readable (e.g., via decapsulation + microprobe). The state is preserved, not destroyed. The chip is *silently-bricked-from-the-wire*, not *destroyed*. This matters for failure-mode analysis and for the warranty/RMA pipeline — manufacturers can determine the specific failure mode from a returned silent chip.
 
-**One-line implementation**: in the codec wrapper, `tx_drive_enable = !chip_dark`, where `chip_dark = trng.health_fail || otp_byzantine_fail || burn_interrupted_latched`. The codec is otherwise unchanged; silence is just the absence of drive.
+**One-line implementation**: in the codec wrapper, `tx_drive_enable = !chip_ngaro`, where `chip_ngaro = trng.health_fail || otp_byzantine_fail || burn_interrupted_latched`. The codec is otherwise unchanged; silence is just the absence of drive.
 
 ## Host asks — enclave answers (no proactive state push)
 
 The enclave **never proactively reports state on the wire**. The heartbeat carries no information beyond "I'm alive enough to drive"; the message layer is purely request-response. This is a deliberate side-channel-elimination measure:
 
-- **Heartbeat layer**: pure idle pattern. Either present (chip alive) or absent (chip DARK, unpowered, or unplugged). Three-way ambiguity in the absent case, by design.
+- **Heartbeat layer**: pure idle pattern. Either present (chip alive) or absent (chip NGARO, unpowered, or unplugged). Three-way ambiguity in the absent case, by design.
 - **Message layer**: the chip transmits only in direct response to a host-initiated request, and the response is a cryptographic derivation (e.g., domain-separated keyed-BLAKE3 over the request, the relevant state, and `ira` or `wairua`), never raw register fields in the clear.
-- **No periodic state pings**, no wakeup advertisements, no auto-notifications on degradation events. A DEGRADED chip heartbeats identically to a HEALTHY chip from the wire's perspective; the host learns the degradation level only by asking for an attestation, which exposes only an opaque derivation that bakes the state into the cryptographic output but reveals nothing of the input directly.
+- **No periodic state pings**, no wakeup advertisements, no auto-notifications on degradation events. A HARA or WHARA chip heartbeats identically to a ORA chip from the wire's perspective; the host learns the degradation level only by asking for an attestation, which exposes only an opaque derivation that bakes the state into the cryptographic output but reveals nothing of the input directly.
 
 Designed-out side-channels: timing-based (no spontaneous transmissions reveal internal events), frequency-based (no periodic patterns leak clock characteristics), DC-level-based (the heartbeat is balanced and stateless). Anything the host needs to know about the chip's internal state has to be **asked for explicitly**.
 
@@ -254,7 +254,7 @@ When designing new modules (`handshake_fsm`, attest handlers, codec wrappers), t
 
 | Test | Validates |
 |---|---|
-| KOHI sim with behavioral clocks (Icarus) | 16-ring parallel sample + 16-way XOR, popcount AND toggle health checks fire, XOR pool fills, BLAKE3 hand-off triggers, ceremony reaches HEALTHY |
+| KOHI sim with behavioral clocks (Icarus) | 16-ring parallel sample + 16-way XOR, popcount AND toggle health checks fire, XOR pool fills, BLAKE3 hand-off triggers, ceremony reaches ORA |
 | TATARI delay sim | `delay_ms` derives correctly from `ira`, FSM idles for the computed duration |
 | TAHU sim with OTP emulator | Burn order correct, per-slot verify catches deliberate-corruption test injections |
 | 5-state classifier sim | Pre-seed OTP emulator with each state's signature pattern, verify boot logic classifies correctly |

@@ -19,11 +19,11 @@
 //   codec.v                         3       (mirror-XOR encode/decode)
 //   wire_io.v                       3       (bidirectional channel port)
 //   otp.v                           9       (write-once storage primitive)
-//   inverted_pair_verify.v          9, 8    (byzantine quorum, DARK gate)
+//   inverted_pair_verify.v          9, 8    (byzantine quorum, NGARO gate)
 //   trng.v                          8       (noise-detection circuitry, KOHI)
 //   ring_scheduler.v                8       (round-robin per-ring health)
 //   ring_health.v                   8       (RCT + APT + iterated GF(2) tests)
-//   ira_fsm.v                       1, 8    (provisioning ceremony, DARK)
+//   ira_fsm.v                       1, 8    (provisioning ceremony, NGARO)
 //   l3_session_fsm.v                2, 5, 6, 7   (per-message wire format, handshake-as-entropy, ira/wairua dichotomy)
 //
 // REFERENCED CRYPTOGRAPHIC PRIMITIVES (stubbed, port-interface only)
@@ -433,7 +433,7 @@ endmodule
 // Combinational-equivalent classifier for the inverted-pair storage geometry described in IRA.md Sec."OTP geometry" / Sec."The five lifelong states". Takes 8 slot values (4 pairs x {A, B}) and produces:
 //
 //   - per-pair classification (kore / valid / corrupt)
-//   - aggregate 5-state machine code (KORE / DARK / DEGRADED-{2,1} / HEALTHY)
+//   - aggregate 5-state machine code (KORE / NGARO / WHARA / HARA / ORA)
 //   - recovered ira value (lowest-indexed valid pair's A slot, or zero)
 //   - byzantine_ok strobe (>=2 valid pairs AND all valid pairs agree on ira)
 //   - state_valid strobe (high after first complete sweep)
@@ -488,9 +488,22 @@ module inverted_pair_verify #(
     output reg                    all_kore,
     output reg                    agreement_ok,
     output reg                    byzantine_ok,
-    output reg  [2:0]             state,
+    // chip_ngaro is true when the chip is in the silent failure state -- valid_count < 2 and not all_kore. The chip's FSM uses this to gate wire output; the host infers NGARO from the absence of any wire response.
+    output reg                    chip_ngaro,
+    // 2-bit wire-reportable state. NGARO is not encoded here since the chip in NGARO does not transmit; the host infers NGARO from no response. The numeric value rises with chip vitality (= number of valid pairs, modulo the KORE/NGARO gap).
+    //   KORE  = 2'd0  (0 valid pairs, storage all zero)
+    //   WHARA = 2'd1  (2 valid pairs, at byzantine minimum)
+    //   HARA  = 2'd2  (3 valid pairs, single fault tolerated)
+    //   ORA   = 2'd3  (4 valid pairs, fully healthy)
+    output reg  [1:0]             state,
     output reg  [SLOT_BITS-1:0]   ira
 );
+
+    // State code constants (matching the localparam style used in callers).
+    localparam [1:0] ST_KORE  = 2'd0;
+    localparam [1:0] ST_WHARA = 2'd1;
+    localparam [1:0] ST_HARA  = 2'd2;
+    localparam [1:0] ST_ORA   = 2'd3;
 
     // -------------------------------------------------------------------------
     // Unpack the 8 slots -- combinational views of slot_flat.
@@ -595,11 +608,14 @@ module inverted_pair_verify #(
                                 : c_pair_valid[3] ? slot[3]
                                 : {SLOT_BITS{1'b0}};
 
-    wire [2:0] c_state = c_all_kore    ? 3'd0
-                       : ~c_byzantine_ok ? 3'd1
-                       : (c_valid_count == 3'd2) ? 3'd2
-                       : (c_valid_count == 3'd3) ? 3'd3
-                       :                            3'd4;
+    // 2-bit wire-reportable state. NGARO is not encoded -- it is a separate signal that gates wire output (chip is silent in NGARO).
+    wire [1:0] c_state = (c_valid_count == 3'd4) ? ST_ORA
+                       : (c_valid_count == 3'd3) ? ST_HARA
+                       : (c_valid_count == 3'd2) ? ST_WHARA
+                       :                            ST_KORE;   // valid_count 0 or 1 (1 collapses to KORE since chip is silent anyway)
+
+    // chip_ngaro: byzantine fail and not in the pristine all-kore state.
+    wire c_chip_ngaro = ~c_byzantine_ok & ~c_all_kore;
 
     // -------------------------------------------------------------------------
     // Sweep FSM -- single always block driving all state and outputs.
@@ -621,7 +637,8 @@ module inverted_pair_verify #(
             all_kore    <= 1'b0;
             agreement_ok  <= 1'b0;
             byzantine_ok  <= 1'b0;
-            state         <= 3'b0;
+            chip_ngaro    <= 1'b0;
+            state         <= ST_KORE;
             ira           <= {SLOT_BITS{1'b0}};
             for (i = 0; i < 8; i = i + 1) begin
                 popcount[i] <= 9'b0;
@@ -636,6 +653,7 @@ module inverted_pair_verify #(
             all_kore   <= c_all_kore;
             agreement_ok <= c_agreement_ok;
             byzantine_ok <= c_byzantine_ok;
+            chip_ngaro   <= c_chip_ngaro;
             state        <= c_state;
             ira          <= c_ira;
             state_valid  <= 1'b1;
@@ -692,7 +710,7 @@ endmodule
 // trng.v -- KOHI entropy gather: round-robin per-ring sampling + layered health
 // =============================================================================
 //
-// Drives a `ring_scheduler` instance that walks the 16 rings sequentially, gathering W=4096 samples per ring (16 x 4096 = 65,536 bits = 8 KB buffer fill). The scheduler runs the layered RCT + APT + iterated GF(2) differencing health check (Claim 3c) on each ring's stream as it goes. After all 16 rings complete, the per-ring verdicts are latched as `ring_health[15:0]` and the Byzantine threshold check decides HEALTHY/DARK.
+// Drives a `ring_scheduler` instance that walks the 16 rings sequentially, gathering W=4096 samples per ring (16 x 4096 = 65,536 bits = 8 KB buffer fill). The scheduler runs the layered RCT + APT + iterated GF(2) differencing health check (Claim 3c) on each ring's stream as it goes. After all 16 rings complete, the per-ring verdicts are latched as `ring_health[15:0]` and the Byzantine threshold check decides ORA/NGARO.
 //
 // The 16 ring oscillators free-run continuously; `ring_enable` is advisory (top.v decides whether to gate). Each ring's bit-stream feeds the entropy buffer one bit per cycle when `sample_valid` is high.
 //
@@ -733,7 +751,7 @@ module trng #(
 
     output reg          busy,           // high during gather + health check
     output reg          gather_done,    // 1-cycle strobe when buffer ready (>= 8 rings healthy)
-    output reg          health_fail,    // latched when <8 of 16 rings pass -- DARK state
+    output reg          health_fail,    // latched when <8 of 16 rings pass -- NGARO state
     output reg  [15:0]  ring_health,    // bitmask of last-gather healthy rings (1=pass)
     output reg   [4:0]  ring_health_cnt,// count of healthy rings 0..16 (for attestation responses)
     output wire [15:0]  ring_enable,    // advisory: one-hot mask of currently-active ring
@@ -829,7 +847,7 @@ module trng #(
         buf_rdata <= buffer[buf_raddr];
     end
 
-    // DARK threshold: 7 or fewer healthy rings. With 8+ of 16, byzantine safety satisfied and entropy remains cryptographically sound (XOR of independent sources via BLAKE3 is uniform whenever any one is uniform).
+    // NGARO threshold: 7 or fewer healthy rings. With 8+ of 16, byzantine safety satisfied and entropy remains cryptographically sound (XOR of independent sources via BLAKE3 is uniform whenever any one is uniform).
     localparam [4:0] HEALTH_MIN = 5'd8;
 
     // -------------------------------------------------------------------------
@@ -892,14 +910,14 @@ module trng #(
                 end
 
                 ST_CHECK: begin
-                    // Latch the health snapshot and decide HEALTHY/DEGRADED/DARK.
+                    // Latch the health snapshot and decide ORA / HARA / WHARA / NGARO.
                     ring_health     <= sched_ring_health_mask;
                     ring_health_cnt <= sched_ring_health_cnt;
                     ring_rct_fail   <= sched_ring_rct_fail;
                     ring_apt_fail   <= sched_ring_apt_fail;
                     ring_level_fail <= sched_ring_level_fail;
                     if (sched_ring_health_cnt < HEALTH_MIN) begin
-                        // <8 rings passed -- DARK. health_fail latches permanently (POR is the only clear path). Downstream gates the wire heartbeat on this so a DARK chip goes silent rather than lying about its capability.
+                        // <8 rings passed -- NGARO. health_fail latches permanently (POR is the only clear path). Downstream gates the wire heartbeat on this so a NGARO chip goes silent rather than lying about its capability.
                         health_fail <= 1'b1;
                     end else begin
                         // 8..16 healthy rings -- entropy sound. The buffer can be conditioned; ring_health_cnt feeds attestation so the host learns the degradation level.
@@ -1366,21 +1384,21 @@ endmodule
 // It observes `chip_state` from inverted_pair_verify (which sees the OTP slots live) and reacts:
 //
 //   state=0 KORE  + provision_request -> run ceremony
-//   state=1 DARK                       -> assert chip_dark, idle
-//   state>=2 DEGRADED/HEALTHY              -> chip is provisioned; nothing to do
+//   state=1 NGARO                       -> assert chip_ngaro, idle
+//   state >= 2 WHARA/HARA/ORA              -> chip is provisioned; nothing to do
 //
 // First-cut scope (this commit):
 //   - KOHI: pulse trng_start, wait for gather_done or health_fail
 //   - BLAKE3: pulse blake3_start, capture 256-bit ira_seed
 //   - TAHU: burn slots 0..3 (A=ira_seed), then 4..7 (B=~ira_seed)
 //   - No TATARI delay (TODO: add the BLAKE3-derived 256-1280 ms random pause)
-//   - No per-burn read-back verify (the next power cycle's classifier read naturally validates each pair; partial burns surface as DARK next boot)
+//   - No per-burn read-back verify (the next power cycle's classifier read naturally validates each pair; partial burns surface as NGARO next boot)
 //   - No wairua orchestration (separate FSM later, but sharing this module's trng/blake3 instances via the same arbiter pattern)
 //
-// chip_dark is asserted when:
-//   - boot-time state == DARK (e.g., previous TAHU was interrupted), OR
+// chip_ngaro is asserted when:
+//   - boot-time state == NGARO (e.g., previous TAHU was interrupted), OR
 //   - trng.health_fail latches during this boot's KOHI, OR
-//   - an OTP burn is rejected (write to already-burned slot -- shouldn't happen on a fresh KORE device; latches DARK defensively)
+//   - an OTP burn is rejected (write to already-burned slot -- shouldn't happen on a fresh KORE device; latches NGARO defensively)
 //
 // =============================================================================
 
@@ -1393,8 +1411,10 @@ module ira_fsm (
     // External trigger -- pulse to start provisioning. Honored only when chip_state == KORE. Ignored otherwise (no-op).
     input  wire         provision_request,
 
-    // Live classifier output (combinational from inverted_pair_verify)
-    input  wire [2:0]   chip_state,          // 0=KORE, 1=DARK, 2..4=operating
+    // Live classifier output (combinational from inverted_pair_verify).
+    // chip_state is 2 bits: KORE=0, WHARA=1, HARA=2, ORA=3. NGARO is not encoded in chip_state; chip_state_ngaro is a separate predicate (chip is silent in NGARO; the host infers NGARO from no wire response).
+    input  wire [1:0]   chip_state,
+    input  wire         chip_state_ngaro,    // true when valid_count < 2 AND not all_kore
     input  wire         byzantine_ok,
 
     // trng.v handshake
@@ -1417,7 +1437,7 @@ module ira_fsm (
     input  wire         otp_write_rejected,
 
     // Outputs to the rest of the chip
-    output reg          chip_dark,         // gate for codec's tx_drive_enable
+    output reg          chip_ngaro,         // gate for codec's tx_drive_enable
     output reg          ceremony_busy,       // high during KOHI/BLAKE3/TAHU
     output reg          ceremony_done,       // 1-cycle pulse when TAHU completes
     output reg  [2:0]   fsm_state            // debug observability
@@ -1427,16 +1447,16 @@ module ira_fsm (
     // FSM states
     // -------------------------------------------------------------------------
     localparam [2:0]
-        ST_OBSERVE  = 3'd0,   // idle; gate chip_dark from chip_state
+        ST_OBSERVE  = 3'd0,   // idle; gate chip_ngaro from chip_state
         ST_KOHI     = 3'd1,   // trng running
         ST_BLAKE3   = 3'd2,   // blake3_tree conditioning
         ST_TAHU_A   = 3'd3,   // burn slots 0..3 (A = ira_seed)
         ST_TAHU_B   = 3'd4,   // burn slots 4..7 (B = ~ira_seed)
         ST_DONE     = 3'd5,   // pulse ceremony_done, settle, return to OBSERVE
         ST_SETTLE   = 3'd6,   // wait for verify to complete fresh post-burn sweeps
-        ST_DARK   = 3'd7;   // latched failure; never leaves until POR
+        ST_NGARO   = 3'd7;   // latched failure; never leaves until POR
 
-    // Wait long enough after TAHU for inverted_pair_verify to complete at least two full sweeps on the new (post-burn) slot_flat data. Sweep is 257 cycles; 1024 covers four sweeps comfortably and avoids any mid-sweep mismatched-latched-output transient propagating into a false ST_DARK transition.
+    // Wait long enough after TAHU for inverted_pair_verify to complete at least two full sweeps on the new (post-burn) slot_flat data. Sweep is 257 cycles; 1024 covers four sweeps comfortably and avoids any mid-sweep mismatched-latched-output transient propagating into a false ST_NGARO transition.
     localparam [9:0] SETTLE_CYCLES = 10'd1023;
     reg [9:0]        settle_cnt;
 
@@ -1447,9 +1467,8 @@ module ira_fsm (
     reg [1:0]   burn_idx;      // 0..3 within ST_TAHU_A or ST_TAHU_B
     reg         awaiting_burn; // high between write_enable pulse and write_done
 
-    // Boot-time DARK detection: if we power up with chip_state == DARK (a previous burn was interrupted), latch chip_dark permanently.
-    // This is observed combinationally from chip_state.
-    wire boot_dark = (chip_state == 3'd1);
+    // Boot-time NGARO detection: if we power up with chip_state_ngaro asserted (a previous burn was interrupted), latch chip_ngaro permanently.
+    wire boot_dark = chip_state_ngaro;
 
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
@@ -1459,7 +1478,7 @@ module ira_fsm (
             otp_write_addr   <= 3'b0;
             otp_write_data   <= 256'b0;
             otp_write_enable <= 1'b0;
-            chip_dark      <= 1'b0;
+            chip_ngaro      <= 1'b0;
             ceremony_busy    <= 1'b0;
             ceremony_done    <= 1'b0;
             ira_seed         <= 256'b0;
@@ -1475,14 +1494,14 @@ module ira_fsm (
 
             case (fsm_state)
                 // ----------------------------------------------------------
-                // ST_OBSERVE: idle. Pass DARK through to chip_dark. If KORE + provision_request, kick off the ceremony.
+                // ST_OBSERVE: idle. Pass NGARO through to chip_ngaro. If KORE + provision_request, kick off the ceremony.
                 // ----------------------------------------------------------
                 ST_OBSERVE: begin
                     ceremony_busy <= 1'b0;
-                    chip_dark   <= boot_dark;
+                    chip_ngaro   <= boot_dark;
                     if (boot_dark) begin
-                        fsm_state <= ST_DARK;
-                    end else if ((chip_state == 3'd0) && provision_request) begin
+                        fsm_state <= ST_NGARO;
+                    end else if ((chip_state == 2'd0) && provision_request) begin
                         // KORE + request -> kick off KOHI
                         trng_start    <= 1'b1;
                         ceremony_busy <= 1'b1;
@@ -1491,12 +1510,12 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_KOHI: wait for trng.gather_done (success) or trng.health_fail (broken silicon -> DARK).
+                // ST_KOHI: wait for trng.gather_done (success) or trng.health_fail (broken silicon -> NGARO).
                 // ----------------------------------------------------------
                 ST_KOHI: begin
                     if (trng_health_fail) begin
-                        chip_dark <= 1'b1;
-                        fsm_state   <= ST_DARK;
+                        chip_ngaro <= 1'b1;
+                        fsm_state   <= ST_NGARO;
                     end else if (trng_gather_done) begin
                         blake3_start <= 1'b1;
                         fsm_state    <= ST_BLAKE3;
@@ -1533,9 +1552,9 @@ module ira_fsm (
                             burn_idx <= burn_idx + 2'd1;
                         end
                     end else if (otp_write_rejected) begin
-                        // Slot was already burned -- should be impossible on a fresh KORE chip. Defensive: latch DARK.
-                        chip_dark <= 1'b1;
-                        fsm_state   <= ST_DARK;
+                        // Slot was already burned -- should be impossible on a fresh KORE chip. Defensive: latch NGARO.
+                        chip_ngaro <= 1'b1;
+                        fsm_state   <= ST_NGARO;
                     end
                 end
 
@@ -1556,13 +1575,13 @@ module ira_fsm (
                             burn_idx <= burn_idx + 2'd1;
                         end
                     end else if (otp_write_rejected) begin
-                        chip_dark <= 1'b1;
-                        fsm_state   <= ST_DARK;
+                        chip_ngaro <= 1'b1;
+                        fsm_state   <= ST_NGARO;
                     end
                 end
 
                 // ----------------------------------------------------------
-                // ST_DONE: ceremony complete. Pulse ceremony_done, then move to SETTLE so the verify module has time to complete fresh post-burn sweeps on the new slot_flat data -- without this, a mid-sweep latched output (mixing OLD all-zero and NEW burned bits) reads as DARK for one sweep period and ST_OBSERVE would latch the chip into ST_DARK on that spurious transient.
+                // ST_DONE: ceremony complete. Pulse ceremony_done, then move to SETTLE so the verify module has time to complete fresh post-burn sweeps on the new slot_flat data -- without this, a mid-sweep latched output (mixing OLD all-zero and NEW burned bits) reads as NGARO for one sweep period and ST_OBSERVE would latch the chip into ST_NGARO on that spurious transient.
                 // ----------------------------------------------------------
                 ST_DONE: begin
                     ceremony_done <= 1'b1;
@@ -1571,8 +1590,8 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_SETTLE: hold off chip_dark / ST_DARK transitions for SETTLE_CYCLES cycles after the last OTP burn, giving inverted_pair_verify time to sweep the new slot data.
-                // chip_state may transiently read DARK during this window -- we ignore it.
+                // ST_SETTLE: hold off chip_ngaro / ST_NGARO transitions for SETTLE_CYCLES cycles after the last OTP burn, giving inverted_pair_verify time to sweep the new slot data.
+                // chip_state may transiently read NGARO during this window -- we ignore it.
                 // ----------------------------------------------------------
                 ST_SETTLE: begin
                     if (settle_cnt == 10'b0) begin
@@ -1583,10 +1602,10 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_DARK: terminal. Never exits except via POR.
+                // ST_NGARO: terminal. Never exits except via POR.
                 // ----------------------------------------------------------
-                ST_DARK: begin
-                    chip_dark   <= 1'b1;
+                ST_NGARO: begin
+                    chip_ngaro   <= 1'b1;
                     ceremony_busy <= 1'b0;
                 end
 
@@ -1653,7 +1672,8 @@ endmodule
 //   over the same 64 bytes, in the same byte order.
 //
 //   state_block layout (LSB at bit 256, MSB at bit 511; reserved bits zero):
-//     [258:256] chip_state           (3 bits)
+//     [257:256] chip_state           (2 bits: KORE=0, WHARA=1, HARA=2, ORA=3)
+//     [258]     chip_state_ngaro     (1 bit: 1 = byzantine fail, chip silent; included for forensics even though a NGARO chip will not actually transmit this state block to the host)
 //     [274:259] ring_health_mask     (16 bits)
 //     [279:275] ring_health_cnt      (5 bits)
 //     [287:280] slot_burned_mask     (8 bits)
@@ -1674,7 +1694,7 @@ endmodule
 module l3_session_fsm (
     input  wire         clk,
     input  wire         reset_n,
-    input  wire         chip_alive,        // chip_state >= DEGRADED-2; gates operation
+    input  wire         chip_operational,        // chip_state >= WHARA; gates operation
 
     // -------------------------------------------------------------------------
     // L2 codec interface (slot-clocked bit stream)
@@ -1714,7 +1734,8 @@ module l3_session_fsm (
     // -------------------------------------------------------------------------
     // Internal-state vector inputs for q/health composition
     // -------------------------------------------------------------------------
-    input  wire [2:0]   chip_state_in,
+    input  wire [1:0]   chip_state_in,
+    input  wire         chip_state_ngaro_in,
     input  wire [15:0]  ring_health_mask_in,
     input  wire [4:0]   ring_health_cnt_in,
     input  wire [7:0]   slot_burned_mask_in,
@@ -1842,7 +1863,8 @@ module l3_session_fsm (
         slot_burned_mask_in,    // [31:24]   slot_burned_mask (8 bits)
         ring_health_cnt_in,     // [23:19]   ring_health_cnt (5 bits)
         ring_health_mask_in,    // [18:3]    ring_health_mask (16 bits)
-        chip_state_in           // [2:0]     chip_state (3 bits)
+        chip_state_ngaro_in,    // [2]       chip_state_ngaro (1 bit)
+        chip_state_in           // [1:0]     chip_state (2 bits)
     };
 
     // Active-key selector based on detected mode.
@@ -1907,12 +1929,12 @@ module l3_session_fsm (
             case (state)
 
                 // -----------------------------------------------------------
-                // IDLE -- wait for chip_alive, then watch host stream for first 1 bit.
+                // IDLE -- wait for chip_operational, then watch host stream for first 1 bit.
                 // -----------------------------------------------------------
                 ST_IDLE: begin
                     tx_data   <= 1'b0;
                     tx_active <= 1'b0;
-                    if (chip_alive && rx_valid && rx_data) begin
+                    if (chip_operational && rx_valid && rx_data) begin
                         // Got the framing 1. It is NOT part of the message -- it is Claim 12a's leading-edge marker that says "the host is leaving idle, the next 256/512 bits are the payload." Don't shift it into rx_buf1; just consume it and start the buffer empty.
                         rx_buf1     <= 256'b0;
                         rx_bit_cnt  <= 9'd0;

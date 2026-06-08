@@ -28,7 +28,7 @@ For the protocol description, see [ferros/PIPE.md](../ferros/PIPE.md).
 | D | Ring + DCCA bringup, blake3 on ring, ring-vs-Fmax boundary (12-stage pass, 11-stage fail) | done |
 | E.1 | Wire bringup, codec, OLED instrumentation, host CDR | done |
 | E.2 | 16-ring TRNG (odd primes 3..59, slow universal sampler, popcount+toggle dual health, 8-of-16 byzantine, BLAKE3 extraction) | sim PASS — see [TRNG.md](TRNG.md) |
-| E.3 | `ira_fsm` (KOHI → TATARI → TAHU), 8-slot inverted-pair OTP, 5-state classifier, DARK-silent wire | sim PASS — see [IRA.md](IRA.md) |
+| E.3 | `ira_fsm` (KOHI → TATARI → TAHU), 8-slot inverted-pair OTP, 5-state classifier, NGARO-silent wire | sim PASS — see [IRA.md](IRA.md) |
 | E.4 | Production PIPE bitstream (TRNG + ira_fsm + codec, no crystal) | synth-clean, PnR convergence WIP (top_pipe_ira) |
 
 **Key lesson from D:** any ring oscillator output that drives more than a handful of FFs needs an explicit DCCA buffer between the ring loop and the synchronous logic. The `(* noglobal *)` attribute on the loop wires keeps the oscillator fast, but downstream distribution requires DCCA — without it, fabric routing skew causes setup/hold violations far below silicon Fmax. See `rtl/ring_osc.v` header.

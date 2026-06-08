@@ -14,21 +14,21 @@
 // It observes `chip_state` from inverted_pair_verify (which sees the OTP slots live) and reacts:
 //
 //   state=0 KORE  + provision_request → run ceremony
-//   state=1 DARK                       → assert chip_dark, idle
-//   state≥2 DEGRADED/HEALTHY              → chip is provisioned; nothing to do
+//   state=1 NGARO                       → assert chip_ngaro, idle
+//   state >= 2 WHARA/HARA/ORA              → chip is provisioned; nothing to do
 //
 // First-cut scope (this commit):
 //   - KOHI: pulse trng_start, wait for gather_done or health_fail
 //   - BLAKE3: pulse blake3_start, capture 256-bit ira_seed
 //   - TAHU: burn slots 0..3 (A=ira_seed), then 4..7 (B=~ira_seed)
 //   - No TATARI delay (TODO: add the BLAKE3-derived 256–1280 ms random pause)
-//   - No per-burn read-back verify (the next power cycle's classifier read naturally validates each pair; partial burns surface as DARK next boot)
+//   - No per-burn read-back verify (the next power cycle's classifier read naturally validates each pair; partial burns surface as NGARO next boot)
 //   - No wairua orchestration (separate FSM later, but sharing this module's trng/blake3 instances via the same arbiter pattern)
 //
-// chip_dark is asserted when:
-//   - boot-time state == DARK (e.g., previous TAHU was interrupted), OR
+// chip_ngaro is asserted when:
+//   - boot-time state == NGARO (e.g., previous TAHU was interrupted), OR
 //   - trng.health_fail latches during this boot's KOHI, OR
-//   - an OTP burn is rejected (write to already-burned slot — shouldn't happen on a fresh KORE device; latches DARK defensively)
+//   - an OTP burn is rejected (write to already-burned slot — shouldn't happen on a fresh KORE device; latches NGARO defensively)
 //
 // =============================================================================
 
@@ -41,8 +41,10 @@ module ira_fsm (
     // External trigger — pulse to start provisioning. Honored only when chip_state == KORE. Ignored otherwise (no-op).
     input  wire         provision_request,
 
-    // Live classifier output (combinational from inverted_pair_verify)
-    input  wire [2:0]   chip_state,          // 0=KORE, 1=DARK, 2..4=operating
+    // Live classifier output (combinational from inverted_pair_verify).
+    // chip_state is 2 bits: KORE=0, WHARA=1, HARA=2, ORA=3. NGARO is not encoded in chip_state; chip_state_ngaro is a separate predicate (chip is silent in NGARO; the host infers NGARO from no wire response).
+    input  wire [1:0]   chip_state,
+    input  wire         chip_state_ngaro,    // true when valid_count < 2 AND not all_kore
     input  wire         byzantine_ok,
 
     // trng.v handshake
@@ -65,7 +67,7 @@ module ira_fsm (
     input  wire         otp_write_rejected,
 
     // Outputs to the rest of the chip
-    output reg          chip_dark,         // gate for codec's tx_drive_enable
+    output reg          chip_ngaro,         // gate for codec's tx_drive_enable
     output reg          ceremony_busy,       // high during KOHI/BLAKE3/TAHU
     output reg          ceremony_done,       // 1-cycle pulse when TAHU completes
     output reg  [2:0]   fsm_state            // debug observability
@@ -75,16 +77,16 @@ module ira_fsm (
     // FSM states
     // -------------------------------------------------------------------------
     localparam [2:0]
-        ST_OBSERVE  = 3'd0,   // idle; gate chip_dark from chip_state
+        ST_OBSERVE  = 3'd0,   // idle; gate chip_ngaro from chip_state
         ST_KOHI     = 3'd1,   // trng running
         ST_BLAKE3   = 3'd2,   // blake3_tree conditioning
         ST_TAHU_A   = 3'd3,   // burn slots 0..3 (A = ira_seed)
         ST_TAHU_B   = 3'd4,   // burn slots 4..7 (B = ~ira_seed)
         ST_DONE     = 3'd5,   // pulse ceremony_done, settle, return to OBSERVE
         ST_SETTLE   = 3'd6,   // wait for verify to complete fresh post-burn sweeps
-        ST_DARK   = 3'd7;   // latched failure; never leaves until POR
+        ST_NGARO   = 3'd7;   // latched failure; never leaves until POR
 
-    // Wait long enough after TAHU for inverted_pair_verify to complete at least two full sweeps on the new (post-burn) slot_flat data. Sweep is 257 cycles; 1024 covers four sweeps comfortably and avoids any mid-sweep mismatched-latched-output transient propagating into a false ST_DARK transition.
+    // Wait long enough after TAHU for inverted_pair_verify to complete at least two full sweeps on the new (post-burn) slot_flat data. Sweep is 257 cycles; 1024 covers four sweeps comfortably and avoids any mid-sweep mismatched-latched-output transient propagating into a false ST_NGARO transition.
     localparam [9:0] SETTLE_CYCLES = 10'd1023;
     reg [9:0]        settle_cnt;
 
@@ -95,9 +97,8 @@ module ira_fsm (
     reg [1:0]   burn_idx;      // 0..3 within ST_TAHU_A or ST_TAHU_B
     reg         awaiting_burn; // high between write_enable pulse and write_done
 
-    // Boot-time DARK detection: if we power up with chip_state == DARK (a previous burn was interrupted), latch chip_dark permanently.
-    // This is observed combinationally from chip_state.
-    wire boot_dark = (chip_state == 3'd1);
+    // Boot-time NGARO detection: if we power up with chip_state_ngaro asserted (a previous burn was interrupted), latch chip_ngaro permanently.
+    wire boot_dark = chip_state_ngaro;
 
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
@@ -107,7 +108,7 @@ module ira_fsm (
             otp_write_addr   <= 3'b0;
             otp_write_data   <= 256'b0;
             otp_write_enable <= 1'b0;
-            chip_dark      <= 1'b0;
+            chip_ngaro      <= 1'b0;
             ceremony_busy    <= 1'b0;
             ceremony_done    <= 1'b0;
             ira_seed         <= 256'b0;
@@ -123,15 +124,15 @@ module ira_fsm (
 
             case (fsm_state)
                 // ----------------------------------------------------------
-                // ST_OBSERVE: idle. Pass DARK through to chip_dark. If KORE + provision_request, kick off the ceremony.
+                // ST_OBSERVE: idle. Pass NGARO through to chip_ngaro. If KORE + provision_request, kick off the ceremony.
                 // ----------------------------------------------------------
                 ST_OBSERVE: begin
                     ceremony_busy <= 1'b0;
-                    chip_dark   <= boot_dark;
+                    chip_ngaro   <= boot_dark;
                     if (boot_dark) begin
-                        fsm_state <= ST_DARK;
-                    end else if ((chip_state == 3'd0) && provision_request) begin
-                        // KORE + request → kick off KOHI
+                        fsm_state <= ST_NGARO;
+                    end else if ((chip_state == 2'd0) && provision_request) begin
+                        // KORE + request -> kick off KOHI
                         trng_start    <= 1'b1;
                         ceremony_busy <= 1'b1;
                         fsm_state     <= ST_KOHI;
@@ -139,12 +140,12 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_KOHI: wait for trng.gather_done (success) or trng.health_fail (broken silicon → DARK).
+                // ST_KOHI: wait for trng.gather_done (success) or trng.health_fail (broken silicon → NGARO).
                 // ----------------------------------------------------------
                 ST_KOHI: begin
                     if (trng_health_fail) begin
-                        chip_dark <= 1'b1;
-                        fsm_state   <= ST_DARK;
+                        chip_ngaro <= 1'b1;
+                        fsm_state   <= ST_NGARO;
                     end else if (trng_gather_done) begin
                         blake3_start <= 1'b1;
                         fsm_state    <= ST_BLAKE3;
@@ -181,9 +182,9 @@ module ira_fsm (
                             burn_idx <= burn_idx + 2'd1;
                         end
                     end else if (otp_write_rejected) begin
-                        // Slot was already burned — should be impossible on a fresh KORE chip. Defensive: latch DARK.
-                        chip_dark <= 1'b1;
-                        fsm_state   <= ST_DARK;
+                        // Slot was already burned — should be impossible on a fresh KORE chip. Defensive: latch NGARO.
+                        chip_ngaro <= 1'b1;
+                        fsm_state   <= ST_NGARO;
                     end
                 end
 
@@ -204,13 +205,13 @@ module ira_fsm (
                             burn_idx <= burn_idx + 2'd1;
                         end
                     end else if (otp_write_rejected) begin
-                        chip_dark <= 1'b1;
-                        fsm_state   <= ST_DARK;
+                        chip_ngaro <= 1'b1;
+                        fsm_state   <= ST_NGARO;
                     end
                 end
 
                 // ----------------------------------------------------------
-                // ST_DONE: ceremony complete. Pulse ceremony_done, then move to SETTLE so the verify module has time to complete fresh post-burn sweeps on the new slot_flat data — without this, a mid-sweep latched output (mixing OLD all-zero and NEW burned bits) reads as DARK for one sweep period and ST_OBSERVE would latch the chip into ST_DARK on that spurious transient.
+                // ST_DONE: ceremony complete. Pulse ceremony_done, then move to SETTLE so the verify module has time to complete fresh post-burn sweeps on the new slot_flat data — without this, a mid-sweep latched output (mixing OLD all-zero and NEW burned bits) reads as NGARO for one sweep period and ST_OBSERVE would latch the chip into ST_NGARO on that spurious transient.
                 // ----------------------------------------------------------
                 ST_DONE: begin
                     ceremony_done <= 1'b1;
@@ -219,8 +220,8 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_SETTLE: hold off chip_dark / ST_DARK transitions for SETTLE_CYCLES cycles after the last OTP burn, giving inverted_pair_verify time to sweep the new slot data.
-                // chip_state may transiently read DARK during this window — we ignore it.
+                // ST_SETTLE: hold off chip_ngaro / ST_NGARO transitions for SETTLE_CYCLES cycles after the last OTP burn, giving inverted_pair_verify time to sweep the new slot data.
+                // chip_state may transiently read NGARO during this window — we ignore it.
                 // ----------------------------------------------------------
                 ST_SETTLE: begin
                     if (settle_cnt == 10'b0) begin
@@ -231,10 +232,10 @@ module ira_fsm (
                 end
 
                 // ----------------------------------------------------------
-                // ST_DARK: terminal. Never exits except via POR.
+                // ST_NGARO: terminal. Never exits except via POR.
                 // ----------------------------------------------------------
-                ST_DARK: begin
-                    chip_dark   <= 1'b1;
+                ST_NGARO: begin
+                    chip_ngaro   <= 1'b1;
                     ceremony_busy <= 1'b0;
                 end
 

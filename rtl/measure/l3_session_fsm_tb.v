@@ -66,7 +66,7 @@ module l3_session_fsm_tb;
     always #5 clk = ~clk;  // 10 ns period (100 MHz)
 
     reg reset_n = 0;
-    reg chip_alive = 0;
+    reg chip_operational = 0;
 
     // -------------------------------------------------------------------------
     // DUT signals
@@ -95,7 +95,8 @@ module l3_session_fsm_tb;
     reg         wairua_gen_valid_r = 0;
 
     // Q/health state vector inputs
-    reg [2:0]   chip_state_in_r       = 3'd0;
+    reg [1:0]   chip_state_in_r       = 2'd0;
+    reg         chip_state_ngaro_in_r = 1'b0;
     reg [15:0]  ring_health_mask_in_r = 16'h0;
     reg [4:0]   ring_health_cnt_in_r  = 5'd0;
     reg [7:0]   slot_burned_mask_in_r = 8'h0;
@@ -119,7 +120,7 @@ module l3_session_fsm_tb;
     l3_session_fsm u_dut (
         .clk                 (clk),
         .reset_n             (reset_n),
-        .chip_alive          (chip_alive),
+        .chip_operational          (chip_operational),
         .rx_valid            (rx_valid_r),
         .rx_data             (rx_data_r),
         .tx_slot             (tx_slot_r),
@@ -140,6 +141,7 @@ module l3_session_fsm_tb;
         .wairua_gen_result   (wairua_gen_result_r),
         .wairua_gen_valid    (wairua_gen_valid_r),
         .chip_state_in       (chip_state_in_r),
+        .chip_state_ngaro_in (chip_state_ngaro_in_r),
         .ring_health_mask_in (ring_health_mask_in_r),
         .ring_health_cnt_in  (ring_health_cnt_in_r),
         .slot_burned_mask_in (slot_burned_mask_in_r),
@@ -598,7 +600,7 @@ module l3_session_fsm_tb;
 
         // Power-up + reset
         reset_n = 0;
-        chip_alive = 0;
+        chip_operational = 0;
         repeat (10) @(posedge clk);
         reset_n = 1;
         repeat (5) @(posedge clk);
@@ -616,7 +618,7 @@ module l3_session_fsm_tb;
                      fsm_state_debug_w, session_valid_o_w, drop_counter_w, tx_active_w);
         end
 
-        chip_alive = 1'b1;
+        chip_operational = 1'b1;
         repeat (3) @(posedge clk);
 
         // ---------------------------------------------------------------------
@@ -800,7 +802,7 @@ module l3_session_fsm_tb;
         // Test 6: Q_HEALTH PERMANENT (Claim 9c)
         // ---------------------------------------------------------------------
         // Set state-vector inputs
-        chip_state_in_r       = 3'd4;       // HEALTHY
+        chip_state_in_r       = 3'd4;       // ORA
         ring_health_mask_in_r = 16'hFFFC;
         ring_health_cnt_in_r  = 5'd14;
         slot_burned_mask_in_r = 8'hFF;

@@ -1,5 +1,5 @@
 // =============================================================================
-// top_pipe_ira.v — first-silicon KORE → HEALTHY ceremony
+// top_pipe_ira.v — first-silicon KORE → ORA ceremony
 // =============================================================================
 //
 // Minimal hardware top for the provisioning ceremony. Press Enter on the
@@ -9,12 +9,12 @@
 //   T6 (onboard LED, active-low):
 //     OFF                  → power-up KORE (provisionable, idle)
 //     fast blink           → ceremony_busy (KOHI / BLAKE3 / TAHU running)
-//     solid ON             → HEALTHY / DEGRADED (post-provisioning)
-//     OFF (with T2 lit)    → DARK
+//     solid ON             → ORA / HARA / WHARA (post-provisioning)
+//     OFF (with T2 lit)    → NGARO
 //
 //   T2 (J4 ext LED):
-//     OFF                  → not DARK
-//     solid ON             → DARK (silent chip per [[pipe-dark-state-silent-wire]])
+//     OFF                  → not NGARO
+//     solid ON             → NGARO (silent chip per [[pipe-ngaro-state-silent-wire]])
 //
 // OTP state does not persist across power cycles in FPGA emulation — every
 // boot starts KORE, every press provisions a *fresh* ira derived from
@@ -44,7 +44,7 @@ module top_pipe_ira (
     output wire oled_scl,       // SSD1306 I2C clock (P2)
     output wire oled_sda,       // SSD1306 I2C data  (R2)
     output reg  led,            // T6 onboard LED — ceremony status
-    output reg  ext_led         // T2 J4 LED — DARK indicator
+    output reg  ext_led         // T2 J4 LED — NGARO indicator
 );
 
     // =========================================================================
@@ -315,7 +315,8 @@ module top_pipe_ira (
     // =========================================================================
     // inverted_pair_verify — combinational classifier
     // =========================================================================
-    wire [2:0]   chip_state;
+    wire [1:0]   chip_state;
+    wire         chip_state_ngaro;
     wire         byzantine_ok;
     wire [255:0] recovered_ira;
 
@@ -332,6 +333,7 @@ module top_pipe_ira (
         .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
+        .chip_ngaro  (chip_state_ngaro),
         .state       (chip_state),
         .ira         (recovered_ira)
     );
@@ -339,7 +341,7 @@ module top_pipe_ira (
     // =========================================================================
     // ira_fsm — the orchestrator
     // =========================================================================
-    wire chip_dark, ceremony_busy, ceremony_done;
+    wire chip_ngaro, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -347,6 +349,7 @@ module top_pipe_ira (
         .reset_n           (reset_n),
         .provision_request (provision_request),
         .chip_state        (chip_state),
+        .chip_state_ngaro  (chip_state_ngaro),
         .byzantine_ok      (byzantine_ok),
         .trng_start        (trng_start),
         .trng_busy         (trng_busy),
@@ -361,7 +364,7 @@ module top_pipe_ira (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_dark       (chip_dark),
+        .chip_ngaro       (chip_ngaro),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),
         .fsm_state         (fsm_state)
@@ -371,27 +374,27 @@ module top_pipe_ira (
     // LED state machine
     //   T6 (active-low, so output = ~drive_value):
     //     ceremony_busy → fast blink (every 2^21 cycles ≈ 12 Hz at 25 MHz)
-    //     post-HEALTHY   → solid on
+    //     post-ORA   → solid on
     //     KORE idle    → off
-    //     DARK         → off (T2 carries the DARK indicator)
+    //     NGARO         → off (T2 carries the NGARO indicator)
     //   T2 (active-high, since T2 drives the ext LED through a buffer):
-    //     chip_dark    → solid on
+    //     chip_ngaro    → solid on
     //     else           → off
     // =========================================================================
     reg [23:0] blink_div = 24'b0;
     always @(posedge clk) blink_div <= blink_div + 24'd1;
 
     wire blink_fast = blink_div[20];     // ~12 Hz
-    wire chip_alive = (chip_state >= 3'd2);
+    wire chip_operational = (chip_state >= 2'd1);
 
     always @(posedge clk) begin
-        if (chip_dark) begin
+        if (chip_ngaro) begin
             led     <= 1'b1;   // OFF (active-low)
             ext_led <= 1'b1;   // ON (T2 buffer logic — match scope convention)
         end else if (ceremony_busy) begin
             led     <= blink_fast;       // fast blink while working
             ext_led <= 1'b0;             // off
-        end else if (chip_alive) begin
+        end else if (chip_operational) begin
             led     <= 1'b0;   // solid ON (active-low)
             ext_led <= 1'b0;
         end else begin
@@ -467,6 +470,7 @@ module top_pipe_ira (
         .mode            (mode),
         .ira             (recovered_ira),
         .chip_state      (chip_state),
+        .chip_state_ngaro  (chip_state_ngaro),
         .ring_health_cnt (trng_ring_health_cnt),
         .slot_flat       (all_slots_flat),
         .ring_rct_fail   (16'b0),
@@ -481,7 +485,7 @@ module top_pipe_ira (
     // screen renders.
     // -------------------------------------------------------------------------
     reg [3:0] re_render_init_cnt;
-    reg [2:0] last_chip_state;
+    reg [1:0] last_chip_state;
     reg [1:0] last_mode;
     reg       re_render_req;
     always @(posedge clk or negedge reset_n) begin

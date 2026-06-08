@@ -5,7 +5,7 @@
 // Combinational-equivalent classifier for the inverted-pair storage geometry described in IRA.md §"OTP geometry" / §"The five lifelong states". Takes 8 slot values (4 pairs × {A, B}) and produces:
 //
 //   - per-pair classification (kore / valid / corrupt)
-//   - aggregate 5-state machine code (KORE / DARK / DEGRADED-{2,1} / HEALTHY)
+//   - aggregate 5-state machine code (KORE / NGARO / WHARA / HARA / ORA)
 //   - recovered ira value (lowest-indexed valid pair's A slot, or zero)
 //   - byzantine_ok strobe (≥2 valid pairs AND all valid pairs agree on ira)
 //   - state_valid strobe (high after first complete sweep)
@@ -60,9 +60,22 @@ module inverted_pair_verify #(
     output reg                    all_kore,
     output reg                    agreement_ok,
     output reg                    byzantine_ok,
-    output reg  [2:0]             state,
+    // chip_ngaro is true when the chip is in the silent failure state -- valid_count < 2 and not all_kore. The chip's FSM uses this to gate wire output; the host infers NGARO from the absence of any wire response.
+    output reg                    chip_ngaro,
+    // 2-bit wire-reportable state. NGARO is not encoded here since the chip in NGARO does not transmit; the host infers NGARO from no response. The numeric value rises with chip vitality (= number of valid pairs, modulo the KORE/NGARO gap).
+    //   KORE  = 2'd0  (0 valid pairs, storage all zero)
+    //   WHARA = 2'd1  (2 valid pairs, at byzantine minimum)
+    //   HARA  = 2'd2  (3 valid pairs, single fault tolerated)
+    //   ORA   = 2'd3  (4 valid pairs, fully healthy)
+    output reg  [1:0]             state,
     output reg  [SLOT_BITS-1:0]   ira
 );
+
+    // State code constants (matching the localparam style used in callers).
+    localparam [1:0] ST_KORE  = 2'd0;
+    localparam [1:0] ST_WHARA = 2'd1;
+    localparam [1:0] ST_HARA  = 2'd2;
+    localparam [1:0] ST_ORA   = 2'd3;
 
     // -------------------------------------------------------------------------
     // Unpack the 8 slots — combinational views of slot_flat.
@@ -167,11 +180,14 @@ module inverted_pair_verify #(
                                 : c_pair_valid[3] ? slot[3]
                                 : {SLOT_BITS{1'b0}};
 
-    wire [2:0] c_state = c_all_kore    ? 3'd0
-                       : ~c_byzantine_ok ? 3'd1
-                       : (c_valid_count == 3'd2) ? 3'd2
-                       : (c_valid_count == 3'd3) ? 3'd3
-                       :                            3'd4;
+    // 2-bit wire-reportable state. NGARO is not encoded -- it is a separate signal that gates wire output (chip is silent in NGARO).
+    wire [1:0] c_state = (c_valid_count == 3'd4) ? ST_ORA
+                       : (c_valid_count == 3'd3) ? ST_HARA
+                       : (c_valid_count == 3'd2) ? ST_WHARA
+                       :                            ST_KORE;   // valid_count 0 or 1 (1 collapses to KORE since chip is silent anyway)
+
+    // chip_ngaro: byzantine fail and not in the pristine all-kore state.
+    wire c_chip_ngaro = ~c_byzantine_ok & ~c_all_kore;
 
     // -------------------------------------------------------------------------
     // Sweep FSM — single always block driving all state and outputs.
@@ -193,7 +209,8 @@ module inverted_pair_verify #(
             all_kore    <= 1'b0;
             agreement_ok  <= 1'b0;
             byzantine_ok  <= 1'b0;
-            state         <= 3'b0;
+            chip_ngaro    <= 1'b0;
+            state         <= ST_KORE;
             ira           <= {SLOT_BITS{1'b0}};
             for (i = 0; i < 8; i = i + 1) begin
                 popcount[i] <= 9'b0;
@@ -208,6 +225,7 @@ module inverted_pair_verify #(
             all_kore   <= c_all_kore;
             agreement_ok <= c_agreement_ok;
             byzantine_ok <= c_byzantine_ok;
+            chip_ngaro   <= c_chip_ngaro;
             state        <= c_state;
             ira          <= c_ira;
             state_valid  <= 1'b1;

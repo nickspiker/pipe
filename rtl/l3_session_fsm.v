@@ -50,14 +50,15 @@
 //   over the same 64 bytes, in the same byte order.
 //
 //   state_block layout (LSB at bit 256, MSB at bit 511; reserved bits zero):
-//     [258:256] chip_state           (3 bits)
+//     [257:256] chip_state           (2 bits: KORE=0, WHARA=1, HARA=2, ORA=3)
+//     [258]     chip_state_ngaro     (1 bit: 1 = byzantine fail, chip silent; included for forensics even though a NGARO chip will not actually transmit this state block to the host)
 //     [274:259] ring_health_mask     (16 bits)
 //     [279:275] ring_health_cnt      (5 bits)
 //     [287:280] slot_burned_mask     (8 bits)
 //     [290:288] fsm_state            (3 bits)
-//     [354:291] session_counter      (64 bits)   ← Message B exchanges this session
-//     [418:355] boot_epoch           (64 bits)   ← enclave_clk count since POR
-//     [482:419] drop_counter         (64 bits)   ← DROP events (lifetime)
+//     [354:291] session_counter      (64 bits)   <- Message B exchanges this session
+//     [418:355] boot_epoch           (64 bits)   <- enclave_clk count since POR
+//     [482:419] drop_counter         (64 bits)   <- DROP events (lifetime)
 //     [511:483] reserved zero        (29 bits)
 //
 //   All counters are 64-bit per user instruction (chain-state visibility +
@@ -71,7 +72,7 @@
 module l3_session_fsm (
     input  wire         clk,
     input  wire         reset_n,
-    input  wire         chip_alive,        // chip_state >= DEGRADED-2; gates operation
+    input  wire         chip_operational,        // chip_state >= WHARA; gates operation
 
     // -------------------------------------------------------------------------
     // L2 codec interface (slot-clocked bit stream)
@@ -111,7 +112,8 @@ module l3_session_fsm (
     // -------------------------------------------------------------------------
     // Internal-state vector inputs for q/health composition
     // -------------------------------------------------------------------------
-    input  wire [2:0]   chip_state_in,
+    input  wire [1:0]   chip_state_in,
+    input  wire         chip_state_ngaro_in,
     input  wire [15:0]  ring_health_mask_in,
     input  wire [4:0]   ring_health_cnt_in,
     input  wire [7:0]   slot_burned_mask_in,
@@ -239,7 +241,8 @@ module l3_session_fsm (
         slot_burned_mask_in,    // [31:24]   slot_burned_mask (8 bits)
         ring_health_cnt_in,     // [23:19]   ring_health_cnt (5 bits)
         ring_health_mask_in,    // [18:3]    ring_health_mask (16 bits)
-        chip_state_in           // [2:0]     chip_state (3 bits)
+        chip_state_ngaro_in,    // [2]       chip_state_ngaro (1 bit)
+        chip_state_in           // [1:0]     chip_state (2 bits)
     };
 
     // Active-key selector based on detected mode.
@@ -304,12 +307,12 @@ module l3_session_fsm (
             case (state)
 
                 // -----------------------------------------------------------
-                // IDLE — wait for chip_alive, then watch host stream for first 1 bit.
+                // IDLE — wait for chip_operational, then watch host stream for first 1 bit.
                 // -----------------------------------------------------------
                 ST_IDLE: begin
                     tx_data   <= 1'b0;
                     tx_active <= 1'b0;
-                    if (chip_alive && rx_valid && rx_data) begin
+                    if (chip_operational && rx_valid && rx_data) begin
                         // Got the framing 1. It is NOT part of the message — it is Claim 12a's leading-edge marker that says "the host is leaving idle, the next 256/512 bits are the payload." Don't shift it into rx_buf1; just consume it and start the buffer empty.
                         rx_buf1     <= 256'b0;
                         rx_bit_cnt  <= 9'd0;

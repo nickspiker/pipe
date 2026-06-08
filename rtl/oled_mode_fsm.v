@@ -9,8 +9,8 @@
 //
 //   MODE 0 — STATUS
 //     Line 0:  "PIPE STATUS"
-//     Line 1:  state name ("KORE" / "DARK" / "DEGRADED-2" / "DEGRADED-1" /
-//              "HEALTHY")
+//     Line 1:  state name ("KORE" / "NGARO" / "WHARA" / "HARA" /
+//              "ORA")
 //     Line 2:  "rings: N/16"  (N = ring_health_cnt)
 //     Line 3:  (blank)
 //
@@ -38,7 +38,8 @@ module oled_mode_fsm #(
 ) (
     input  wire [2:0]                                  mode,
     input  wire [255:0]                                ira,
-    input  wire [2:0]                                  chip_state,
+    input  wire [1:0]                                  chip_state,
+    input  wire                                        chip_state_ngaro,
     input  wire [4:0]                                  ring_health_cnt,
     input  wire [8*SLOT_BITS-1:0]                      slot_flat,
     // Diagnostic surface for MODE 3 (HEALTH DETAIL)
@@ -85,37 +86,29 @@ module oled_mode_fsm #(
         strings_status[ 7*8 +: 8] = "A"; strings_status[ 8*8 +: 8] = "T";
         strings_status[ 9*8 +: 8] = "U"; strings_status[10*8 +: 8] = "S";
 
-        // Line 1 (slot 24..47): state name
-        case (chip_state)
-            3'd0: begin
-                strings_status[(24+0)*8 +: 8] = "V"; strings_status[(24+1)*8 +: 8] = "I";
-                strings_status[(24+2)*8 +: 8] = "R"; strings_status[(24+3)*8 +: 8] = "G";
-                strings_status[(24+4)*8 +: 8] = "I"; strings_status[(24+5)*8 +: 8] = "N";
+        // Line 1 (slot 24..47): state name.
+        // chip_state_ngaro takes priority -- the chip in NGARO state would not actually drive the wire (or this OLED, in production), so the display is meaningful only for diagnostics. The 2-bit chip_state values map to KORE / WHARA / HARA / ORA in order.
+        if (chip_state_ngaro) begin
+            strings_status[(24+0)*8 +: 8] = "N"; strings_status[(24+1)*8 +: 8] = "G";
+            strings_status[(24+2)*8 +: 8] = "A"; strings_status[(24+3)*8 +: 8] = "R";
+            strings_status[(24+4)*8 +: 8] = "O";
+        end else case (chip_state)
+            2'd0: begin
+                strings_status[(24+0)*8 +: 8] = "K"; strings_status[(24+1)*8 +: 8] = "O";
+                strings_status[(24+2)*8 +: 8] = "R"; strings_status[(24+3)*8 +: 8] = "E";
             end
-            3'd1: begin
-                strings_status[(24+0)*8 +: 8] = "F"; strings_status[(24+1)*8 +: 8] = "U";
-                strings_status[(24+2)*8 +: 8] = "C"; strings_status[(24+3)*8 +: 8] = "K";
-                strings_status[(24+4)*8 +: 8] = "E"; strings_status[(24+5)*8 +: 8] = "D";
+            2'd1: begin
+                strings_status[(24+0)*8 +: 8] = "W"; strings_status[(24+1)*8 +: 8] = "H";
+                strings_status[(24+2)*8 +: 8] = "A"; strings_status[(24+3)*8 +: 8] = "R";
+                strings_status[(24+4)*8 +: 8] = "A";
             end
-            3'd2: begin
-                strings_status[(24+0)*8 +: 8] = "D"; strings_status[(24+1)*8 +: 8] = "E";
-                strings_status[(24+2)*8 +: 8] = "G"; strings_status[(24+3)*8 +: 8] = "R";
-                strings_status[(24+4)*8 +: 8] = "A"; strings_status[(24+5)*8 +: 8] = "D";
-                strings_status[(24+6)*8 +: 8] = "E"; strings_status[(24+7)*8 +: 8] = "D";
-                strings_status[(24+8)*8 +: 8] = "-"; strings_status[(24+9)*8 +: 8] = "2";
+            2'd2: begin
+                strings_status[(24+0)*8 +: 8] = "H"; strings_status[(24+1)*8 +: 8] = "A";
+                strings_status[(24+2)*8 +: 8] = "R"; strings_status[(24+3)*8 +: 8] = "A";
             end
-            3'd3: begin
-                strings_status[(24+0)*8 +: 8] = "D"; strings_status[(24+1)*8 +: 8] = "E";
-                strings_status[(24+2)*8 +: 8] = "G"; strings_status[(24+3)*8 +: 8] = "R";
-                strings_status[(24+4)*8 +: 8] = "A"; strings_status[(24+5)*8 +: 8] = "D";
-                strings_status[(24+6)*8 +: 8] = "E"; strings_status[(24+7)*8 +: 8] = "D";
-                strings_status[(24+8)*8 +: 8] = "-"; strings_status[(24+9)*8 +: 8] = "1";
-            end
-            3'd4: begin
-                strings_status[(24+0)*8 +: 8] = "H"; strings_status[(24+1)*8 +: 8] = "E";
-                strings_status[(24+2)*8 +: 8] = "A"; strings_status[(24+3)*8 +: 8] = "L";
-                strings_status[(24+4)*8 +: 8] = "T"; strings_status[(24+5)*8 +: 8] = "H";
-                strings_status[(24+6)*8 +: 8] = "Y";
+            2'd3: begin
+                strings_status[(24+0)*8 +: 8] = "O"; strings_status[(24+1)*8 +: 8] = "R";
+                strings_status[(24+2)*8 +: 8] = "A";
             end
             default: begin
                 strings_status[(24+0)*8 +: 8] = "?"; strings_status[(24+1)*8 +: 8] = "?";

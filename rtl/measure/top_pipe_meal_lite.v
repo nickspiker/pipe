@@ -18,11 +18,11 @@
 //       response = BLAKE3_keyed_hash(IRA, challenge).
 //
 //   v2: OTP_INIT_FILE=<file containing the IRA from v1's OLED> → boots
-//       directly HEALTHY (no ceremony, no TRNG run) → challenges work
+//       directly ORA (no ceremony, no TRNG run) → challenges work
 //       immediately → power cycle → same IRA, same response.
 //
 //   v3.<fault>: OTP_INIT_FILE=<corrupt fixture> → boots into the appropriate
-//       DARK/DEGRADED state per inverted_pair_verify, demonstrating
+//       NGARO/WHARA/HARA state per inverted_pair_verify, demonstrating
 //       classifier robustness against realistic eFuse failure modes
 //       (interrupted programming, stuck bits).
 //
@@ -32,7 +32,7 @@
 //
 // LEDs:
 //   T6 (active-low): mirrors ext_led for completeness; hard to see near power LED
-//   T2 (active-high, ext): OFF→KORE; ~12 Hz→busy; solid→HEALTHY; ~1.5 Hz→DARK
+//   T2 (active-high, ext): OFF→KORE; ~12 Hz→busy; solid→ORA; ~1.5 Hz→NGARO
 //
 // =============================================================================
 
@@ -297,7 +297,7 @@ module top_pipe_meal_lite (
     wire [15:0] trng_ring_enable;
     // Arbitrated wairua-gen pipeline. ira_fsm drives during ceremony; L3 drives
     // for fresh-session wairua refresh. They are mutually exclusive: ira_fsm
-    // runs only while chip_state < HEALTHY; L3 runs only when chip_alive.
+    // runs only while chip_state < ORA; L3 runs only when chip_operational.
     wire        ira_trng_start, ira_blake3_start;
     wire        l3_trng_start, l3_wairua_gen_start;
     wire        trng_start  = ira_trng_start  | l3_trng_start;
@@ -427,7 +427,8 @@ module top_pipe_meal_lite (
     // =========================================================================
     // inverted_pair_verify — combinational classifier
     // =========================================================================
-    wire [2:0]   chip_state;
+    wire [1:0]   chip_state;
+    wire         chip_state_ngaro;
     wire         byzantine_ok;
     wire [255:0] recovered_ira;
     wire         verify_state_valid;
@@ -444,6 +445,7 @@ module top_pipe_meal_lite (
         .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
+        .chip_ngaro  (chip_state_ngaro),
         .state       (chip_state),
         .ira         (recovered_ira)
     );
@@ -451,7 +453,7 @@ module top_pipe_meal_lite (
     // =========================================================================
     // ira_fsm — KOHI → BLAKE3 → TAHU ceremony orchestrator
     // =========================================================================
-    wire chip_dark, ceremony_busy, ceremony_done;
+    wire chip_ngaro, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -459,6 +461,7 @@ module top_pipe_meal_lite (
         .reset_n           (ira_fsm_reset_n),
         .provision_request (provision_request),
         .chip_state        (chip_state),
+        .chip_state_ngaro  (chip_state_ngaro),
         .byzantine_ok      (byzantine_ok),
         .trng_start        (ira_trng_start),
         .trng_busy         (trng_busy),
@@ -473,7 +476,7 @@ module top_pipe_meal_lite (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_dark       (chip_dark),
+        .chip_ngaro       (chip_ngaro),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),
         .fsm_state         (fsm_state)
@@ -484,27 +487,27 @@ module top_pipe_meal_lite (
     //   ext_led (T2 active-high) is primary status:
     //     ring0-alive blink → KORE idle
     //     ~12 Hz fast blink → ceremony busy
-    //     solid             → HEALTHY (or DEGRADED, still alive)
-    //     ~1.5 Hz slow      → DARK
+    //     solid             → ORA (or HARA/WHARA, still alive)
+    //     ~1.5 Hz slow      → NGARO
     // =========================================================================
     reg [23:0] blink_div = 24'b0;
     always @(posedge clk) blink_div <= blink_div + 24'd1;
     wire blink_fast = blink_div[20];
     wire blink_slow = blink_div[23];
-    wire chip_alive = (chip_state >= 3'd2);
+    wire chip_operational = (chip_state >= 2'd1);
 
     reg [21:0] ring0_div = 22'b0;
     always @(posedge ring_out[0]) ring0_div <= ring0_div + 22'd1;
     wire ring0_alive = ring0_div[21];
 
     always @(posedge clk) begin
-        if (chip_dark) begin
+        if (chip_ngaro) begin
             led     <= ~blink_slow;
             ext_led <=  blink_slow;
         end else if (ceremony_busy) begin
             led     <= ~blink_fast;
             ext_led <=  blink_fast;
-        end else if (chip_alive) begin
+        end else if (chip_operational) begin
             led     <= 1'b0;
             ext_led <= 1'b1;
         end else begin
@@ -558,6 +561,7 @@ module top_pipe_meal_lite (
         .mode               (mode),
         .ira                (recovered_ira),
         .chip_state         (chip_state),
+        .chip_state_ngaro  (chip_state_ngaro),
         .ring_health_cnt    (trng_ring_health_cnt),
         .slot_flat          (all_slots_flat),
         .ring_rct_fail      (trng_ring_rct_fail),
@@ -580,7 +584,7 @@ module top_pipe_meal_lite (
     // its R_DONE idle state). Previously this was a 1-cycle pulse, which was
     // dropped if a new trigger fired while the renderer was still mid-frame
     // from a previous trigger. Specifically: ceremony_done fires the first
-    // re-render; chip_state transitions KORE→HEALTHY a few hundred cycles
+    // re-render; chip_state transitions KORE→ORA a few hundred cycles
     // later (after inverted_pair_verify finishes its sweep) and fires a
     // second re-render — but the first render is still in progress, so the
     // pulse is missed. Result: OLED shows a stale frame at the leftmost
@@ -589,9 +593,9 @@ module top_pipe_meal_lite (
     // flag, and the renderer's render_done falling edge clears it (= request
     // consumed).
     reg [3:0] re_render_init_cnt;
-    reg [2:0] last_chip_state;
+    reg [1:0] last_chip_state;
     reg [2:0] last_mode;
-    reg       last_chip_dark;
+    reg       last_chip_ngaro;
     reg       last_trng_health_fail;
     reg       last_trng_gather_done_seen;
     reg       re_render_req;
@@ -603,7 +607,7 @@ module top_pipe_meal_lite (
             re_render_req              <= 1'b0;
             last_chip_state            <= 3'd0;
             last_mode                  <= 3'd0;
-            last_chip_dark           <= 1'b0;
+            last_chip_ngaro           <= 1'b0;
             last_trng_health_fail      <= 1'b0;
             last_trng_gather_done_seen <= 1'b0;
             last_render_done           <= 1'b1;
@@ -623,12 +627,12 @@ module top_pipe_meal_lite (
             if (ceremony_done)                                       re_render_req <= 1'b1;
             if (chip_state != last_chip_state)                       re_render_req <= 1'b1;
             if (mode != last_mode)                                   re_render_req <= 1'b1;
-            if (chip_dark && !last_chip_dark)                    re_render_req <= 1'b1;
+            if (chip_ngaro && !last_chip_ngaro)                    re_render_req <= 1'b1;
             if (trng_health_fail && !last_trng_health_fail)          re_render_req <= 1'b1;
             if (trng_gather_done && !last_trng_gather_done_seen)     re_render_req <= 1'b1;
             last_chip_state            <= chip_state;
             last_mode                  <= mode;
-            last_chip_dark           <= chip_dark;
+            last_chip_ngaro           <= chip_ngaro;
             last_trng_health_fail      <= trng_health_fail;
             last_trng_gather_done_seen <= trng_gather_done;
         end
@@ -666,7 +670,7 @@ module top_pipe_meal_lite (
     // PIPE wire — bidirectional I/O. wire_io is the pad tristate buffer with
     // synchronized input. The mirror-XOR codec + slot timing are inlined below
     // so everything runs in the single enclave_clk domain (no gated clock).
-    // Until chip_alive, drive_en is held LOW so the line stays HIGH-Z and the
+    // Until chip_operational, drive_en is held LOW so the line stays HIGH-Z and the
     // external pull-down (or internal weak pull-down on the dev rig) keeps it
     // idle LOW — indistinguishable from "chip absent" (Claim 6 silent wire).
     // =========================================================================
@@ -724,7 +728,7 @@ module top_pipe_meal_lite (
     // L1 mirror-XOR codec (inline, enclave_clk domain).
     //   Encode (combinational, valid every cycle while my_slot = 1):
     //     wire_out = OWN_IDLE (1) ^ tx_data ^ other_last
-    //     drive_en = chip_alive AND my_slot AND wire_out  (asymmetric pull-down
+    //     drive_en = chip_operational AND my_slot AND wire_out  (asymmetric pull-down
     //                — we drive HIGH or release; never drive LOW)
     //   Decode (registered, fires at slot boundary as my_slot toggles to 1):
     //     rx_data = wire_in ^ OTHER_IDLE (0) ^ own_last
@@ -739,7 +743,7 @@ module top_pipe_meal_lite (
 
     wire wire_logical = 1'b1 ^ l3_tx_data_w ^ other_last;
     assign wire_out_internal = wire_logical;
-    assign drive_en_internal = chip_alive && my_slot && wire_logical;
+    assign drive_en_internal = chip_operational && my_slot && wire_logical;
 
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
@@ -770,7 +774,7 @@ module top_pipe_meal_lite (
     end
 
     // =========================================================================
-    // L3 session FSM (PROTOCOL.md v0). Owns the wire after chip_alive.
+    // L3 session FSM (PROTOCOL.md v0). Owns the wire after chip_operational.
     //   * fresh-session (Message A: 1,0,...,0) → KOHI → wairua → H_req/H_resp
     //   * Message B (X1||X2 each way): mode = SESSION vs PERMANENT by X2 form
     //   * q/health (Claim 9c) via BLAKE3("Kei te ora koe?") domain identifier
@@ -790,7 +794,7 @@ module top_pipe_meal_lite (
     l3_session_fsm u_l3 (
         .clk                 (clk),
         .reset_n             (reset_n),
-        .chip_alive          (chip_alive),
+        .chip_operational          (chip_operational),
 
         .rx_valid            (l3_rx_valid_r),
         .rx_data             (l3_rx_data_r),
@@ -816,6 +820,7 @@ module top_pipe_meal_lite (
         .wairua_gen_valid    (blake3_ira_valid),
 
         .chip_state_in       (chip_state),
+        .chip_state_ngaro_in (chip_state_ngaro),
         .ring_health_mask_in (trng_ring_health),
         .ring_health_cnt_in  (trng_ring_health_cnt),
         .slot_burned_mask_in (otp_burned_mask),

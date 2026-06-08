@@ -4,15 +4,15 @@
 //
 // Wires up the actual production modules (trng + blake3_tree + otp +
 // inverted_pair_verify + ira_fsm) and drives the provisioning ceremony
-// from KORE to HEALTHY. Validates that:
+// from KORE to ORA. Validates that:
 //   - chip_state starts at KORE (0) on power-up (all OTP slots zero)
 //   - provision_request triggers KOHI
 //   - trng gathers, popcounts all stay in band → no health_fail
 //   - blake3_tree conditions the buffer → 256-bit ira_seed
 //   - ira_fsm burns A-slots then B-slots
-//   - chip_state transitions to HEALTHY (4)
+//   - chip_state transitions to ORA (4)
 //   - ceremony_done pulses
-//   - chip_dark stays low throughout
+//   - chip_ngaro stays low throughout
 //
 // Rings are simulated by per-ring LFSRs giving each ring a different,
 // ~50/50 bit stream that easily passes the ¼…¾ popcount health check.
@@ -127,6 +127,7 @@ module ira_ceremony_tb;
     otp u_otp (
         .clk           (clk),
         .reset_n       (reset_n),
+        .wipe          (1'b0),
         .read_addr     (otp_read_addr),
         .read_data     (otp_read_data),
         .read_burned   (otp_read_burned),
@@ -135,7 +136,8 @@ module ira_ceremony_tb;
         .write_enable  (otp_write_enable),
         .write_done    (otp_write_done),
         .write_rejected(otp_write_rejected),
-        .burned_mask   (otp_burned_mask)
+        .burned_mask   (otp_burned_mask),
+        .all_slots_flat()
     );
 
     // -------------------------------------------------------------------------
@@ -151,7 +153,8 @@ module ira_ceremony_tb;
         u_otp.slot_data[3], u_otp.slot_data[2], u_otp.slot_data[1], u_otp.slot_data[0]
     };
 
-    wire [2:0]   chip_state;
+    wire [1:0]   chip_state;
+    wire         chip_state_ngaro;
     wire         byzantine_ok;
     wire [255:0] recovered_ira;
     wire [3:0]   pair_valid;
@@ -169,6 +172,7 @@ module ira_ceremony_tb;
         .all_kore  (),
         .agreement_ok(),
         .byzantine_ok(byzantine_ok),
+        .chip_ngaro  (chip_state_ngaro),
         .state       (chip_state),
         .ira         (recovered_ira)
     );
@@ -176,7 +180,7 @@ module ira_ceremony_tb;
     // -------------------------------------------------------------------------
     // ira_fsm — the orchestrator
     // -------------------------------------------------------------------------
-    wire chip_dark, ceremony_busy, ceremony_done;
+    wire chip_ngaro, ceremony_busy, ceremony_done;
     wire [2:0] fsm_state;
 
     ira_fsm u_fsm (
@@ -184,6 +188,7 @@ module ira_ceremony_tb;
         .reset_n          (reset_n),
         .provision_request(provision_request),
         .chip_state       (chip_state),
+        .chip_state_ngaro  (chip_state_ngaro),
         .byzantine_ok     (byzantine_ok),
         .trng_start       (trng_start_sig),
         .trng_busy        (trng_busy),
@@ -198,7 +203,7 @@ module ira_ceremony_tb;
         .otp_write_enable (otp_write_enable),
         .otp_write_done   (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
-        .chip_dark      (chip_dark),
+        .chip_ngaro      (chip_ngaro),
         .ceremony_busy    (ceremony_busy),
         .ceremony_done    (ceremony_done),
         .fsm_state        (fsm_state)
@@ -225,8 +230,8 @@ module ira_ceremony_tb;
         // Wait for the sequential popcount sweep to complete its first pass.
         wait (verify_state_valid);
         @(posedge clk);
-        $display("[t=%0t] After reset + first sweep: chip_state=%0d (expect 0=KORE), chip_dark=%b",
-                 $time, chip_state, chip_dark);
+        $display("[t=%0t] After reset + first sweep: chip_state=%0d (expect 0=KORE), chip_ngaro=%b",
+                 $time, chip_state, chip_ngaro);
         if (chip_state !== 3'd0)
             $display("  FAIL: expected KORE at boot, got state=%0d", chip_state);
 
@@ -267,17 +272,17 @@ module ira_ceremony_tb;
         // Wait for verify to re-sweep on the post-burn slot contents.
         // The sweep is 2049 cycles (low-and-slow); wait 5000 to cover two.
         repeat (5000) @(posedge clk);
-        $display("[t=%0t] Post-ceremony + resweep: chip_state=%0d (expect 4=HEALTHY), chip_dark=%b",
-                 $time, chip_state, chip_dark);
+        $display("[t=%0t] Post-ceremony + resweep: chip_state=%0d (expect 3=ORA), chip_ngaro=%b",
+                 $time, chip_state, chip_ngaro);
         $display("  pair_valid=%b, byzantine_ok=%b", pair_valid, byzantine_ok);
         $display("  recovered_ira=%h", recovered_ira);
 
-        if (chip_state === 3'd4 && chip_dark === 1'b0 && byzantine_ok && recovered_ira === blake3_ira) begin
+        if (chip_state === 2'd3 && chip_ngaro === 1'b0 && byzantine_ok && recovered_ira === blake3_ira) begin
             $display("");
-            $display("  *** PASS ***  KORE → HEALTHY ceremony complete, ira matches");
+            $display("  *** PASS ***  KORE → ORA ceremony complete, ira matches");
         end else begin
             $display("");
-            $display("  *** FAIL ***  ceremony did not reach HEALTHY state cleanly");
+            $display("  *** FAIL ***  ceremony did not reach ORA state cleanly");
         end
         $display("");
         $finish;

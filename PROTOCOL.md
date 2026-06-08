@@ -361,9 +361,9 @@ State block layout (matches `rtl/l3_session_fsm.v`):
 
 | Bits (within mblock) | Width | Field                | Notes                                                            |
 |---------------------:|------:|----------------------|------------------------------------------------------------------|
-|              258:256 |     3 | chip_state           | 0=KORE, 1=DARK, 2=DEGRADED-2, 3=DEGRADED-1, 4=HEALTHY        |
+|              258:256 |     3 | chip_state           | 0=KORE, 1=NGARO, 2=WHARA, 3=HARA, 4=ORA        |
 |              274:259 |    16 | ring_health_mask     | Per-ring pass bits (16 rings, LSB = ring 0)                      |
-|              279:275 |     5 | ring_health_cnt      | Healthy-ring count (0–16)                                        |
+|              279:275 |     5 | ring_health_cnt      | Ora-ring count (0–16)                                        |
 |              287:280 |     8 | slot_burned_mask     | OTP slot burned bits (8 slots, LSB = slot 0)                     |
 |              290:288 |     3 | fsm_state            | Ceremony FSM state (debug-only)                                  |
 |              354:291 |    64 | session_counter      | Verified Message-B exchanges in this session                     |

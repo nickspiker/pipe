@@ -2,7 +2,7 @@
 // trng.v — KOHI entropy gather: round-robin per-ring sampling + layered health
 // =============================================================================
 //
-// Drives a `ring_scheduler` instance that walks the 16 rings sequentially, gathering W=4096 samples per ring (16 × 4096 = 65,536 bits = 8 KB buffer fill). The scheduler runs the layered RCT + APT + iterated GF(2) differencing health check (Claim 3c) on each ring's stream as it goes. After all 16 rings complete, the per-ring verdicts are latched as `ring_health[15:0]` and the Byzantine threshold check decides HEALTHY/DARK.
+// Drives a `ring_scheduler` instance that walks the 16 rings sequentially, gathering W=4096 samples per ring (16 × 4096 = 65,536 bits = 8 KB buffer fill). The scheduler runs the layered RCT + APT + iterated GF(2) differencing health check (Claim 3c) on each ring's stream as it goes. After all 16 rings complete, the per-ring verdicts are latched as `ring_health[15:0]` and the Byzantine threshold check decides ORA/NGARO.
 //
 // The 16 ring oscillators free-run continuously; `ring_enable` is advisory (top.v decides whether to gate). Each ring's bit-stream feeds the entropy buffer one bit per cycle when `sample_valid` is high.
 //
@@ -43,7 +43,7 @@ module trng #(
 
     output reg          busy,           // high during gather + health check
     output reg          gather_done,    // 1-cycle strobe when buffer ready (>= 8 rings healthy)
-    output reg          health_fail,    // latched when <8 of 16 rings pass — DARK state
+    output reg          health_fail,    // latched when <8 of 16 rings pass — NGARO state
     output reg  [15:0]  ring_health,    // bitmask of last-gather healthy rings (1=pass)
     output reg   [4:0]  ring_health_cnt,// count of healthy rings 0..16 (for attestation responses)
     output wire [15:0]  ring_enable,    // advisory: one-hot mask of currently-active ring
@@ -139,7 +139,7 @@ module trng #(
         buf_rdata <= buffer[buf_raddr];
     end
 
-    // DARK threshold: 7 or fewer healthy rings. With 8+ of 16, byzantine safety satisfied and entropy remains cryptographically sound (XOR of independent sources via BLAKE3 is uniform whenever any one is uniform).
+    // NGARO threshold: 7 or fewer healthy rings. With 8+ of 16, byzantine safety satisfied and entropy remains cryptographically sound (XOR of independent sources via BLAKE3 is uniform whenever any one is uniform).
     localparam [4:0] HEALTH_MIN = 5'd8;
 
     // -------------------------------------------------------------------------
@@ -202,14 +202,14 @@ module trng #(
                 end
 
                 ST_CHECK: begin
-                    // Latch the health snapshot and decide HEALTHY/DEGRADED/DARK.
+                    // Latch the health snapshot and decide ORA / HARA / WHARA / NGARO.
                     ring_health     <= sched_ring_health_mask;
                     ring_health_cnt <= sched_ring_health_cnt;
                     ring_rct_fail   <= sched_ring_rct_fail;
                     ring_apt_fail   <= sched_ring_apt_fail;
                     ring_level_fail <= sched_ring_level_fail;
                     if (sched_ring_health_cnt < HEALTH_MIN) begin
-                        // <8 rings passed — DARK. health_fail latches permanently (POR is the only clear path). Downstream gates the wire heartbeat on this so a DARK chip goes silent rather than lying about its capability.
+                        // <8 rings passed — NGARO. health_fail latches permanently (POR is the only clear path). Downstream gates the wire heartbeat on this so a NGARO chip goes silent rather than lying about its capability.
                         health_fail <= 1'b1;
                     end else begin
                         // 8..16 healthy rings — entropy sound. The buffer can be conditioned; ring_health_cnt feeds attestation so the host learns the degradation level.

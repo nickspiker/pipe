@@ -19,11 +19,11 @@
 //   codec.v                         3       (mirror-XOR encode/decode)
 //   wire_io.v                       3       (bidirectional channel port)
 //   otp.v                           9       (write-once storage primitive)
-//   inverted_pair_verify.v          9, 8    (byzantine quorum, DARK gate)
+//   inverted_pair_verify.v          9, 8    (byzantine quorum, NGARO gate)
 //   trng.v                          8       (noise-detection circuitry, KOHI)
 //   ring_scheduler.v                8       (round-robin per-ring health)
 //   ring_health.v                   8       (RCT + APT + iterated GF(2) tests)
-//   ira_fsm.v                       1, 8    (provisioning ceremony, DARK)
+//   ira_fsm.v                       1, 8    (provisioning ceremony, NGARO)
 //   l3_session_fsm.v                2, 5, 6, 7   (per-message wire format, handshake-as-entropy, ira/wairua dichotomy)
 //
 // REFERENCED CRYPTOGRAPHIC PRIMITIVES (stubbed, port-interface only)

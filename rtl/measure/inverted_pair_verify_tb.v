@@ -23,8 +23,9 @@ module inverted_pair_verify_tb;
     reg  [8*SLOT_BITS-1:0] slot_flat = 0;
     wire                   state_valid;
     wire [3:0]             pair_kore, pair_valid, pair_corrupt;
-    wire [2:0]             valid_count, state;
-    wire                   all_kore, agreement_ok, byzantine_ok;
+    wire [2:0]             valid_count;
+    wire [1:0]             state;
+    wire                   all_kore, agreement_ok, byzantine_ok, chip_ngaro;
     wire [SLOT_BITS-1:0]   ira;
 
     inverted_pair_verify #(.SLOT_BITS(SLOT_BITS)) dut (
@@ -39,6 +40,7 @@ module inverted_pair_verify_tb;
         .all_kore  (all_kore),
         .agreement_ok(agreement_ok),
         .byzantine_ok(byzantine_ok),
+        .chip_ngaro  (chip_ngaro),
         .state       (state),
         .ira         (ira)
     );
@@ -102,87 +104,90 @@ module inverted_pair_verify_tb;
         expect_eq("T1.valid_count", {29'b0, valid_count}, 32'd0);
         expect_eq("T1.all_kore",  {31'b0, all_kore},  32'd1);
 
-        // T2. Pair 0 valid (A=IRA_A, B=~IRA_A), others zero (kore) → DARK
+        // T2. Pair 0 valid (A=IRA_A, B=~IRA_A), others zero (kore) -> byzantine fail -> chip_ngaro=1; state collapses to KORE since chip is silent in NGARO.
         set_slots(IRA_A, ZERO, ZERO, ZERO, ~IRA_A, ZERO, ZERO, ZERO);
         wait_for_resweep;
-        $display("T2 (1 valid + 3 kore): state=%0d, valid_count=%0d", state, valid_count);
-        expect_eq("T2.state",       {29'b0, state},       32'd1);
+        $display("T2 (1 valid + 3 kore): state=%0d, valid_count=%0d, ngaro=%b", state, valid_count, chip_ngaro);
+        expect_eq("T2.state",       {29'b0, state},       32'd0);
         expect_eq("T2.valid_count", {29'b0, valid_count}, 32'd1);
+        expect_eq("T2.chip_ngaro",  {31'b0, chip_ngaro},  32'd1);
 
-        // T3. Pairs 0,1 valid agreeing → DEGRADED-2 (state 2)
+        // T3. Pairs 0,1 valid agreeing -> WHARA (new state 1, was state 2)
         set_slots(IRA_A, IRA_A, ZERO, ZERO, ~IRA_A, ~IRA_A, ZERO, ZERO);
         wait_for_resweep;
         $display("T3 (2 valid agreeing): state=%0d, valid_count=%0d", state, valid_count);
-        expect_eq("T3.state",       {29'b0, state},        32'd2);
+        expect_eq("T3.state",       {29'b0, state},        32'd1);
         expect_eq("T3.valid_count", {29'b0, valid_count},  32'd2);
         expect_eq("T3.byzantine",   {31'b0, byzantine_ok}, 32'd1);
         if (ira === IRA_A) pass_count = pass_count + 1;
         else begin fail_count = fail_count + 1; $display("  FAIL T3.ira"); end
 
-        // T4. Pairs 0,1 valid DISAGREEING → DARK
+        // T4. Pairs 0,1 valid DISAGREEING -> chip_state reports WHARA (2 valid pairs in shape) but chip_ngaro=1 (disagreement -> byzantine fail). The two signals are orthogonal: chip_state describes valid-pair count, chip_ngaro describes the "would-be-silent" predicate. The chip in this state does not transmit, so the wire-reported state is moot; internal diagnostics see WHARA + ngaro=1.
         set_slots(IRA_A, IRA_B, ZERO, ZERO, ~IRA_A, ~IRA_B, ZERO, ZERO);
         wait_for_resweep;
-        $display("T4 (2 valid disagreeing): state=%0d, agreement=%b", state, agreement_ok);
+        $display("T4 (2 valid disagreeing): state=%0d, agreement=%b, ngaro=%b", state, agreement_ok, chip_ngaro);
         expect_eq("T4.state",        {29'b0, state},        32'd1);
         expect_eq("T4.agreement_ok", {31'b0, agreement_ok}, 32'd0);
+        expect_eq("T4.chip_ngaro",   {31'b0, chip_ngaro},   32'd1);
 
-        // T5. Pairs 0,1,2 valid agreeing → DEGRADED-1 (state 3)
+        // T5. Pairs 0,1,2 valid agreeing -> HARA (new state 2, was state 3)
         set_slots(IRA_A, IRA_A, IRA_A, ZERO, ~IRA_A, ~IRA_A, ~IRA_A, ZERO);
         wait_for_resweep;
         $display("T5 (3 valid agreeing): state=%0d, valid_count=%0d", state, valid_count);
-        expect_eq("T5.state",       {29'b0, state},       32'd3);
+        expect_eq("T5.state",       {29'b0, state},       32'd2);
         expect_eq("T5.valid_count", {29'b0, valid_count}, 32'd3);
 
-        // T6. All 4 pairs valid agreeing → HEALTHY (state 4)
+        // T6. All 4 pairs valid agreeing -> ORA (new state 3, was state 4)
         set_slots(IRA_A, IRA_A, IRA_A, IRA_A, ~IRA_A, ~IRA_A, ~IRA_A, ~IRA_A);
         wait_for_resweep;
-        $display("T6 (HEALTHY): state=%0d, valid_count=%0d", state, valid_count);
-        expect_eq("T6.state",       {29'b0, state},       32'd4);
+        $display("T6 (ORA): state=%0d, valid_count=%0d", state, valid_count);
+        expect_eq("T6.state",       {29'b0, state},       32'd3);
         expect_eq("T6.valid_count", {29'b0, valid_count}, 32'd4);
         if (ira === IRA_A) pass_count = pass_count + 1;
         else begin fail_count = fail_count + 1; $display("  FAIL T6.ira"); end
 
-        // T7. 1 corrupt + 3 valid agreeing → DEGRADED-1
+        // T7. 1 corrupt + 3 valid agreeing -> HARA (new state 2)
         set_slots(IRA_A, IRA_A, IRA_A, IRA_A, IRA_B, ~IRA_A, ~IRA_A, ~IRA_A);
         wait_for_resweep;
         $display("T7 (1 corrupt + 3 valid): state=%0d, corrupt=%b, valid=%b",
                  state, pair_corrupt, pair_valid);
-        expect_eq("T7.state",          {29'b0, state},      32'd3);
+        expect_eq("T7.state",          {29'b0, state},      32'd2);
         expect_eq("T7.valid_count",    {29'b0, valid_count}, 32'd3);
         expect_eq("T7.corrupt0",       {31'b0, pair_corrupt[0]}, 32'd1);
 
-        // T8. Lowest-valid-pair ira recovery: pair 0 corrupt, pair 1 valid
+        // T8. Lowest-valid-pair ira recovery: pair 0 corrupt, pair 1 valid -> 1 valid -> chip_ngaro=1, state collapses to KORE. ira recovery still works (pair 1 is lowest valid).
         set_slots(IRA_A, IRA_B, ZERO, ZERO, IRA_B, ~IRA_B, ZERO, ZERO);
         wait_for_resweep;
         $display("T8 (pair 0 corrupt, pair 1 valid): ira=%h", ira);
-        expect_eq("T8.state", {29'b0, state}, 32'd1);
+        expect_eq("T8.state",      {29'b0, state},      32'd0);
+        expect_eq("T8.chip_ngaro", {31'b0, chip_ngaro}, 32'd1);
         if (ira === IRA_B) pass_count = pass_count + 1;
         else begin fail_count = fail_count + 1; $display("  FAIL T8.ira"); end
 
-        // T9. Degenerate A=0, B=all-ones — popcount sanity must reject
+        // T9. Degenerate A=0, B=all-ones -- popcount sanity must reject pair 0; remaining 3 pairs valid -> HARA (new state 2)
         set_slots(ZERO, IRA_A, IRA_A, IRA_A, ONES, ~IRA_A, ~IRA_A, ~IRA_A);
         wait_for_resweep;
         $display("T9 (degenerate A=0/B=ones in pair 0): state=%0d, corrupt=%b",
                  state, pair_corrupt);
-        expect_eq("T9.state",          {29'b0, state},           32'd3);
+        expect_eq("T9.state",          {29'b0, state},           32'd2);
         expect_eq("T9.pair0_corrupt",  {31'b0, pair_corrupt[0]}, 32'd1);
         expect_eq("T9.pair0_valid",    {31'b0, pair_valid[0]},   32'd0);
 
-        // T10. A=ones/B=ones → CORRUPT (tightened kore requires all-zero)
+        // T10. A=ones/B=ones -> CORRUPT (tightened kore requires all-zero); remaining 3 valid -> HARA (new state 2)
         set_slots(ONES, IRA_A, IRA_A, IRA_A, ONES, ~IRA_A, ~IRA_A, ~IRA_A);
         wait_for_resweep;
         $display("T10 (A=ones/B=ones pair 0): state=%0d, kore=%b, corrupt=%b",
                  state, pair_kore, pair_corrupt);
-        expect_eq("T10.state",          {29'b0, state},           32'd3);
+        expect_eq("T10.state",          {29'b0, state},           32'd2);
         expect_eq("T10.pair0_kore",   {31'b0, pair_kore[0]},  32'd0);
         expect_eq("T10.pair0_corrupt",  {31'b0, pair_corrupt[0]}, 32'd1);
 
-        // T11. Low-popcount slot A (popcount=8 < 32) → CORRUPT
+        // T11. Low-popcount slot A (popcount=8 < 32) -> CORRUPT; remaining 3 valid -> HARA (new state 2)
         set_slots(256'h0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_00FF, IRA_A, IRA_A, IRA_A,
                   ~256'h0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_00FF, ~IRA_A, ~IRA_A, ~IRA_A);
         wait_for_resweep;
         $display("T11 (low-popcount A pair 0): state=%0d, corrupt=%b", state, pair_corrupt);
-        expect_eq("T11.state",          {29'b0, state},           32'd3);
+        expect_eq("T11.state",          {29'b0, state},           32'd2);
         expect_eq("T11.pair0_corrupt", {31'b0, pair_corrupt[0]}, 32'd1);
 
         // Summary
