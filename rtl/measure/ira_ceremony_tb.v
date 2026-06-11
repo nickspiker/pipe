@@ -181,7 +181,7 @@ module ira_ceremony_tb;
     // ira_fsm — the orchestrator
     // -------------------------------------------------------------------------
     wire chip_ngaro, ceremony_busy, ceremony_done;
-    wire [2:0] fsm_state;
+    wire [3:0] fsm_state;
 
     ira_fsm u_fsm (
         .clk              (clk),
@@ -203,6 +203,8 @@ module ira_ceremony_tb;
         .otp_write_enable (otp_write_enable),
         .otp_write_done   (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
+        // Sim has unbounded simulated energy -- tie the gate high.
+        .energy_ok        (1'b1),
         .chip_ngaro      (chip_ngaro),
         .ceremony_busy    (ceremony_busy),
         .ceremony_done    (ceremony_done),

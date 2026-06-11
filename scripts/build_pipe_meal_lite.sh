@@ -17,21 +17,31 @@
 #                           challenge-response output.
 #
 #   --bake-fault <variant>  Bake a corrupt configuration that exercises the
-#                           inverted_pair_verify classifier's robustness.
+#                           inverted_pair_verify classifier's robustness on a
+#                           chip that was successfully provisioned at some
+#                           point in the past, then later suffered cell-level
+#                           damage (single-event upset, latent defect, etc.).
+#                           The energy-budgeted atomic-commit architecture
+#                           (see patent Detailed Description) precludes the
+#                           "interrupted ceremony" failure mode entirely:
+#                           either the burn completes atomically or it never
+#                           starts, so partially-burned-but-uncommitted slot
+#                           configurations are not reachable in normal
+#                           operation. The fault fixtures here therefore
+#                           model post-commit damage only.
 #                           Variants:
-#                             partial_1            → pair 0 valid, 1/2/3 virgin
-#                                                    (expect FUCKED, 1 < byzantine)
-#                             partial_2            → pairs 0,1 valid, 2,3 virgin
-#                                                    (expect DEGRADED-2)
-#                             partial_3            → pairs 0,1,2 valid, 3 virgin
-#                                                    (expect DEGRADED-1)
+#                             partial_1            → pair 0 valid, 1/2/3 kore
+#                                                    (expect NGARO, 1 < byzantine)
+#                             partial_2            → pairs 0,1 valid, 2,3 kore
+#                                                    (expect WHARA)
+#                             partial_3            → pairs 0,1,2 valid, 3 kore
+#                                                    (expect HARA)
 #                             single_bit_one_pair  → all 4 pairs but slot[0]
 #                                                    has one bit flipped
-#                                                    (expect DEGRADED-1)
+#                                                    (expect HARA)
 #                             single_bit_two_pairs → all 4 pairs but slot[0]
 #                                                    AND slot[1] each have one
-#                                                    bit flipped
-#                                                    (expect DEGRADED-2)
+#                                                    bit flipped (expect WHARA)
 #
 #   --program               openFPGALoader to SRAM (volatile, fast iteration)
 #   --flash                 openFPGALoader to SPI flash (non-volatile, survives
@@ -218,9 +228,9 @@ elif [ -n "$BAKE_FAULT" ]; then
 fi
 
 echo "================================================================"
-if   [ -n "$BAKE_IRA" ];   then echo " MEAL LITE v2: baked IRA, boots HEALTHY"
-elif [ -n "$BAKE_FAULT" ]; then echo " MEAL LITE v3: fault fixture '$BAKE_FAULT'"
-else                            echo " MEAL LITE v1: VIRGIN boot, ceremony runs"
+if   [ -n "$BAKE_IRA" ];   then echo " MEAL LITE v2: baked IRA, boots ORA"
+elif [ -n "$BAKE_FAULT" ]; then echo " MEAL LITE v3: post-commit fault fixture '$BAKE_FAULT'"
+else                            echo " MEAL LITE v1: KORE boot, ceremony runs"
 fi
 echo "================================================================"
 

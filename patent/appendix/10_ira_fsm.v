@@ -66,25 +66,29 @@ module ira_fsm (
     input  wire         otp_write_done,
     input  wire         otp_write_rejected,
 
+    // Atomic-commit energy-budget gate. The FSM refuses to begin TAHU (the actual burn) unless energy_ok is asserted -- i.e. the chip's on-die or on-package energy buffer has sufficient stored charge to drive the entire burn sequence to completion at the required burn voltage, even if the external supply is removed mid-burn. Once TAHU starts the cap is isolated from the external rail and the burn proceeds to completion regardless of external power. If energy_ok is low the FSM waits in ST_ENERGY_WAIT; if external power is removed during this wait, no storage has been written and the chip presents KORE at next boot. On FPGA where no real energy buffer exists, top.v ties this input high (energy is always trivially available from the bench supply).
+    input  wire         energy_ok,
+
     // Outputs to the rest of the chip
     output reg          chip_ngaro,         // gate for codec's tx_drive_enable
     output reg          ceremony_busy,       // high during KOHI/BLAKE3/TAHU
     output reg          ceremony_done,       // 1-cycle pulse when TAHU completes
-    output reg  [2:0]   fsm_state            // debug observability
+    output reg  [3:0]   fsm_state            // debug observability
 );
 
     // -------------------------------------------------------------------------
     // FSM states
     // -------------------------------------------------------------------------
-    localparam [2:0]
-        ST_OBSERVE  = 3'd0,   // idle; gate chip_ngaro from chip_state
-        ST_KOHI     = 3'd1,   // trng running
-        ST_BLAKE3   = 3'd2,   // blake3_tree conditioning
-        ST_TAHU_A   = 3'd3,   // burn slots 0..3 (A = ira_seed)
-        ST_TAHU_B   = 3'd4,   // burn slots 4..7 (B = ~ira_seed)
-        ST_DONE     = 3'd5,   // pulse ceremony_done, settle, return to OBSERVE
-        ST_SETTLE   = 3'd6,   // wait for verify to complete fresh post-burn sweeps
-        ST_NGARO   = 3'd7;   // latched failure; never leaves until POR
+    localparam [3:0]
+        ST_OBSERVE      = 4'd0,   // idle; gate chip_ngaro from chip_state
+        ST_KOHI         = 4'd1,   // trng running
+        ST_BLAKE3       = 4'd2,   // blake3_tree conditioning
+        ST_ENERGY_WAIT  = 4'd3,   // ira_seed captured; wait for energy_ok before any storage write
+        ST_TAHU_A       = 4'd4,   // burn slots 0..3 (A = ira_seed) -- powered from the chip's energy buffer once entered
+        ST_TAHU_B       = 4'd5,   // burn slots 4..7 (B = ~ira_seed)
+        ST_DONE         = 4'd6,   // pulse ceremony_done, settle, return to OBSERVE
+        ST_SETTLE       = 4'd7,   // wait for verify to complete fresh post-burn sweeps
+        ST_NGARO        = 4'd8;   // latched failure; never leaves until POR
 
     // Wait long enough after TAHU for inverted_pair_verify to complete at least two full sweeps on the new (post-burn) slot_flat data. Sweep is 257 cycles; 1024 covers four sweeps comfortably and avoids any mid-sweep mismatched-latched-output transient propagating into a false ST_NGARO transition.
     localparam [9:0] SETTLE_CYCLES = 10'd1023;
@@ -108,7 +112,7 @@ module ira_fsm (
             otp_write_addr   <= 3'b0;
             otp_write_data   <= 256'b0;
             otp_write_enable <= 1'b0;
-            chip_ngaro      <= 1'b0;
+            chip_ngaro       <= 1'b0;
             ceremony_busy    <= 1'b0;
             ceremony_done    <= 1'b0;
             ira_seed         <= 256'b0;
@@ -159,6 +163,15 @@ module ira_fsm (
                     if (blake3_ira_valid) begin
                         ira_seed <= blake3_ira;
                         burn_idx <= 2'b0;
+                        fsm_state <= ST_ENERGY_WAIT;
+                    end
+                end
+
+                // ----------------------------------------------------------
+                // ST_ENERGY_WAIT: ira_seed is captured in volatile registers but no storage cell has been written yet. The chip waits here for the energy_ok signal indicating that its on-die or on-package energy buffer has accumulated enough stored charge to drive the entire TAHU burn sequence to completion at the required burn voltage. If external power is removed in this state, the volatile registers drop and the chip presents KORE at next boot -- no storage was touched, no committed identity exists, ceremony is re-runnable. Once energy_ok asserts, the FSM enters TAHU and the cap supplies the burn regardless of external supply.
+                // ----------------------------------------------------------
+                ST_ENERGY_WAIT: begin
+                    if (energy_ok) begin
                         fsm_state <= ST_TAHU_A;
                     end
                 end

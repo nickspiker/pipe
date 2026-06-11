@@ -454,7 +454,7 @@ module top_pipe_meal_lite (
     // ira_fsm — KOHI → BLAKE3 → TAHU ceremony orchestrator
     // =========================================================================
     wire chip_ngaro, ceremony_busy, ceremony_done;
-    wire [2:0] fsm_state;
+    wire [3:0] fsm_state;
 
     ira_fsm u_fsm (
         .clk               (clk),
@@ -476,6 +476,8 @@ module top_pipe_meal_lite (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
+        // FPGA dev rig: bench supply has effectively unbounded stored energy, so the atomic-commit energy gate is always trivially satisfied. Production silicon replaces this with a real charge sensor on the chip's on-die or on-package energy buffer (see patent Detailed Description "Atomic Provisioning Commit").
+        .energy_ok         (1'b1),
         .chip_ngaro       (chip_ngaro),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),

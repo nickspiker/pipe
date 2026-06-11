@@ -218,11 +218,11 @@ module inverted_pair_verify #(
             end
         end else if (end_of_sweep) begin
             // Latch the classifier outputs from the matched accumulators.
-            pair_kore  <= c_pair_kore;
+            pair_kore    <= c_pair_kore;
             pair_valid   <= c_pair_valid;
             pair_corrupt <= c_pair_corrupt;
             valid_count  <= c_valid_count;
-            all_kore   <= c_all_kore;
+            all_kore     <= c_all_kore;
             agreement_ok <= c_agreement_ok;
             byzantine_ok <= c_byzantine_ok;
             chip_ngaro   <= c_chip_ngaro;

@@ -468,7 +468,7 @@ module top_pipe_meal (
     // ira_fsm — the orchestrator
     // =========================================================================
     wire chip_ngaro, ceremony_busy, ceremony_done;
-    wire [2:0] fsm_state;
+    wire [3:0] fsm_state;
 
     ira_fsm u_fsm (
         .clk               (clk),
@@ -490,6 +490,8 @@ module top_pipe_meal (
         .otp_write_enable  (otp_write_enable),
         .otp_write_done    (otp_write_done),
         .otp_write_rejected(otp_write_rejected),
+        // FPGA dev rig: bench supply has effectively unbounded stored energy.
+        .energy_ok         (1'b1),
         .chip_ngaro       (chip_ngaro),
         .ceremony_busy     (ceremony_busy),
         .ceremony_done     (ceremony_done),
