@@ -925,64 +925,51 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 
 \vspace{0.4em}
 
-% ---- worked mirror-XOR example ----
-\begin{tikzpicture}[
-  font=\small,
-  lbl/.style={font=\scriptsize, align=center},
-  note/.style={font=\footnotesize, align=center},
-  hi/.style={thick},
-  x=0.92cm, y=1cm]
-
-% slot grid: 8 slots, owners E H E H E H E H; wire = 1 0 0 1 1 1 0 0
-% drives: chip(E) high at 0,4 ; host(H) high at 3,5 ; releases elsewhere
-\def\slotlabels{0/E,1/H,2/E,3/H,4/E,5/H,6/E,7/H}
-
-% column guides + owner row
-\foreach \s/\o in \slotlabels {
-  \draw[gray!35, very thin] (\s,3.05) -- (\s,-2.55);
-  \node[lbl] at (\s+0.5,3.25) {\o};
-}
-\draw[gray!35, very thin] (8,3.05) -- (8,-2.55);
-\node[lbl, left] at (0,3.25) {slot / owner};
-
-% lane 1: chip drive (thin). high at slots 0,4 ; low (release) elsewhere
-\node[lbl, left, align=right] at (-0.15,2.3) {chip\\drives};
-\def\chipwave{0/1,1/0,2/0,3/0,4/1,5/0,6/0,7/0}
-\draw[thick]
-  (0,2.0) -- (0,2.6) -- (1,2.6) -- (1,2.0) -- (2,2.0) -- (2,2.0) -- (3,2.0)
-  -- (3,2.0) -- (4,2.0) -- (4,2.6) -- (5,2.6) -- (5,2.0) -- (6,2.0) -- (8,2.0);
-
-% lane 2: host drive (thin). high at slots 3,5
-\node[lbl, left, align=right] at (-0.15,0.8) {host\\drives};
-\draw[thick]
-  (0,0.5) -- (3,0.5) -- (3,1.1) -- (4,1.1) -- (4,0.5) -- (5,0.5) -- (5,1.1)
-  -- (6,1.1) -- (6,0.5) -- (8,0.5);
-
-% lane 3: actual wire (bold) = OR of the two drives = 1 0 0 1 1 1 0 0
-\node[lbl, left, align=right] at (-0.15,-1.0) {actual\\wire};
-\draw[very thick]
-  (0,-1.5) -- (0,-0.7) -- (1,-0.7) -- (1,-1.5) -- (3,-1.5) -- (3,-0.7)
-  -- (6,-0.7) -- (6,-1.5) -- (8,-1.5);
-% wire bit labels
-\foreach \s/\b in {0/1,1/0,2/0,3/1,4/1,5/1,6/0,7/0}
-  \node[lbl] at (\s+0.5,-2.3) {\b};
-
-% event callouts
-\draw[-{Stealth[length=1.5mm]}] (2.5,4.05) -- (2.5,2.62);
-\node[lbl, align=center, anchor=south] at (2.5,4.05) {chip data-1:\\release (HIGH$\to$LOW)};
-\draw[-{Stealth[length=1.5mm]}] (3.5,-0.05) -- (3.5,0.45);
-\node[lbl, align=center, anchor=north] at (3.4,-0.1) {host mirror-drive\\restores balance};
-\draw[-{Stealth[length=1.5mm]}] (5.5,-0.05) -- (5.5,0.45);
-\node[lbl, align=center, anchor=north] at (5.6,-0.1) {host data-1:\\drive HIGH};
-
-% balance tallies
-\node[draw, rounded corners=2pt, align=left, font=\scriptsize, anchor=north west] at (8.5,3.0)
-  {chip sourced: 2 HIGH / 2 LOW\\host sourced: 2 HIGH / 2 LOW\\[2pt]\textbf{wire total: 4 HIGH / 4 LOW}\\DC-balanced};
+% ---- minimal two-event mirror-XOR example ----
+\begin{tikzpicture}[font=\small, lbl/.style={font=\scriptsize, align=center}, x=0.92cm, y=1cm]
+\draw[gray!30, very thin] (0,2.95) -- (0,-1.95);
+\draw[gray!30, very thin] (1,2.95) -- (1,-1.95);
+\draw[gray!30, very thin] (2,2.95) -- (2,-1.95);
+\draw[gray!30, very thin] (3,2.95) -- (3,-1.95);
+\draw[gray!30, very thin] (4,2.95) -- (4,-1.95);
+\draw[gray!30, very thin] (5,2.95) -- (5,-1.95);
+\draw[gray!30, very thin] (6,2.95) -- (6,-1.95);
+\draw[gray!30, very thin] (7,2.95) -- (7,-1.95);
+\draw[gray!30, very thin] (8,2.95) -- (8,-1.95);
+\node[lbl] at (0.5,3.15) {E};
+\node[lbl] at (1.5,3.15) {H};
+\node[lbl] at (2.5,3.15) {E};
+\node[lbl] at (3.5,3.15) {H};
+\node[lbl] at (4.5,3.15) {E};
+\node[lbl] at (5.5,3.15) {H};
+\node[lbl] at (6.5,3.15) {E};
+\node[lbl] at (7.5,3.15) {H};
+\node[lbl, left] at (0,3.15) {slot / owner};
+\node[lbl, left, align=right] at (-0.15,2.25) {enclave\\drives};
+\draw[thick] (0,2.55) -- (1,2.55) -- (1,2.00) -- (2,2.00) -- (2,2.55) -- (3,2.55) -- (3,2.00) -- (4,2.00) -- (5,2.00) -- (6,2.00) -- (6,2.55) -- (7,2.55) -- (7,2.00) -- (8,2.00);
+\node[lbl, left, align=right] at (-0.15,0.85) {host\\drives};
+\draw[thick] (0,0.60) -- (1,0.60) -- (2,0.60) -- (3,0.60) -- (3,1.15) -- (4,1.15) -- (4,0.60) -- (5,0.60) -- (6,0.60) -- (7,0.60) -- (8,0.60);
+\node[lbl, left, align=right] at (-0.15,-0.65) {wire};
+\draw[very thick] (0,-0.35) -- (1,-0.35) -- (1,-0.90) -- (2,-0.90) -- (2,-0.35) -- (3,-0.35) -- (4,-0.35) -- (4,-0.90) -- (5,-0.90) -- (6,-0.90) -- (6,-0.35) -- (7,-0.35) -- (7,-0.90) -- (8,-0.90);
+\node[lbl] at (0.5,-1.7) {1};
+\node[lbl] at (1.5,-1.7) {0};
+\node[lbl] at (2.5,-1.7) {1};
+\node[lbl] at (3.5,-1.7) {1};
+\node[lbl] at (4.5,-1.7) {0};
+\node[lbl] at (5.5,-1.7) {0};
+\node[lbl] at (6.5,-1.7) {1};
+\node[lbl] at (7.5,-1.7) {0};
+\draw[gray!55, thick, rounded corners=1pt] (3,3.0) rectangle (4,-2.0);
+\draw[gray!55, thick, rounded corners=1pt] (4,3.0) rectangle (5,-2.0);
+\draw[-{Stealth[length=1.5mm]}] (3.5,3.95) -- (3.5,1.2);
+\node[lbl, align=center, anchor=south] at (3.5,3.95) {host data-1:\\idle is LOW, so a\\\textbf{drive} (breaks up)};
+\draw[-{Stealth[length=1.5mm]}] (4.5,-2.45) -- (4.5,-0.4);
+\node[lbl, align=center, anchor=north] at (4.5,-2.5) {enclave data-1:\\idle is HIGH, so a\\\textbf{release} (silence, breaks down)};
 \end{tikzpicture}
 
 \vspace{0.3em}
 \begin{center}\begin{minipage}{0.9\textwidth}
-\footnotesize The two thin traces show each endpoint's active drives; the bold trace is the resulting single conductor, the composite both sides decode. Where one endpoint's data bit unbalances the line (slot 2), the other endpoint's next-slot mirror drive (slot 3) restores balance, so the running excursion never exceeds one slot. \figref{wireformat80} carries the same mechanism over a full 80-slot exchange on a real payload, where the composite conductor settles to an exact 40/40 balance.
+\footnotesize Two minimal signalling events. Because the endpoints hold opposite idle biases, the same data bit is signalled by opposite physical gestures: a one from the host (idle LOW) is an active \emph{drive} that breaks the line upward, while a one from the enclave (idle HIGH) is a \emph{release} that lets the line fall to its pull-down, a silence that breaks the line downward. Every slot has a single defined source, so the two endpoints never contend. \figref{wireformat80} carries this mechanism over a full 80-slot exchange on a real payload, where the composite conductor settles to an exact 40/40 direct-current balance.
 \end{minipage}\end{center}
 \end{center}
 
