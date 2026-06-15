@@ -22,7 +22,7 @@
 \usepackage{textcomp}
 \usepackage{etoolbox}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, calc, decorations.pathmorphing, decorations.pathreplacing, backgrounds}
+\usetikzlibrary{arrows.meta, positioning, calc, decorations.pathmorphing, decorations.pathreplacing, backgrounds, shapes.geometric}
 \usepackage{hyperref}
 
 \hypersetup{
@@ -1085,37 +1085,60 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \begin{center}
 \textbf{\figref{keyselect}}
 
-\vspace{1em}
+\vspace{0.8em}
 \begin{tikzpicture}[
   font=\small,
-  blk/.style={draw, minimum width=6em, minimum height=2.4em, align=center},
+  blk/.style={draw, minimum width=8.5em, minimum height=2.1em, align=center},
+  dec/.style={draw, diamond, aspect=2.4, inner sep=1pt, align=center, font=\scriptsize},
   arrow/.style={-{Stealth[length=2mm]}, thick},
+  yes/.style={font=\scriptsize},
   note/.style={font=\footnotesize, align=center},
-  lbl/.style={font=\scriptsize, align=center}]
+  lbl/.style={font=\scriptsize, align=center},
+  node distance=0.5cm]
 
-\node[blk] (recover) at (0,0) {recover\\$m_{\mathit{req}}$ from $X_1$};
-\node[blk] (hash) at (3.4,0) {BLAKE3($m_{\mathit{req}}$)};
-\draw[arrow] (recover) -- (hash);
+% two received fields from the host message, top
+\node[blk] (x1) at (0,0) {received $X_1$};
+\node[blk, right=2.6cm of x1] (x2) {received $X_2$};
+\node[lbl, above=0.05cm of x1] {(host message, over the wire)};
 
-\node[blk] (cand1) at (7.4,1.3)  {$\mathit{BLAKE3}(m_{\mathit{req}}) \oplus H_{\mathit{resp}}$};
-\node[blk] (cand2) at (7.4,-1.3) {$\overline{\mathit{BLAKE3}(m_{\mathit{req}})} \oplus H_{\mathit{resp}}$};
-\draw[arrow] (hash) -- (cand1.west);
-\draw[arrow] (hash) -- (cand2.west);
+% recover m_req then K
+\node[blk, below=0.7cm of x1] (rec) {$m_{\mathit{req}} = X_1 \oplus H_{\mathit{req}}$};
+\draw[arrow] (x1) -- (rec);
+\node[blk, below=0.6cm of rec] (k) {$K = \mathit{BLAKE3}(m_{\mathit{req}})$};
+\draw[arrow] (rec) -- (k);
 
-\node[blk] (cmp) at (11.0,0) {compare\\with $X_2$};
-\draw[arrow] (cand1.east) -- ([yshift=0.25cm]cmp.west);
-\draw[arrow] (cand2.east) -- ([yshift=-0.25cm]cmp.west);
+% the single decision: does X2 match K (plain) or Kbar (complement), each XOR H_resp
+\node[dec, below=1.0cm of k] (cmp) {which equals $X_2$?\\$K \oplus H_{\mathit{resp}}$\ \ or\ \ $\overline{K} \oplus H_{\mathit{resp}}$};
+\draw[arrow] (k) -- (cmp);
+\draw[arrow] (x2) |- (cmp.east);
 
-\node[blk] (mux) at (11.0,-3.0) {active key\\multiplexer};
-\draw[arrow] (cmp) -- node[lbl, right] {polarity} (mux);
+% two outcomes
+\node[blk, below left=1.6cm and -0.6cm of cmp] (sess) {SESSION mode\\$\Rightarrow$ active key = \emph{wairua}};
+\node[blk, below right=1.6cm and -0.6cm of cmp] (perm) {PERMANENT mode\\$\Rightarrow$ active key = \emph{ira}};
+\draw[arrow] (cmp.south west) -- node[yes, above left=-1pt] {matches $K$} (sess.north);
+\draw[arrow] (cmp.south east) -- node[yes, above right=-1pt] {matches $\overline{K}$} (perm.north);
 
-\node[note] (wai) at (7.4,-2.2) {\emph{wairua} (positive match)};
-\node[note] (ira) at (7.4,-3.8) {\emph{ira} (complement match)};
-\draw[arrow] (wai) -- ([yshift=0.25cm]mux.west);
-\draw[arrow] (ira) -- ([yshift=-0.25cm]mux.west);
+% truth table to the right
+\node[draw, anchor=north west, align=left, font=\scriptsize, inner sep=4pt] (tbl) at (7.4,-2.6)
+  {\textbf{selection rule}\\[2pt]
+   \begin{tabular}{@{}ll@{}}
+   $X_2 = K \oplus H_{\mathit{resp}}$        & $\rightarrow$ \emph{wairua}\\
+   $X_2 = \overline{K} \oplus H_{\mathit{resp}}$ & $\rightarrow$ \emph{ira}\\
+   neither                                   & $\rightarrow$ corruption: drop\\
+   \end{tabular}};
 
-\node[note, below=0.5cm of mux, xshift=-2.0cm]
-  {no plaintext mode indicator on the wire;\\mode is recoverable only by endpoints holding session state};
+% elided-XOR mini example of the complement
+\node[draw, anchor=north west, align=left, font=\scriptsize, inner sep=4pt, below=0.5cm of tbl.south west] (ex)
+  {\textbf{$\overline{K}$ is $K$ with every bit flipped}\\[3pt]
+   \ttfamily
+   \begin{tabular}{@{}r@{\ }l@{}}
+   $K$            & 1011$\cdots$0010\\
+   $\overline{K}$ & 0100$\cdots$1101\\
+   \end{tabular}\\[2pt]
+   \normalfont\scriptsize the two candidates differ in\\every bit, so exactly one can match};
+
+\node[note, below=3.3cm of cmp, align=center]
+  {The wire carries only $X_1$ and $X_2$, both cryptographically uniform in either mode.\\No plaintext mode bit appears; the mode is the \emph{polarity} that matches, recoverable\\only by an endpoint holding $H_{\mathit{req}}$ and $H_{\mathit{resp}}$ from the session chain.};
 \end{tikzpicture}
 \end{center}
 
