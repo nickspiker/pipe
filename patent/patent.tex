@@ -1110,7 +1110,8 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 % the single decision: does X2 match K (plain) or Kbar (complement), each XOR H_resp
 \node[dec, below=1.0cm of k] (cmp) {which equals $X_2$?\\$K \oplus H_{\mathit{resp}}$\ \ or\ \ $\overline{K} \oplus H_{\mathit{resp}}$};
 \draw[arrow] (k) -- (cmp);
-\draw[arrow] (x2) |- (cmp.east);
+% X2 drops straight down its own clear lane into the diamond's top-right edge
+\draw[arrow] (x2) -- ++(0,-3.55) -| (cmp.north east);
 
 % two outcomes
 \node[blk, below left=1.6cm and -0.6cm of cmp] (sess) {SESSION mode\\$\Rightarrow$ active key = \emph{wairua}};
@@ -1118,17 +1119,19 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \draw[arrow] (cmp.south west) -- node[yes, above left=-1pt] {matches $K$} (sess.north);
 \draw[arrow] (cmp.south east) -- node[yes, above right=-1pt] {matches $\overline{K}$} (perm.north);
 
-% truth table to the right
-\node[draw, anchor=north west, align=left, font=\scriptsize, inner sep=4pt] (tbl) at (7.4,-2.6)
+\node[note, below=0.7cm of sess.south, align=center, anchor=north, xshift=2.6cm] (cap)
+  {The wire carries only $X_1$ and $X_2$, both cryptographically uniform in either mode.\\No plaintext mode bit appears; the mode is the \emph{polarity} that matches, recoverable\\only by an endpoint holding $H_{\mathit{req}}$ and $H_{\mathit{resp}}$ from the session chain.};
+
+% reference boxes placed below everything, side by side, clear of all signal paths
+\node[draw, anchor=north, align=left, font=\scriptsize, inner sep=4pt] (tbl) at ([yshift=-0.8cm]cap.south -| sess)
   {\textbf{selection rule}\\[2pt]
    \begin{tabular}{@{}ll@{}}
    $X_2 = K \oplus H_{\mathit{resp}}$        & $\rightarrow$ \emph{wairua}\\
    $X_2 = \overline{K} \oplus H_{\mathit{resp}}$ & $\rightarrow$ \emph{ira}\\
-   neither                                   & $\rightarrow$ corruption: drop\\
+   neither                                   & $\rightarrow$ drop (corruption)\\
    \end{tabular}};
 
-% elided-XOR mini example of the complement
-\node[draw, anchor=north west, align=left, font=\scriptsize, inner sep=4pt, below=0.5cm of tbl.south west] (ex)
+\node[draw, anchor=north, align=left, font=\scriptsize, inner sep=4pt] (ex) at ([yshift=-0.8cm]cap.south -| perm)
   {\textbf{$\overline{K}$ is $K$ with every bit flipped}\\[3pt]
    \ttfamily
    \begin{tabular}{@{}r@{\ }l@{}}
@@ -1136,9 +1139,6 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
    $\overline{K}$ & 0100$\cdots$1101\\
    \end{tabular}\\[2pt]
    \normalfont\scriptsize the two candidates differ in\\every bit, so exactly one can match};
-
-\node[note, below=3.3cm of cmp, align=center]
-  {The wire carries only $X_1$ and $X_2$, both cryptographically uniform in either mode.\\No plaintext mode bit appears; the mode is the \emph{polarity} that matches, recoverable\\only by an endpoint holding $H_{\mathit{req}}$ and $H_{\mathit{resp}}$ from the session chain.};
 \end{tikzpicture}
 \end{center}
 
