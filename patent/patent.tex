@@ -242,7 +242,7 @@ A timing waveform annotation depicts a noise event of duration less than one hal
 
 \para The chip's external interface comprises exactly one bidirectional communication port. The chip does not include a separate clock input, a debug interface, a JTAG tap, an in-circuit firmware update mechanism, an out-of-band manufacturer access path, a destruct port, or any other interface that crosses the chip's package boundary. The architectural decision to provide a single bidirectional port is not aesthetic; each interface absent from the chip is a class of attack absent from the chip.
 
-\para The physical embodiment of the single bidirectional port may vary by application. In an electrical embodiment, the port comprises a single bidirectional input/output pin coupled to a single conductor, with an external pull-down resistor (or, in some embodiments, an external pull-up resistor) coupled to the conductor establishing the conductor's idle electrical state. In an optical embodiment, the port comprises a paired light emitter and light detector at the chip side and a corresponding paired emitter and detector at the host side, with both pairs coupled to a single optical fiber operating as a bidirectional channel; the channel's idle state is established by an optical bias source or by passive emitter quiescence with detector thresholding. In a magnetic or inductive embodiment, the port comprises one or more coupling coils, with the channel operating thru near-field magnetic coupling and the channel's idle state established by a quiescent flux level. Capacitive, radio-frequency near-field, and acoustic embodiments employ analogous structures. References herein to ``wire,'' ``conductor,'' ``drive,'' ``pull-down,'' ``high logic level,'' ``low logic level,'' and similar electrical terminology are used to describe the line code clearly in the electrical embodiment; in non-electrical embodiments, the corresponding analog structures and signal states apply, and the term ``channel'' is used herein when the description applies generally to any physical embodiment.
+\para The physical embodiment of the single bidirectional port may vary by application. In an electrical embodiment, the port comprises a single bidirectional input/output pin coupled to a single conductor, with one or more pull-down resistors (or, in some embodiments, one or more pull-up resistors) coupled to the conductor establishing the conductor's idle electrical state. A single such resistor on the shared conductor is sufficient; in some embodiments, for symmetry of the two endpoints' analog interfaces, a respective pull-down resistor is provided at each endpoint's pin, optionally in series with a respective current-limiting resistor, the parallel combination establishing the same idle state. The number and placement of the biasing resistors is an analog implementation choice and does not alter the line-code semantics, which depend only on the conductor settling to the idle level whenever no endpoint actively drives. In an optical embodiment, the port comprises a paired light emitter and light detector at the chip side and a corresponding paired emitter and detector at the host side, with both pairs coupled to a single optical fiber operating as a bidirectional channel; the channel's idle state is established by an optical bias source or by passive emitter quiescence with detector thresholding. In a magnetic or inductive embodiment, the port comprises one or more coupling coils, with the channel operating thru near-field magnetic coupling and the channel's idle state established by a quiescent flux level. Capacitive, radio-frequency near-field, and acoustic embodiments employ analogous structures. References herein to ``wire,'' ``conductor,'' ``drive,'' ``pull-down,'' ``high logic level,'' ``low logic level,'' and similar electrical terminology are used to describe the line code clearly in the electrical embodiment; in non-electrical embodiments, the corresponding analog structures and signal states apply, and the term ``channel'' is used herein when the description applies generally to any physical embodiment.
 
 \para The absence of a JTAG interface eliminates in-system invasive probing of the chip's internal state. The absence of a firmware update mechanism eliminates the possibility of future vendor-pushed identity replacement. The absence of a debug interface eliminates any manufacturer access path designated as a service mode. The absence of a destruct pin eliminates any host-authenticated wipe that an attacker possessing the chip could trigger. The absence of an external clock input eliminates clock-glitching attacks against the chip's finite-state machine.
 
@@ -470,7 +470,7 @@ decoding, at each of the chip and the host endpoint, each received bit as the ex
 
 driving the single electrical conductor to a high logic level during a transmission slot of each endpoint when the encoded bit value of the endpoint evaluates to binary 1; and releasing the single electrical conductor to a high-impedance state otherwise;
 
-wherein an external pull-down resistor coupled to the single electrical conductor establishes a low logic level at the wire as the wire's idle electrical state;
+wherein one or more pull-down elements coupled to the single electrical conductor, including in some embodiments a respective pull-down element at each endpoint, establish a low logic level at the wire as the wire's idle electrical state;
 
 wherein direct-current balance over the single electrical conductor emerges from the encoding without dedicated balance overhead bits; and
 
@@ -532,7 +532,7 @@ monitoring, by combinational logic of the chip, for one or more failure conditio
 
 gating off, upon detection of any failure condition, a drive-enable signal of the chip's wire driver such that an external wire interface of the chip is rendered high-impedance for a duration of the failure condition;
 
-allowing the wire's idle electrical state to be established by an external pull-down resistor coupled to the wire, such that the wire's behaviour during the failure condition is indistinguishable from the wire's behaviour when the chip is not physically present in the system;
+allowing the wire's idle electrical state to be established by one or more pull-down elements coupled to the wire, such that the wire's behaviour during the failure condition is indistinguishable from the wire's behaviour when the chip is not physically present in the system;
 
 wherein no error code, status flag, or distinguishing signal other than the wire's pull-down idle is emitted at the wire under any failure condition.
 
@@ -868,66 +868,119 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \begin{center}
 \textbf{\figref{xorgates}}
 
-\vspace{1em}
+\vspace{0.6em}
 \begin{tikzpicture}[
   font=\small,
-  blk/.style={draw, minimum width=3.6em, minimum height=2.2em, align=center},
-  arrow/.style={-{Stealth[length=2mm]}, thick},
+  blk/.style={draw, minimum width=3.2em, minimum height=1.9em, align=center},
+  arrow/.style={-{Stealth[length=1.8mm]}, thick},
   note/.style={font=\footnotesize, align=center},
   lbl/.style={font=\scriptsize, align=center}]
 
 % chip endpoint (top row)
 \node[note, align=right] (inc) at (0,0) {own\_idle = 1\\own\_data\\other\_last\_data};
-\node[blk, right=0.5cm of inc]  (xorc) {XOR};
-\node[blk, right=1.5cm of xorc] (andc) {AND};
-\node[blk, right=1.5cm of andc] (tric) {tristate\\driver};
+\node[blk, right=0.4cm of inc]  (xorc) {XOR};
+\node[blk, right=1.1cm of xorc] (andc) {AND};
+\node[blk, right=1.1cm of andc] (tric) {tristate\\driver};
 \draw[arrow] (inc)  -- (xorc);
 \draw[arrow] (xorc) -- node[lbl, above] {wire\_out} (andc);
 \draw[arrow] (andc) -- node[lbl, above] {drive\_en} (tric);
-\node[lbl, above=0.4cm of andc] (slotc) {own\_slot};
+\node[lbl, above=0.35cm of andc] (slotc) {own\_slot};
 \draw[arrow] (slotc) -- (andc);
-\node[note, below=0.3cm of xorc] {chip endpoint};
+\node[note, below=0.25cm of xorc] {chip endpoint};
 
 % host endpoint (bottom row, mirrored)
-\node[blk, below=3.2cm of tric] (trih) {tristate\\driver};
-\node[blk, left=1.5cm of trih]  (andh) {AND};
-\node[blk, left=1.5cm of andh]  (xorh) {XOR};
-\node[note, align=right, left=0.5cm of xorh] (inh) {own\_idle = 0\\own\_data\\other\_last\_data};
+\node[blk, below=2.7cm of tric] (trih) {tristate\\driver};
+\node[blk, left=1.1cm of trih]  (andh) {AND};
+\node[blk, left=1.1cm of andh]  (xorh) {XOR};
+\node[note, align=right, left=0.4cm of xorh] (inh) {own\_idle = 0\\own\_data\\other\_last\_data};
 \draw[arrow] (inh)  -- (xorh);
 \draw[arrow] (xorh) -- node[lbl, above] {wire\_out} (andh);
 \draw[arrow] (andh) -- node[lbl, above] {drive\_en} (trih);
-\node[lbl, above=0.4cm of andh] (sloth) {own\_slot};
+\node[lbl, above=0.35cm of andh] (sloth) {own\_slot};
 \draw[arrow] (sloth) -- (andh);
-\node[note, below=0.3cm of xorh] {host endpoint};
+\node[note, below=0.25cm of xorh] {host endpoint};
 
 % single conductor joining the endpoints
-\coordinate[right=1.1cm of tric] (wj);
-\coordinate[right=1.1cm of trih] (wjh);
+\coordinate[right=0.9cm of tric] (wj);
+\coordinate[right=0.9cm of trih] (wjh);
 \draw[thick] (tric) -- (wj);
 \draw[thick] (trih) -- (wjh);
-\draw[thick] (wj) -- node[lbl, left] {single\\conductor} (wjh);
+\draw[thick] (wj) -- node[lbl, right=1pt] {single conductor} (wjh);
 
-% pull-down resistor to ground off the conductor midpoint
-\coordinate (mid) at ($(wj)!0.5!(wjh)$);
-\draw[thick] (mid) -- ++(0.6,0) coordinate (rtop);
-\draw[thick] (rtop) -- ++(0.1,-0.12) -- ++(0.2,0.24) -- ++(0.2,-0.24) -- ++(0.2,0.24) -- ++(0.1,-0.12) coordinate (rbot);
-\node[lbl, above=0.15cm of rtop, xshift=0.4cm] {pull-down};
-\draw[thick] (rbot) -- ++(0.3,0) coordinate (gnd);
-\draw[thick] ($(gnd)+(0,-0.12)$) -- ++(0,0.24);
-\draw[thick] ($(gnd)+(0.08,-0.07)$) -- ++(0,0.14);
-
-% idle waveform
-\begin{scope}[shift={(1.2,-7.6)}]
-\node[note, left] at (0,0.4) {idle wire:};
-\draw[thick] (0.2,0) -- ++(0,0.8) -- ++(0.8,0) -- ++(0,-0.8) -- ++(0.8,0)
-  -- ++(0,0.8) -- ++(0.8,0) -- ++(0,-0.8) -- ++(0.8,0)
-  -- ++(0,0.8) -- ++(0.8,0) -- ++(0,-0.8) -- ++(0.8,0);
-\foreach \x/\l in {0.6/E, 1.4/H, 2.2/E, 3.0/H, 3.8/E, 4.6/H}
-  \node[lbl] at (\x,-0.3) {\l};
-\node[note, right] at (5.6,0.4)
-  {chip drives HIGH in its slots (E);\\pull-down holds LOW in host slots (H);\\100\% transition density};
-\end{scope}
+% per-side pull-down at each pin (symmetric)
+\foreach \n/\dir in {wj/1, wjh/-1} {
+  \draw[thick] (\n) -- ++(0.55,0) coordinate (r\n t);
+  \draw[thick] (r\n t) -- ++(0.09,0.11) -- ++(0.18,-0.22) -- ++(0.18,0.22) -- ++(0.18,-0.22) -- ++(0.09,0.11) coordinate (r\n b);
+  \draw[thick] (r\n b) -- ++(0.28,0) coordinate (g\n);
+  \draw[thick] ($(g\n)+(0,-0.11)$) -- ++(0,0.22);
+  \draw[thick] ($(g\n)+(0.07,-0.06)$) -- ++(0,0.12);
+}
+\node[lbl, above=0.04cm of rwjt] {pull-down};
+\node[lbl, above=0.04cm of rwjht] {pull-down};
+\node[lbl, align=center] at ($(wj)!0.5!(wjh)$) [xshift=2.6cm] {a respective pull-down\\at each endpoint\\(one shared resistor\\is equivalent)};
 \end{tikzpicture}
+
+\vspace{0.4em}
+
+% ---- worked mirror-XOR example ----
+\begin{tikzpicture}[
+  font=\small,
+  lbl/.style={font=\scriptsize, align=center},
+  note/.style={font=\footnotesize, align=center},
+  hi/.style={thick},
+  x=0.92cm, y=1cm]
+
+% slot grid: 8 slots, owners E H E H E H E H; wire = 1 0 0 1 1 1 0 0
+% drives: chip(E) high at 0,4 ; host(H) high at 3,5 ; releases elsewhere
+\def\slotlabels{0/E,1/H,2/E,3/H,4/E,5/H,6/E,7/H}
+
+% column guides + owner row
+\foreach \s/\o in \slotlabels {
+  \draw[gray!35, very thin] (\s,3.05) -- (\s,-2.55);
+  \node[lbl] at (\s+0.5,3.25) {\o};
+}
+\draw[gray!35, very thin] (8,3.05) -- (8,-2.55);
+\node[lbl, left] at (0,3.25) {slot / owner};
+
+% lane 1: chip drive (thin). high at slots 0,4 ; low (release) elsewhere
+\node[lbl, left, align=right] at (-0.15,2.3) {chip\\drives};
+\def\chipwave{0/1,1/0,2/0,3/0,4/1,5/0,6/0,7/0}
+\draw[thick]
+  (0,2.0) -- (0,2.6) -- (1,2.6) -- (1,2.0) -- (2,2.0) -- (2,2.0) -- (3,2.0)
+  -- (3,2.0) -- (4,2.0) -- (4,2.6) -- (5,2.6) -- (5,2.0) -- (6,2.0) -- (8,2.0);
+
+% lane 2: host drive (thin). high at slots 3,5
+\node[lbl, left, align=right] at (-0.15,0.8) {host\\drives};
+\draw[thick]
+  (0,0.5) -- (3,0.5) -- (3,1.1) -- (4,1.1) -- (4,0.5) -- (5,0.5) -- (5,1.1)
+  -- (6,1.1) -- (6,0.5) -- (8,0.5);
+
+% lane 3: actual wire (bold) = OR of the two drives = 1 0 0 1 1 1 0 0
+\node[lbl, left, align=right] at (-0.15,-1.0) {actual\\wire};
+\draw[very thick]
+  (0,-1.5) -- (0,-0.7) -- (1,-0.7) -- (1,-1.5) -- (3,-1.5) -- (3,-0.7)
+  -- (6,-0.7) -- (6,-1.5) -- (8,-1.5);
+% wire bit labels
+\foreach \s/\b in {0/1,1/0,2/0,3/1,4/1,5/1,6/0,7/0}
+  \node[lbl] at (\s+0.5,-2.3) {\b};
+
+% event callouts
+\draw[-{Stealth[length=1.5mm]}] (2.5,4.05) -- (2.5,2.62);
+\node[lbl, align=center, anchor=south] at (2.5,4.05) {chip data-1:\\release (HIGH$\to$LOW)};
+\draw[-{Stealth[length=1.5mm]}] (3.5,-0.05) -- (3.5,0.45);
+\node[lbl, align=center, anchor=north] at (3.4,-0.1) {host mirror-drive\\restores balance};
+\draw[-{Stealth[length=1.5mm]}] (5.5,-0.05) -- (5.5,0.45);
+\node[lbl, align=center, anchor=north] at (5.6,-0.1) {host data-1:\\drive HIGH};
+
+% balance tallies
+\node[draw, rounded corners=2pt, align=left, font=\scriptsize, anchor=north west] at (8.5,3.0)
+  {chip sourced: 2 HIGH / 2 LOW\\host sourced: 2 HIGH / 2 LOW\\[2pt]\textbf{wire total: 4 HIGH / 4 LOW}\\DC-balanced};
+\end{tikzpicture}
+
+\vspace{0.3em}
+\begin{center}\begin{minipage}{0.9\textwidth}
+\footnotesize The two thin traces show each endpoint's active drives; the bold trace is the resulting single conductor, the composite both sides decode. Where one endpoint's data bit unbalances the line (slot 2), the other endpoint's next-slot mirror drive (slot 3) restores balance, so the running excursion never exceeds one slot. The exact 4/4 split shown is illustrative of this worked sequence; over arbitrary uniform data the line is DC-balanced in expectation with at most a one-slot transient.
+\end{minipage}\end{center}
 \end{center}
 
 \newpage
