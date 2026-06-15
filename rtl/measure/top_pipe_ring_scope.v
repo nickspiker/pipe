@@ -9,7 +9,7 @@
 // filling the entire 128×64 display.
 //
 // Raw bit mapping: sample bit 0 → 0x00 (black pixel), sample bit 1 → 0xFF
-// (white pixel). The greyscale driver's dither passes these through
+// (white pixel). The greyscale driver's dither passes these thru
 // unchanged because 0 always loses against the dither threshold and 0xFF
 // always wins.
 //

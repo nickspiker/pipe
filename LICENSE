@@ -3,11 +3,8 @@ PIPE License — TBD
 
 Copyright (c) 2026 Nick Spiker
 
-Top-level license for the PIPE project is to be decided by the author.
-Until then, all rights are reserved.
+Top-level license for the PIPE project is to be decided by the author. Until then, all rights are reserved.
 
-The vendored BLAKE3 compression core in rtl/blake3/ retains its original
-BSD-3-Clause license — see rtl/blake3/LICENSE. That license is independent
-of, and unaffected by, whatever license the rest of PIPE ultimately adopts.
+The vendored BLAKE3 compression core in rtl/blake3/ retains its original BSD-3-Clause license — see rtl/blake3/LICENSE. That license is independent of, and unaffected by, whatever license the rest of PIPE ultimately adopts.
 
 Contact: fractaldecoder@proton.me

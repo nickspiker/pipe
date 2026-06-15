@@ -51,7 +51,7 @@
 //
 //   state_block layout (LSB at bit 256, MSB at bit 511; reserved bits zero):
 //     [257:256] chip_state           (2 bits: KORE=0, WHARA=1, HARA=2, ORA=3)
-//     [258]     chip_state_ngaro     (1 bit: 1 = byzantine fail, chip silent; included for forensics even though a NGARO chip will not actually transmit this state block to the host)
+//     [258]     chip_state_ngaro     (1 bit: 1 = byzantine fail, chip silent; included for forensics even tho a NGARO chip will not actually transmit this state block to the host)
 //     [274:259] ring_health_mask     (16 bits)
 //     [279:275] ring_health_cnt      (5 bits)
 //     [287:280] slot_burned_mask     (8 bits)

@@ -111,7 +111,7 @@ PHASE B — ad-hoc scan (row 4):
 Total phase cycle: 1 (multiply) + 4 (matrix rows) + 3 (ad-hoc keys) = 8 phases per full scan.
 ```
 
-**Order matters**: Phase 0 must run before Phase A. During Phase A, driving any matrix row LOW would also pull pin 62 LOW *through* the Multiply key if it's held — producing false matches on the col-2 keys (Stel/Lun/Ter/Zil). With Phase 0 first, we know whether Multiply is held *before* doing matrix scans and can mask its false-positive signature out.
+**Order matters**: Phase 0 must run before Phase A. During Phase A, driving any matrix row LOW would also pull pin 62 LOW *thru* the Multiply key if it's held — producing false matches on the col-2 keys (Stel/Lun/Ter/Zil). With Phase 0 first, we know whether Multiply is held *before* doing matrix scans and can mask its false-positive signature out.
 
 Implementation: latch `multiply_held` from Phase 0. During Phase A's col-2 reads, ignore "pressed" signal if `multiply_held` is set (or report both Multiply *and* the col-2 key if you want to support that combination).
 

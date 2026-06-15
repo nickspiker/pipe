@@ -44,7 +44,7 @@ module top_dut_bench (
         end
     endgenerate
 
-    // Explicitly buffer ring_q[0] through a DCCA (global clock network) for low-skew distribution to all sys_clk-clocked FFs (blake3, FSM, accumulator, ...). Without DCCA, sys_clk is direct-routed and the skew across blake3's wide datapath causes setup/hold failures even at frequencies far below silicon Fmax. The (* noglobal *) on ring_q keeps the oscillator loop itself fast (no DCCA delay inside the ring).
+    // Explicitly buffer ring_q[0] thru a DCCA (global clock network) for low-skew distribution to all sys_clk-clocked FFs (blake3, FSM, accumulator, ...). Without DCCA, sys_clk is direct-routed and the skew across blake3's wide datapath causes setup/hold failures even at frequencies far below silicon Fmax. The (* noglobal *) on ring_q keeps the oscillator loop itself fast (no DCCA delay inside the ring).
 `ifdef RING_DIV
     // Arbitrary integer divider: sys_clk = ring_freq / RING_DIV. RING_DIV must be ≥ 2 and even (odd values get floor-rounded — half-period = RING_DIV/2 input cycles). Implemented as count-to-half + toggle on rollover: the counter walks 0..HALF-1, and on hitting HALF-1 wraps to 0 and toggles the output flip-flop. Output is REGISTERED with exact 50% duty cycle for even RING_DIV, glitch-free by construction (the FF only changes on its own clock edge). Two DCCAs consumed: one buffers the raw ring onto the global net (so the counter is reliably clocked), one buffers the toggle output as final sys_clk.
     wire sys_clk_raw;
@@ -191,7 +191,7 @@ module top_dut_bench (
     always @(posedge clk) begin
         snap_pulse <= 1'b0;
         if (fc_window_at_top) begin
-            // snap_sync2 holds the count from the PREVIOUS window — by now it has had a full 16.67 ms to propagate through CDC at any sys_clk we care about. One-window display lag is invisible.
+            // snap_sync2 holds the count from the PREVIOUS window — by now it has had a full 16.67 ms to propagate thru CDC at any sys_clk we care about. One-window display lag is invisible.
             count_snap <= snap_sync2;
             snap_pulse <= 1'b1;
         end
@@ -323,7 +323,7 @@ module top_dut_bench (
 `endif
 
 `ifdef DUT_MULTI_COMBO
-    // Multi-round: cycle through all 16 width combos (4 frac × 4 exp)
+    // Multi-round: cycle thru all 16 width combos (4 frac × 4 exp)
     reg [3:0]  combo = 0;          // sequential counter 0..15
     reg [3:0]  combo_mask = 0;     // random XOR mask (captured at start)
     wire [3:0] combo_actual = combo ^ combo_mask;  // shuffled combo index
@@ -1165,7 +1165,7 @@ module top_dut_bench (
 
 `elsif DUT_BLAKE3
     // ----- BLAKE3 compression core (iterative, ~30 cycles per hash) -----
-    // 256-bit chain (BLAKE3 IV), 512-bit message tiled from lfsr/lfsr2, counter=0, numbytes=64, dflags = ROOT|CHUNK_END|CHUNK_START. Reset gated through PH_IDLE/PH_SWITCH so internal state doesn't leak gold→test (parity with FPnew div/sqrt iter pattern, see SYNTH_NOTES.md).
+    // 256-bit chain (BLAKE3 IV), 512-bit message tiled from lfsr/lfsr2, counter=0, numbytes=64, dflags = ROOT|CHUNK_END|CHUNK_START. Reset gated thru PH_IDLE/PH_SWITCH so internal state doesn't leak gold→test (parity with FPnew div/sqrt iter pattern, see SYNTH_NOTES.md).
     wire [255:0] b3_chain_in = {
         32'h5BE0CD19, 32'h1F83D9AB, 32'h9B05688C, 32'h510E527F,
         32'hA54FF53A, 32'h3C6EF372, 32'hBB67AE85, 32'h6A09E667
@@ -1893,7 +1893,7 @@ module top_dut_bench (
         end
     end
 
-    // Keypad LED: LATCHED pass/fail. Drives off the buffered display_miss (which only updates at the per-capture PH_DONE edge), so the LED reports the *last completed* gold-vs-test comparison and stays steady between captures. Previously this was a live `gold_reg == test_reg` comparison that flickered through every cycle as the registers were being mutated — useless for visual pass/fail.
+    // Keypad LED: LATCHED pass/fail. Drives off the buffered display_miss (which only updates at the per-capture PH_DONE edge), so the LED reports the *last completed* gold-vs-test comparison and stays steady between captures. Previously this was a live `gold_reg == test_reg` comparison that flickered thru every cycle as the registers were being mutated — useless for visual pass/fail.
     assign ext_led = (display_miss == 32'd0);
 
     // =========================================================================
@@ -2025,7 +2025,7 @@ module top_dut_bench (
     end
     wire [3:0] fc_gy = wr_row[3:0];
 
-    // kHz integer display: 7 BCD digits, right-justified in slots 1..7. Slot 0 is always empty. Leading zeros suppressed up through slot 6; slot 7 (BCD[3:0]) always visible so a "0" reading shows as "0" not blank. Underlying milli_mhz == kHz (1 milli-MHz = 1 kHz), so the displayed integer IS the frequency in kHz. No decimal point — at ring/divider operating points we don't have sub-kHz resolution anyway (1/60 sec window → ±1 kHz LSB).
+    // kHz integer display: 7 BCD digits, right-justified in slots 1..7. Slot 0 is always empty. Leading zeros suppressed up thru slot 6; slot 7 (BCD[3:0]) always visible so a "0" reading shows as "0" not blank. Underlying milli_mhz == kHz (1 milli-MHz = 1 kHz), so the displayed integer IS the frequency in kHz. No decimal point — at ring/divider operating points we don't have sub-kHz resolution anyway (1/60 sec window → ±1 kHz LSB).
     wire fc_suppress_p0 = (display_bcd[27:24] == 4'd0);
     wire fc_suppress_p1 = fc_suppress_p0 && (display_bcd[23:20] == 4'd0);
     wire fc_suppress_p2 = fc_suppress_p1 && (display_bcd[19:16] == 4'd0);
@@ -2164,7 +2164,7 @@ module top_dut_bench (
         // display_gold / display_test continuously sample the live values (so the gold/test bands stay lively as accumulation runs). But display_miss must NOT continuously update — between captures gold_reg gets reset/refilled while test_reg still holds the prior cycle, so a live XOR would show transient "fail" patterns. → see the always block below: latch exactly once per real capture.
     end
 
-    // Per-test latch on display_miss. Fires when capture_pulse goes high (one clk cycle per PH_TEST → PH_DONE transition, edge-detected through a toggle CDC). At that moment both gold_reg and test_reg are stable and reflect the SAME cycle's gold/test accumulators.
+    // Per-test latch on display_miss. Fires when capture_pulse goes high (one clk cycle per PH_TEST → PH_DONE transition, edge-detected thru a toggle CDC). At that moment both gold_reg and test_reg are stable and reflect the SAME cycle's gold/test accumulators.
     always @(posedge clk) begin
         if (capture_pulse) display_miss <= display_gold_live ^ display_test_live;
     end

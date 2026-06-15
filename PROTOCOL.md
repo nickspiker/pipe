@@ -161,7 +161,7 @@ slot 6 (E):  wire_out = 1^0^0 = 1 → drive HIGH       wire = 1
 slot 7 (H):  wire_out = 0^0^0 = 0 → release          wire = 0
 ```
 
-Slots 4–7 = `0 1 1 0`, DC-balanced ✓. **Critical:** in slot 5 the host actively drove HIGH even though its data was 0. The compensation term forced it. Host's `drive_en` is *not* "only when I have data" — it's `my_slot AND wire_out`, and the XOR coupling can make `wire_out = 1` with `own_data = 0`.
+Slots 4–7 = `0 1 1 0`, DC-balanced ✓. **Critical:** in slot 5 the host actively drove HIGH even tho its data was 0. The compensation term forced it. Host's `drive_en` is *not* "only when I have data" — it's `my_slot AND wire_out`, and the XOR coupling can make `wire_out = 1` with `own_data = 0`.
 
 **Example 4 — Both sides send 1 in the same exchange window.**
 
@@ -181,7 +181,7 @@ slot 7 (H):  wire_out = 0^0^0 = 0 → release          wire = 0
 slot 8 (E):  wire_out = 1^0^0 = 1 → drive HIGH       wire = 1
 ```
 
-Four consecutive LOWs on the wire, but both sides correctly decode the other's 1, and the chain converges back to idle by slot 8. CDR has enough edge history from prior idle to coast through the dropout.
+Four consecutive LOWs on the wire, but both sides correctly decode the other's 1, and the chain converges back to idle by slot 8. CDR has enough edge history from prior idle to coast thru the dropout.
 
 **Example 5 — Host sends a 4-bit message `1 0 1 1` starting at slot 1.**
 
@@ -231,7 +231,7 @@ In practice, `effective[s]` looks like:
 | `enclave_data = 1` constant | `1 0 1 0 …` (shifted phase) | 100% |
 | `enclave_data` alternating | `0 1 1 0 0 1 1 0 …` | 50% |
 
-The CDR PLL needs τ wide enough to coast through the worst case (alternating enclave data → 50% edges) without unlocking, which is easy: a few slots of edge dropout doesn't budge a properly-tuned loop.
+The CDR PLL needs τ wide enough to coast thru the worst case (alternating enclave data → 50% edges) without unlocking, which is easy: a few slots of edge dropout doesn't budge a properly-tuned loop.
 
 ## Layer 3 — messaging and authentication (protocol v0)
 
@@ -480,7 +480,7 @@ fn pipe_loop(ftdi: &mut Ftdi, codec: &mut Codec) {
 
 The existing `rtl/shift_tx.v`, `rtl/shift_rx.v`, `rtl/cdc.v` skeletons describe the old half-duplex doorbell-based design and need to be rewritten around mirror-XOR. New module split:
 
-- **codec.v** — per-side encode + decode + state. Pure combinational tx encoder and a registered rx decoder. Two instantiations: one with `OWN_IDLE=1` (enclave) and one with `OWN_IDLE=0` (host) — though only the enclave instance ships in silicon.
+- **codec.v** — per-side encode + decode + state. Pure combinational tx encoder and a registered rx decoder. Two instantiations: one with `OWN_IDLE=1` (enclave) and one with `OWN_IDLE=0` (host) — tho only the enclave instance ships in silicon.
 - **slot_clk.v** — divides `enclave_clk` down to the slot rate. Generates `slot_phase` (toggles each tick).
 - **wire_io.v** — bidirectional pad with tristate enable from `slot_phase`. 2-flop synchronizer on the input path.
 
@@ -488,7 +488,7 @@ Total RTL footprint for the wire layer: < 50 LUT4. The protocol's complexity liv
 
 ## What this protocol explicitly does NOT do
 
-- **No power-saving deep-idle.** Both sides drive constantly. Power cost: negligible at 1 MHz on a 3.3 V signal through a 430 Ω series resistor.
+- **No power-saving deep-idle.** Both sides drive constantly. Power cost: negligible at 1 MHz on a 3.3 V signal thru a 430 Ω series resistor.
 - **No flow control.** Both sides assume the other is keeping up. For attestation this is fine — transactions are bounded length, both sides know the schedule.
 - **No error correction.** Single-bit flips silently corrupt one data bit. The ragu layer detects corruption end-to-end (a corrupted ragu won't verify against the expected ragu), so the attestation protocol is naturally fail-safe — corrupted = retry.
 - **No crypto in line code.** Mirror-XOR is purely a balanced framing primitive. The attestation primitive (chaos_amp + BLAKE3 keyed) is the security layer; the line code just gets bits across cleanly.

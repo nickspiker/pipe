@@ -21,7 +21,7 @@
 //!   5. elf2uf2-rs auto-detects the mount and copies the UF2; board reboots
 //!
 //! After flashing, the board appears as /dev/ttyACM0 (Linux) or COMx (Windows).
-//! Open it in a serial terminal (115200 8N1 — though baud rate is ignored over CDC) and type characters to drive GP0.
+//! Open it in a serial terminal (115200 8N1 — tho baud rate is ignored over CDC) and type characters to drive GP0.
 
 #![no_std]
 #![no_main]
@@ -682,7 +682,7 @@ static L3_FLAGS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0)
 /// close_session was not set. Cleared on lock loss or close_session.
 static PIPE_SESSION_LIVE: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
 
-/// Result published by core 1. session_ok = 1 if CDR held throughout the
+/// Result published by core 1. session_ok = 1 if CDR held thruout the
 /// exchange, 0 if lost. rx_actual_count may be less than the requested count
 /// on lock loss / wall-clock abort. slot_drift surfaces the final
 /// interval_fp_period for host-side diagnostic.
@@ -1226,7 +1226,7 @@ const PIO_EDGE_SM: usize = 0;
 const PIO_EDGE_GPIO: u8 = 0; // GP0
 // Bridge-side TX piezo mirror as H-bridge pair (piezo between the two pins, not pin-
 // to-GND): doubles the audio swing across the piezo from 3.3 V to 6.6 V. Latched on
-// host slot entry, held through enclave slots so the audio is continuous (a stair-
+// host slot entry, held thru enclave slots so the audio is continuous (a stair-
 // step at the FPGA-cycle rate, not a chopped per-slot toggle).
 const PIEZO_TX_P_GPIO: u8 = 10; // in-phase   leg
 const PIEZO_TX_N_GPIO: u8 = 11; // anti-phase leg
@@ -1310,7 +1310,7 @@ fn pio_edge_stop() {
 /// Pop the next FIFO word, bounded by a wall-clock deadline. Returns None on timeout.
 /// In loopback mode (TX_LOOPBACK_PATTERN nonzero), tops up the TX FIFO with the
 /// pattern word while waiting for RX. This lets the dispatch handler turn TX on
-/// before triggering fast_sync and have the TX stream stay continuous through the
+/// before triggering fast_sync and have the TX stream stay continuous thru the
 /// whole capture window without needing a separate refill task.
 #[inline(always)]
 fn pio_edge_read_until(deadline_us: u64, start: embassy_time::Instant) -> Option<u32> {
@@ -1610,7 +1610,7 @@ fn pio_sample_init() {
     PIO0.instr_mem(PIO_SAMPLE_ADDR_LOOP).write_value(InstrMem(PIO_SAMPLE_IN_PINS_DELAY15 as u32));
 
     // Wrap: single-instruction loop on addr 13 (in pins, 1 [15]). Pre-roll at
-    // addr 12 (nop [7]) executes once before falling through into the loop.
+    // addr 12 (nop [7]) executes once before falling thru into the loop.
     PIO0.sm(PIO_SAMPLE_SM).execctrl().write(|w| {
         w.set_wrap_bottom(PIO_SAMPLE_ADDR_LOOP as u8);
         w.set_wrap_top(PIO_SAMPLE_ADDR_LOOP as u8);
@@ -1839,7 +1839,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let initial = pio_edge_start();
 
     // TX piezo H-bridge pair (GP10 in-phase, GP11 anti-phase). Configure as SIO outputs
-    // once; latched on each host-slot entry in the slots_crossed loop and HELD through
+    // once; latched on each host-slot entry in the slots_crossed loop and HELD thru
     // enclave slots. Use lowest-drive pad setting (2 mA on RP2040 is `Drive2mA`) to keep
     // the piezo quiet by default; the user can increase if more volume wanted.
     {
@@ -2036,9 +2036,9 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
     let mut interval_fp_high: u32 = 0;
     let mut acquisition_iter_count: u32 = 0;
     // Min-tracking bootstrap for random-bit-data acquisition (1-slot threshold).
-    // `_skipped_*` are kept as side effects only — surfacing them through SyncResult
+    // `_skipped_*` are kept as side effects only — surfacing them thru SyncResult
     // would extend the wire format; the test we care about is "does lock hold?", not
-    // "exactly how many edges got rejected." Wire through if a future debug session
+    // "exactly how many edges got rejected." Wire thru if a future debug session
     // needs them.
     let mut min_interval_u: u32 = u32::MAX;
     let mut _multi_slot_skipped_acq: u32 = 0;
@@ -2354,7 +2354,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             // SM2 sampler: clkdiv = slot_cyc / 16 (each of the SM2 program's 16 PIO
             // cycles per slot ticks at this rate). Derive from the SAME interval_fp_slot
             // snapshot so SM1's and SM2's clkdivs are in an exact 16:1 ratio — keeps
-            // their PIO clocks frequency-locked through the run.
+            // their PIO clocks frequency-locked thru the run.
             if sampler_mode {
                 let (ci2, cf2) = interval_fp_to_clkdiv(interval_fp_slot >> 4, frac_bits);
                 pio_sample_arm(ci2, cf2);
@@ -2400,13 +2400,13 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             raw_own_cyc_slot_cyc = ((interval_fp_period as u64 >> 1) >> frac_bits) as u32;
             sampler_slot_index = 0;
             // Count edge for stats but skip CDR update — the anchor is a phase reference,
-            // not a slot-duration measurement. Falls through to rising_total/falling_total
+            // not a slot-duration measurement. Falls thru to rising_total/falling_total
             // increment below.
             if rising { rising_total += 1 } else { falling_total += 1 };
             continue;
         }
 
-        // Mirror-mode slot-phase tracker: advance through any slot boundaries this
+        // Mirror-mode slot-phase tracker: advance thru any slot boundaries this
         // edge implies, updating slot_phase + TX shift register. Then check whether
         // the edge polarity matches what we expect at the new slot phase. Rejection
         // categories:
@@ -2445,7 +2445,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
             if slot_cyc_for_filter >= 8 {
                 // Threshold = slot_cyc/2. Any edge arriving < half a slot after the
                 // previous is a glitch (real edges are >=1 slot apart). Tightens from
-                // previous slot_cyc/3 which let through the wider 0.32-0.5-slot splits.
+                // previous slot_cyc/3 which let thru the wider 0.32-0.5-slot splits.
                 let glitch_threshold = (slot_cyc_for_filter as u32) / 2;
                 if own_cyc_u < glitch_threshold {
                     pending_glitch_cyc = pending_glitch_cyc.saturating_add(own_cyc_u);
@@ -2560,7 +2560,7 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
                             tx_bits_remaining = 32;
                         }
                         // Piezo H-bridge update: in-phase = current_tx_bit, anti-phase
-                        // = its inverse. Held through next enclave slot (no update there)
+                        // = its inverse. Held thru next enclave slot (no update there)
                         // so audio is continuous.
                         let sio = embassy_rp::pac::SIO;
                         if current_tx_bit != 0 {
@@ -2711,8 +2711,8 @@ fn fast_sync(max_iter: u32, frac_bits: u32, settle_iter: u32, p_shift: u32, mirr
         // Mirror-mode FULL SKIP for edges the slot-phase + TX-bit filter rejected:
         // bridge-driven edges during host slots when we drive HIGH (no transition
         // expected), or unexpected edges during enclave slots (line should be HIGH
-        // from FPGA throughout). These edges aren't FPGA-anchored timing references
-        // — feeding them through cascade / slew / EMA / bit decoder poisons every
+        // from FPGA thruout). These edges aren't FPGA-anchored timing references
+        // — feeding them thru cascade / slew / EMA / bit decoder poisons every
         // downstream measurement. Drop completely; count for diagnostic only.
         if mirror_started && !accept_for_cdr {
             if rising { rising_total += 1 } else { falling_total += 1 };
@@ -3524,7 +3524,7 @@ fn fast_l3_round(
         }
 
         // (3) Edge update from SM0 for per-edge CDR refresh. Non-blocking:
-        //     if no edge yet, fall through and loop.
+        //     if no edge yet, fall thru and loop.
         if let Some(raw) = pio_edge_try_read() {
             iter += 1;
             let rising = (iter & 1) == 1; // approximate; live mode lost initial polarity
@@ -3632,7 +3632,7 @@ fn fast_l3_round(
         // SM2's pre-roll `nop [7]` positions the first sample mid-enclave, so
         // round N+1's first byte's bit 0 IS the first enclave sample.
         //
-        // SM1 stays running throughout. SM0 stays running throughout.
+        // SM1 stays running thruout. SM0 stays running thruout.
         // PIPE_SESSION_LIVE is set after the resync completes; if the resync
         // can't find a rising edge within the wall-clock window, we tear down
         // and force round N+1 to re-acquire from scratch.
@@ -4512,7 +4512,7 @@ fn jump_to_dev_image() -> ! {
         let sp = core::ptr::read_volatile(DEV_IMAGE_DEST as *const u32);
         let pc = core::ptr::read_volatile((DEV_IMAGE_DEST + 4) as *const u32);
         // VTOR before MSP/bx so any IRQ that fires during the brief transition vectors
-        // through the dev image's table (which we just wrote into SRAM) rather than
+        // thru the dev image's table (which we just wrote into SRAM) rather than
         // manager's. Leave PRIMASK alone — cold-boot state is "enabled", and
         // embassy_executor on cortex-m assumes the same. Disabling here was the bug
         // that previously left the dev image with IRQs masked, so USBCTRL_IRQ never
@@ -4608,7 +4608,7 @@ fn next_eagle_time() -> Option<u64> {
 
 /// Pull `n` bytes (≤32) of BLAKE3-conditioned hardware entropy.
 ///
-/// Gathers 64 raw ROSC bits, runs them through one BLAKE3 invocation, returns
+/// Gathers 64 raw ROSC bits, runs them thru one BLAKE3 invocation, returns
 /// the first `n` bytes of the digest. Not crypto-grade — the RP2040 ROSC is a
 /// single ring with no health checks (datasheet says so explicitly) — but it's
 /// fine for the bridge's `random` debug command. PIPE silicon has the actual

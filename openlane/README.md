@@ -1,6 +1,6 @@
 # OpenLane Sky130 ASIC flow for PIPE
 
-This directory holds the OpenLane configuration that pushes PIPE through the open Sky130 ASIC flow: yosys synthesis → OpenROAD floorplan/place/route → magic/klayout DRC+LVS → GDS layout.
+This directory holds the OpenLane configuration that pushes PIPE thru the open Sky130 ASIC flow: yosys synthesis → OpenROAD floorplan/place/route → magic/klayout DRC+LVS → GDS layout.
 
 The goal is a **wake-up-call silicon footprint**: real measured area numbers on Sky130 130nm, replacing the back-of-envelope estimates.
 

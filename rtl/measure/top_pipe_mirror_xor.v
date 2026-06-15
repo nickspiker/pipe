@@ -92,7 +92,7 @@ module top_pipe_mirror_xor #(
     // FPGA's own enclave TX mirror as an H-bridge pair driving a single piezo
     // (piezo between the two pins, not piezo-to-GND): doubles the swing across the
     // piezo from 3.3 V to 6.6 V peak-to-peak. Continuously holds the latched enclave
-    // value through host slots ("interpolate" = no audio gap between enclave updates,
+    // value thru host slots ("interpolate" = no audio gap between enclave updates,
     // just a stair-step at the FPGA-cycle rate).
     output wire piezo_enclave_p,                  // in-phase   (p42, M4)
     output wire piezo_enclave_n                   // anti-phase (p46, N4)
@@ -192,7 +192,7 @@ module top_pipe_mirror_xor #(
     // Two cascaded power-of-2 dividers, pure binary bit-tap (no comparator /
     // no subtractor — saves LUTs vs. a mod-N counter). Each counter free-runs
     // on its input clock; the top bit toggles at input/2^width, which IS the
-    // output clock. Each output goes through a DCCA buffer so it can drive
+    // output clock. Each output goes thru a DCCA buffer so it can drive
     // multiple FFs cleanly per Phase D's "ring fanout needs DCCA" lesson.
     //
     //   stage 1: ring_raw → enclave_clk      (= ring / 2^ENCLAVE_DIV_LOG2 → ~5.7 MHz)
@@ -275,7 +275,7 @@ module top_pipe_mirror_xor #(
     wire wire_drive_en = ~slot_owner;
 
     // FPGA enclave-TX piezo H-bridge. Latch enclave_drive_value during enclave slots
-    // and HOLD it through the following host slot (= continuous "interpolate"; no audio
+    // and HOLD it thru the following host slot (= continuous "interpolate"; no audio
     // gap between enclave updates, just a stair-step at the FPGA-cycle rate). The two
     // output pins are anti-phase so the piezo (wired BETWEEN p42 M4 and p46 N4, NOT
     // pin-to-GND) sees 2× the swing — 6.6 V peak-to-peak instead of 3.3 V. LPF sets
@@ -722,7 +722,7 @@ module top_pipe_mirror_xor #(
             R_NEXT_LN: begin
                 // Always render to last line (NUM_LINES-1 = 3). partial_mode skips
                 // the title lines 0+1 (= clears at line 2 start) but still walks
-                // through 2 → 3 → done. Previously stopped at line 2 in partial,
+                // thru 2 → 3 → done. Previously stopped at line 2 in partial,
                 // which is why the EN frequency on line 3 never rendered.
                 if (line_idx == NUM_LINES - 1) begin
                     rstate <= R_DONE;

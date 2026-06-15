@@ -202,7 +202,7 @@ module oled_text_renderer #(
 
                 R_PX_READ: begin
                     // atlas_pix updates one cycle after atlas_addr is set —
-                    // we wait through this state once per pixel for the read
+                    // we wait thru this state once per pixel for the read
                     // to settle.
                     rstate <= R_PX_WRITE;
                 end

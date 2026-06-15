@@ -6,7 +6,7 @@
 // In an electrical embodiment (depicted here), the port is a tristate input/output pin coupled to a single conductor with an external asymmetric pull-down to ground.
 // In alternative embodiments the port couples to an optical fiber via a paired emitter and detector, to a magnetic coupling coil, or to any other bidirectional coupling structure satisfying the asymmetric-drive requirement of the mirror-XOR line code.
 //
-// The input path is synchronized through two flip-flops into the receiving clock domain.
+// The input path is synchronized thru two flip-flops into the receiving clock domain.
 // The two endpoints share no clock; every received bit crosses a domain boundary and must be synchronized to avoid metastability propagating into the decode logic.
 //
 // SYNTHESIS NOTE: the tristate behaviour is depicted here as a behavioural `assign pad = drive_en ? wire_out : 1'bz;` for portability.

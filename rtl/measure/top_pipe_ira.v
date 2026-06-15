@@ -4,7 +4,7 @@
 //
 // Minimal hardware top for the provisioning ceremony. Press Enter on the
 // dozenal keypad (kp_col / R13) and the FPGA runs KOHI (~110 ms gather) →
-// BLAKE3 (~22 ms hash) → TAHU (8 OTP burns) and the LEDs walk through:
+// BLAKE3 (~22 ms hash) → TAHU (8 OTP burns) and the LEDs walk thru:
 //
 //   T6 (onboard LED, active-low):
 //     OFF                  → power-up KORE (provisionable, idle)
@@ -380,7 +380,7 @@ module top_pipe_ira (
     //     post-ORA   → solid on
     //     KORE idle    → off
     //     NGARO         → off (T2 carries the NGARO indicator)
-    //   T2 (active-high, since T2 drives the ext LED through a buffer):
+    //   T2 (active-high, since T2 drives the ext LED thru a buffer):
     //     chip_ngaro    → solid on
     //     else           → off
     // =========================================================================

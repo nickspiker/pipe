@@ -69,7 +69,7 @@ IOBUF PORT "oled_sda" IO_TYPE=LVCMOS33;
 
 # -----------------------------------------------------------------------------
 # SPI flash pins — connect to the same GD25Q32 chip the ECP5 configures from.
-# Post-configuration, user logic drives these pins directly. SCK goes through
+# Post-configuration, user logic drives these pins directly. SCK goes thru
 # the USRMCLK primitive (no LOCATE constraint needed for the SCK port — there
 # is no SCK port; the primitive drives the dedicated CCLK pad internally).
 # CS/MOSI/MISO are on the standard configuration MFIO pins for ECP5 CABGA256.

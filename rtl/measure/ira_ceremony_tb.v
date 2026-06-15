@@ -12,7 +12,7 @@
 //   - ira_fsm burns A-slots then B-slots
 //   - chip_state transitions to ORA (4)
 //   - ceremony_done pulses
-//   - chip_ngaro stays low throughout
+//   - chip_ngaro stays low thruout
 //
 // Rings are simulated by per-ring LFSRs giving each ring a different,
 // ~50/50 bit stream that easily passes the ¼…¾ popcount health check.

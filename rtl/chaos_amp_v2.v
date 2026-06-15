@@ -88,7 +88,7 @@ module chaos_amp_v2 (
     reg [7:0]  gf_p;                  // accumulator (XOR sum)
     reg [3:0]  gfmul_cnt;             // 0..7
 
-    // For S_MUL_RUN / S_GFMUL_RUN we need to remember the original val[15:8]/[23:16] and secondary[15:0]/[23:16] for the final result composition (only the low-byte half goes through the slow path)
+    // For S_MUL_RUN / S_GFMUL_RUN we need to remember the original val[15:8]/[23:16] and secondary[15:0]/[23:16] for the final result composition (only the low-byte half goes thru the slow path)
     reg [15:0] mul_sec_frac;
     reg [7:0]  mul_sec_exp;
     reg [7:0]  gf_val_hi;             // ufa[15:8] for GFMUL result composition

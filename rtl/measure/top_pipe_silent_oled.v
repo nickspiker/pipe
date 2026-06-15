@@ -6,8 +6,8 @@
 // constant LOW (`assign pipe_pad = 1'b0;`). Purpose: let the bridge test its
 // PIO TX state machine without contending with the FPGA's drive.
 //
-// Contention math: when both ends drive CMOS through the 470 Ω series resistor,
-// disagreeing drives sink ~7 mA through the resistor — survivable for brief
+// Contention math: when both ends drive CMOS thru the 470 Ω series resistor,
+// disagreeing drives sink ~7 mA thru the resistor — survivable for brief
 // tests. The FPGA holding LOW means contention only when the bridge drives
 // HIGH; for typical wire-idle-LOW protocols this is the safe direction.
 //
@@ -446,7 +446,7 @@ module top_pipe_silent_oled #(
             end
 
             R_PX_READ: begin
-                // atlas_pix updates one cycle after atlas_addr is set, so we wait through this state once per pixel for the read to settle.
+                // atlas_pix updates one cycle after atlas_addr is set, so we wait thru this state once per pixel for the read to settle.
                 rstate <= R_PX_WRITE;
             end
 

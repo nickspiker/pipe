@@ -196,7 +196,7 @@ The architectural payoff: **no command, key, host, or attacker can move the chip
 
 ## Runtime status byte
 
-The chip naturally computes its state on every boot. Expose it through a status byte in every protocol response:
+The chip naturally computes its state on every boot. Expose it thru a status byte in every protocol response:
 
 ```
 struct chip_status {

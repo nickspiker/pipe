@@ -23,7 +23,7 @@
 // enclave_clk ≈ 3 MHz this gives ~1.5 MHz SCK — well under the GD25Q32's
 // 33 MHz standard-read ceiling.
 //
-// SCK is driven through the USRMCLK ECP5 primitive, which gives user logic
+// SCK is driven thru the USRMCLK ECP5 primitive, which gives user logic
 // access to the dedicated CCLK config pin after the bitstream is loaded.
 // CS, MOSI, MISO are on regular GPIO and located in the .lpf constraints.
 //
@@ -63,7 +63,7 @@ module spi_master (
     // Physical SPI bus to GD25Q32
     // -------------------------------------------------------------------------
     output reg         flash_cs_n,        // active-low chip select
-    output wire        flash_sck,         // routed through USRMCLK primitive
+    output wire        flash_sck,         // routed thru USRMCLK primitive
     output reg         flash_mosi,
     input  wire        flash_miso
 );

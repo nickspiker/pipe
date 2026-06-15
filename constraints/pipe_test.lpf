@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Maps pipe_pad to the E16/F15 ball pair (physically bridged on the board with
-# solder, then driven through a 400Ω series resistor to header pin D7). Only
+# solder, then driven thru a 400Ω series resistor to header pin D7). Only
 # one of the two FPGA balls is wired here — the other is left floating; the
 # external solder bridge ties them together at the package, so driving either
 # one drives both.

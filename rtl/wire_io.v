@@ -30,7 +30,7 @@ module wire_io (
         .B(pad)
     );
 
-    // 2-FF synchronizer: every external wire value must cross into the enclave_clk domain through 2 FFs before any combinational use.
+    // 2-FF synchronizer: every external wire value must cross into the enclave_clk domain thru 2 FFs before any combinational use.
     reg [1:0] in_sync = 2'b00;
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) in_sync <= 2'b00;

@@ -7,7 +7,7 @@
 #   wire_value = OWN_IDLE XOR own_data XOR other_last_decoded_data
 # instead of the slot-timing-only stub in top_pipe_slotted_oled.v. FPGA decodes
 # bridge bits at mid-host-slot, encodes its own TX bit per Claim 12 during the
-# enclave slot, and rotates through TX_PATTERN (default 32'hAAAAAAAA).
+# enclave slot, and rotates thru TX_PATTERN (default 32'hAAAAAAAA).
 # =============================================================================
 set -e
 

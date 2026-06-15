@@ -10,7 +10,7 @@
 //!   5. Sample — expect LOW.
 //!   6. Drive HIGH again, sample, expect HIGH.
 //!
-//! All steps via MPSSE on FT232H ADBUS7 (the bit physically connected to the bridged E16/F15 pad through 400 Ω + header D7).
+//! All steps via MPSSE on FT232H ADBUS7 (the bit physically connected to the bridged E16/F15 pad thru 400 Ω + header D7).
 
 use pipe_host::ft232h::{Ft232h, PIPE_ADBUS_BIT, PIPE_PIN_MASK};
 use std::thread::sleep;

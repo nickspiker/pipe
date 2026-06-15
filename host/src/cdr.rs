@@ -2,7 +2,7 @@
 //!
 //! Provides two layers:
 //!   (1) edge-count helpers (`count_edges`, `frequency_hz`, `detect_active_pin`) — used by the TX-only smoke test and for one-shot calibration.
-//!   (2) `Cdr` — a bang-bang PLL with ±1-MCLK dead zone, anchored to the enclave's slot boundaries. It locks from idle (host passive, wire shows 1010 from enclave drives + pull-down LOW) and tracks drift through full-duplex traffic where only ~25% of slot boundaries carry E-attributable edges.
+//!   (2) `Cdr` — a bang-bang PLL with ±1-MCLK dead zone, anchored to the enclave's slot boundaries. It locks from idle (host passive, wire shows 1010 from enclave drives + pull-down LOW) and tracks drift thru full-duplex traffic where only ~25% of slot boundaries carry E-attributable edges.
 //!
 //! Edge attribution: the host knows its own emissions per slot (drive vs release). Any edge that can be fully explained by a host-side drive transition is H-controlled and rejected for tracking. The remaining E-controlled edges are what the PLL anchors to.
 

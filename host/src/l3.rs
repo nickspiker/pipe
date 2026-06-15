@@ -791,7 +791,7 @@ mod tests {
 
     /// End-to-end: build the SAME X1/X2 the iverilog testbench builds, prove
     /// the encode/decode pair is self-consistent, and recover an arbitrary
-    /// `message_resp` round-tripped through a simulated enclave.
+    /// `message_resp` round-tripped thru a simulated enclave.
     #[test]
     fn message_b_roundtrip_session_and_permanent() {
         let mut client = L3Client::new(IRA_FIXED);

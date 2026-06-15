@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // Wraps a single ring_health instance in a self-restart harness so nextpnr can
-// time the critical path through RCT + APT + iterated-diff popcount counters.
+// time the critical path thru RCT + APT + iterated-diff popcount counters.
 // Sample input is the LSB of a 16-bit Fibonacci LFSR that advances every cycle,
 // providing pseudorandom-but-deterministic input that the synthesis tool
 // cannot reduce to a constant.

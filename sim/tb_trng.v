@@ -3,7 +3,7 @@
 // tb_trng.v — integration test for trng + ring_scheduler + ring_health
 // =============================================================================
 //
-// Drives 16 ring inputs with mixed patterns through one KOHI gather. Uses a tiny SCHED_W=128 so total sim time is bounded.
+// Drives 16 ring inputs with mixed patterns thru one KOHI gather. Uses a tiny SCHED_W=128 so total sim time is bounded.
 //
 // Patterns:
 //   0..11:  distinct LFSRs (healthy)

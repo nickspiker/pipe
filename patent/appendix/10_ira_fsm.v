@@ -128,7 +128,7 @@ module ira_fsm (
 
             case (fsm_state)
                 // ----------------------------------------------------------
-                // ST_OBSERVE: idle. Pass NGARO through to chip_ngaro. If KORE + provision_request, kick off the ceremony.
+                // ST_OBSERVE: idle. Pass NGARO thru to chip_ngaro. If KORE + provision_request, kick off the ceremony.
                 // ----------------------------------------------------------
                 ST_OBSERVE: begin
                     ceremony_busy <= 1'b0;

@@ -60,7 +60,7 @@ module bin_to_bcd #(
                     done <= 1'b1;
                     busy <= 1'b0;
                 end else begin
-                    // Shift left through {bcd_adjusted, shifter}.
+                    // Shift left thru {bcd_adjusted, shifter}.
                     {bcd_accum, shifter} <= {bcd_adjusted, shifter} << 1;
                     step <= step + 1;
                 end

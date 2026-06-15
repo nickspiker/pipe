@@ -2,7 +2,7 @@
 // tb_ring_health.v — exercise per-ring health monitor
 // =============================================================================
 //
-// Feeds each known pattern through ring_health and checks the verdict against
+// Feeds each known pattern thru ring_health and checks the verdict against
 // expectation. Patterns:
 //
 //   1. LFSR pseudo-random          → healthy

@@ -55,7 +55,7 @@ window). No firmware change shipped this round.
 3. P-controller refines: at each edge within ±25% of median, snap phase and
    update period via period_est += K_p × error (K_p = 0.05)
 4. Outlier rejection: edges outside ±25% snap phase but don't update period
-   (coast through TX/sync without disturbing the lock)
+   (coast thru TX/sync without disturbing the lock)
 5. Sync detection: LOW run in `[1.5, 4] × period_est`. The upper bound is new
    (was unbounded) — it filters the post-TX RX window (16 wire_clks LOW when
    bridge is silent) from false-positive sync matches.
@@ -105,7 +105,7 @@ $ for i in $(seq 1 200); do ./bridge wire_count_decode 8192 10000 ...; done
 ## 4096-slot gap claim demonstrated (2026-05-29)
 
 `rtl/measure/top_pipe_gap.v` and `wire_gap_decode` empirically prove that the
-PIPE line code holds slot lock through 4096 wire_clks of constant-wire state.
+PIPE line code holds slot lock thru 4096 wire_clks of constant-wire state.
 This is the patent-claim test for "long-gap clock recovery" — the only
 remaining open question after the 256-bit Claims 7+12 demonstration at
 commit `aaf0b14`.

@@ -1,6 +1,6 @@
 //! Host-side PIPE protocol smoke test.
 //!
-//! Talks to `top_pipe_codec.v` via FT232H MPSSE in batched form: one big USB write programs an entire run (drive + sample + drive + sample × N) at slot-rate timing using MPSSE "Clock For N Bytes" as a precise delay primitive. Reads the queued GET_BITS_LOW responses back, walks them through `Codec::host()`, and prints decoded bytes.
+//! Talks to `top_pipe_codec.v` via FT232H MPSSE in batched form: one big USB write programs an entire run (drive + sample + drive + sample × N) at slot-rate timing using MPSSE "Clock For N Bytes" as a precise delay primitive. Reads the queued GET_BITS_LOW responses back, walks them thru `Codec::host()`, and prints decoded bytes.
 //!
 //! Sequence:
 //!   1. Sample 64 slots with host driving 0 (idle) — verify wire shows the enclave's 1010 idle pattern.
@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Each per-loop iteration uses 4 delay commands + 2 SET_BITS_LOW + 2 GET_BITS_LOW. SET_BITS_LOW and GET_BITS_LOW take ~1 byte cycle each; Clock-For-N takes ~(N+2) byte cycles. We want total per-iter to equal exactly 2 × FPGA slot = 4 × half_slot_bytes byte cycles, so each delay's `bytes` arg should be half_slot_bytes - 1 (so its execution time is half_slot_bytes; the 4 setup cycles for SET/GET commands amount to the slack absorbed by leaving N slightly under target). Per pair: 4 SET/GET commands (1 clock cycle each) + 4 waits. Target = 2 FPGA slots = 4 × half_slot_clocks. So each wait should be half_slot_clocks - 1 clock cycles. With bit-granular delay_cmds() we can hit any integer value exactly.
     //
-    // Empirically, calibration tends to count slightly short (each GET_BITS_LOW takes a little more than 1 MPSSE clock to execute on this chip), so the same N edges span N+ε clock cycles. We add a small wait-time offset to compensate; if you see the wire pattern walk through phases, sweep WAIT_OFFSET ± a few clocks.
+    // Empirically, calibration tends to count slightly short (each GET_BITS_LOW takes a little more than 1 MPSSE clock to execute on this chip), so the same N edges span N+ε clock cycles. We add a small wait-time offset to compensate; if you see the wire pattern walk thru phases, sweep WAIT_OFFSET ± a few clocks.
     let half_clocks = half_slot_bytes as u32;
     let wait_offset: i32 = std::env::var("WAIT_OFFSET")
         .ok()

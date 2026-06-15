@@ -8,7 +8,7 @@
 // tree has three parent levels: 8 → 4 → 2 → 1 root.
 //
 // Per BLAKE3 spec:
-//   - Chunk blocks chain through CV; block 0 has CHUNK_START flag, block 15
+//   - Chunk blocks chain thru CV; block 0 has CHUNK_START flag, block 15
 //     has CHUNK_END flag. Counter = chunk index, same for every block within
 //     the chunk. Numbytes = 64 (all blocks full).
 //   - Parent compressions take {left_cv, right_cv} as the 64-byte mblock,
@@ -107,7 +107,7 @@ module blake3_tree_shared (
     // CV register file — 8 × 256 bits = 2048 bits of state.
     // Level 0 (chunks) fills slots 0..7; level 1 overwrites slots 0..3 with
     // its 4 parents; level 2 overwrites 0..1; root is captured directly to
-    // `ira` without going through cv_buf.
+    // `ira` without going thru cv_buf.
     // -------------------------------------------------------------------------
     reg [255:0] cv_buf [0:7];
 

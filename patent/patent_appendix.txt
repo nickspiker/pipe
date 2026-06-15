@@ -237,7 +237,7 @@ endmodule
 // In an electrical embodiment (depicted here), the port is a tristate input/output pin coupled to a single conductor with an external asymmetric pull-down to ground.
 // In alternative embodiments the port couples to an optical fiber via a paired emitter and detector, to a magnetic coupling coil, or to any other bidirectional coupling structure satisfying the asymmetric-drive requirement of the mirror-XOR line code.
 //
-// The input path is synchronized through two flip-flops into the receiving clock domain.
+// The input path is synchronized thru two flip-flops into the receiving clock domain.
 // The two endpoints share no clock; every received bit crosses a domain boundary and must be synchronized to avoid metastability propagating into the decode logic.
 //
 // SYNTHESIS NOTE: the tristate behaviour is depicted here as a behavioural `assign pad = drive_en ? wire_out : 1'bz;` for portability.
@@ -1497,7 +1497,7 @@ module ira_fsm (
 
             case (fsm_state)
                 // ----------------------------------------------------------
-                // ST_OBSERVE: idle. Pass NGARO through to chip_ngaro. If KORE + provision_request, kick off the ceremony.
+                // ST_OBSERVE: idle. Pass NGARO thru to chip_ngaro. If KORE + provision_request, kick off the ceremony.
                 // ----------------------------------------------------------
                 ST_OBSERVE: begin
                     ceremony_busy <= 1'b0;
@@ -1685,7 +1685,7 @@ endmodule
 //
 //   state_block layout (LSB at bit 256, MSB at bit 511; reserved bits zero):
 //     [257:256] chip_state           (2 bits: KORE=0, WHARA=1, HARA=2, ORA=3)
-//     [258]     chip_state_ngaro     (1 bit: 1 = byzantine fail, chip silent; included for forensics even though a NGARO chip will not actually transmit this state block to the host)
+//     [258]     chip_state_ngaro     (1 bit: 1 = byzantine fail, chip silent; included for forensics even tho a NGARO chip will not actually transmit this state block to the host)
 //     [274:259] ring_health_mask     (16 bits)
 //     [279:275] ring_health_cnt      (5 bits)
 //     [287:280] slot_burned_mask     (8 bits)

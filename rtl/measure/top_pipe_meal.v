@@ -505,7 +505,7 @@ module top_pipe_meal (
     //     post-ORA   → solid on
     //     KORE idle    → off
     //     NGARO         → off (T2 carries the NGARO indicator)
-    //   T2 (active-high, since T2 drives the ext LED through a buffer):
+    //   T2 (active-high, since T2 drives the ext LED thru a buffer):
     //     chip_ngaro    → solid on
     //     else           → off
     // =========================================================================

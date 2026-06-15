@@ -35,7 +35,7 @@ These are nominal — actual placement varies ±10% across seeds due to fabric r
 
 **Why prime**: any two rings of stage counts `m` and `n` produce frequencies in ratio approximately `n/m`. If both are prime, that ratio is irreducible — no integer multiple of one frequency aligns with the other. Result: phase between any two rings drifts continuously, no harmonic lock can form, the metastability sampler always sees the sampled signal in an unpredictable phase relative to the sampler clock. (If we used 6 and 12 stages, for instance, their 1:2 frequency ratio would invite phase-lock; primes avoid this entirely.)
 
-Other valid choices in the same family: **2, 3, 5, 7, 11, 13, 17, 19, 23** are all prime. We could substitute any of these. The 3-through-13 set was picked for a moderate frequency spread (4.3×) that keeps even the slowest ring well above the 1/(BLAKE3 latency) floor while keeping the fastest ring below ECP5 fabric distortion limits.
+Other valid choices in the same family: **2, 3, 5, 7, 11, 13, 17, 19, 23** are all prime. We could substitute any of these. The 3-thru-13 set was picked for a moderate frequency spread (4.3×) that keeps even the slowest ring well above the 1/(BLAKE3 latency) floor while keeping the fastest ring below ECP5 fabric distortion limits.
 
 **Layered decorrelation beyond primes.** Prime stage counts only buy irreducible *rational* ratios. The real-world layered stack pushes ratios into approximately-irrational territory:
 

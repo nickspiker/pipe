@@ -645,7 +645,7 @@ fn capture_and_decode_counter(
         let error = actual - predicted;
         if error.abs() > 0.25 * median {
             rejected += 1;
-            // Snap phase forward but DO NOT update period — coast through the
+            // Snap phase forward but DO NOT update period — coast thru the
             // outlier interval so the next valid edge re-anchors.
             phase_ref = actual;
         } else {
@@ -1194,7 +1194,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
-/// `wire_gap_decode [PERIOD_NS]` — proves the bridge can stay locked through
+/// `wire_gap_decode [PERIOD_NS]` — proves the bridge can stay locked thru
 /// a 4096-wire_clk gap of no edges. FPGA bitstream `top_pipe_gap.v` emits:
 ///   sync1 (4 LOW) → gap (4096 HIGH, no edges) → sync2 (4 LOW)
 /// Bridge captures both syncs in one trace, host estimates wire_clk_period
@@ -1322,7 +1322,7 @@ fn cmd_wire_gap_decode(port_path: &str, args: &[String]) -> Result<(), String> {
 
     if drift_wire_clks.abs() < 1.0 {
         println!();
-        println!("  ✓ PASS — clock recovery held through 4096-slot gap (drift < 1 wire_clk)");
+        println!("  ✓ PASS — clock recovery held thru 4096-slot gap (drift < 1 wire_clk)");
         println!("  → Patent claim demonstrated: PIPE line code tolerates 4096 wire_clks of");
         println!("    constant-wire state without losing slot phase.");
     } else if drift_wire_clks.abs() < 2.0 {
@@ -1485,7 +1485,7 @@ fn cmd_wire_4096_decode(port_path: &str, args: &[String]) -> Result<(), String> 
     if let Some(first) = first_drift {
         println!("  first drift at bit {} (= within kbit window {})", first, first / 1024);
     } else {
-        println!("  ✓ ALL 4096 BITS LANDED — clock recovery held through full burst");
+        println!("  ✓ ALL 4096 BITS LANDED — clock recovery held thru full burst");
     }
     println!("  errors per kbit window: [0..1024]={}  [1024..2048]={}  [2048..3072]={}  [3072..4096]={}",
         errors_per_kbit[0], errors_per_kbit[1], errors_per_kbit[2], errors_per_kbit[3]);
@@ -2717,7 +2717,7 @@ fn cmd_tune_p(port_path: &str, args: &[String]) -> Result<(), String> {
         let (fall_std, fall_max) = stat_polarity(&r.falling_hist);
 
         // Smoothed std after the P controller's effective averaging (~2^p_shift edges).
-        // Per-edge measurement noise reduces by √(2^p_shift) when integrated through the
+        // Per-edge measurement noise reduces by √(2^p_shift) when integrated thru the
         // single-pole filter the proportional gain creates. The steady-state precision
         // is slot / smoothed_std → 2^N stability per slot.
         let avg_window = (1u64 << p) as f64;
@@ -4447,7 +4447,7 @@ fn cmd_load_dev(port_path: &str, args: &[String]) -> Result<(), String> {
     }
 
     // Phase 2: stream the image bytes over the same CDC link. The manager is in a
-    // tight `class.read_packet` loop; we just push the bytes through. open_port
+    // tight `class.read_packet` loop; we just push the bytes thru. open_port
     // already set a 150s read timeout — the write side has no separate timeout,
     // and the kernel paces full-speed CDC at ~1 Mbit/s (~1.5 s for 164 KB).
     println!("→ streaming {} bytes", image.len());

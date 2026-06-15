@@ -9,7 +9,7 @@
 // =============================================================================
 //
 //   round[r], r = 0..11:
-//     SUBSTITUTE   — each state byte through AES S-box
+//     SUBSTITUTE   — each state byte thru AES S-box
 //     MIX          — ARX with data-dependent rotation, near and far neighbors
 //     INTERLEAVE   — swap upper halves between bucket pairs (i, i+8)
 //     LOSE         — destroy 6 bits in one bucket via popcount mixing
@@ -148,7 +148,7 @@ module chaos_amp (
     // Combinational round: state → next_state via 5 phases.
     // =========================================================================
 
-    // SUBSTITUTE: each byte of each bucket through the S-box.
+    // SUBSTITUTE: each byte of each bucket thru the S-box.
     wire [31:0] sub_state [0:N_BUCKETS-1];
     genvar gi;
     generate

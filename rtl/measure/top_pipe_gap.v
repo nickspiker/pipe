@@ -19,7 +19,7 @@
 // equals exactly (4 + 4096) × wire_clk_period_samples within ±1 wire_clk.
 //
 // This is the empirical proof that the bridge's clock recovery — locked from
-// the IDLE pattern before SYNC1 — stays correct through 4096 wire_clks of
+// the IDLE pattern before SYNC1 — stays correct thru 4096 wire_clks of
 // indistinguishable-from-idle wire state. Patent Claim: 4096-slot gap
 // tolerance for the PIPE single-wire line code.
 //

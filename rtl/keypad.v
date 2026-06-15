@@ -7,7 +7,7 @@
 // the Multiply special key (p62 to GND) plus three ad-hoc keys (Divide,
 // Decimal, Negate) on dedicated pin pairs.
 //
-// All 11 pins routed through ECP5 BB (bidirectional buffer) primitives.
+// All 11 pins routed thru ECP5 BB (bidirectional buffer) primitives.
 // Yosys's tri-state inference via `assign pin = drive ? 1'b0 : 1'bz` is
 // flagged as "limited support" and doesn't reliably produce IOBUFs on
 // ECP5 — explicit BB instantiation is the safe path.

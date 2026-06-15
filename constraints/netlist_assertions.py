@@ -11,7 +11,7 @@
 #
 # Phase A status: stub. The functions parse pipe.json (yosys "write_json" output
 # format) and run the checks. Real implementations come during module work
-# (Phases F+); for now they all pass-through with TODO markers so build_pipe.sh
+# (Phases F+); for now they all pass-thru with TODO markers so build_pipe.sh
 # can wire them in without failing trivially.
 #
 # Reference for the .json format:

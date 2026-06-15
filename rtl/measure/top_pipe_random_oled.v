@@ -470,7 +470,7 @@ module top_pipe_random_oled #(
             end
 
             R_PX_READ: begin
-                // atlas_pix updates one cycle after atlas_addr is set, so we wait through this state once per pixel for the read to settle.
+                // atlas_pix updates one cycle after atlas_addr is set, so we wait thru this state once per pixel for the read to settle.
                 rstate <= R_PX_WRITE;
             end
 

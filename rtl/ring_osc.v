@@ -14,7 +14,7 @@
 //                              fabric (no DCCA inserted into the loop, which
 //                              would slow it by 3-5 ns per insertion).
 //
-// DISTRIBUTION: clk_out is taken from the loop and routed through an explicit DCCA primitive onto the global clock network. Without this, fabric routing skew across the chip causes setup/hold violations even at ring frequencies far below silicon Fmax (lesson from Phase D bringup — see commit history).
+// DISTRIBUTION: clk_out is taken from the loop and routed thru an explicit DCCA primitive onto the global clock network. Without this, fabric routing skew across the chip causes setup/hold violations even at ring frequencies far below silicon Fmax (lesson from Phase D bringup — see commit history).
 //
 // SIMULATION: this module instantiates ECP5-specific primitives (LUT4, DCCA) that iverilog cannot model. Testbenches must NOT include this module — downstream modules' TBs supply a behavioral clock generator instead. The ring_osc.v itself is validated only on real silicon (Phase B/D measurements).
 //

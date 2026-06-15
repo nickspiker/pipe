@@ -2,7 +2,7 @@
 // top_pipe_silicon.v — Sky130-targeted production digital top (no FPGA primitives)
 // =============================================================================
 //
-// This is the silicon-target top-level: just the digital portion of PIPE that gets synthesized through OpenLane → Sky130 → GDS. Distinct from top_pipe_ira.v (the FPGA emulation with OLED + keypad) and top.v (the empty stub).
+// This is the silicon-target top-level: just the digital portion of PIPE that gets synthesized thru OpenLane → Sky130 → GDS. Distinct from top_pipe_ira.v (the FPGA emulation with OLED + keypad) and top.v (the empty stub).
 //
 // External pins (production package — SOT-23-5 or DFN-3 candidate):
 //   clk        — from custom ring_osc analog block on-die (not in this RTL)

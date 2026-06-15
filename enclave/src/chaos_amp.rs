@@ -4,7 +4,7 @@
 //!
 //! # Round structure (5 phases per round, 12 rounds total)
 //!
-//! 1. **SUBSTITUTE** — each state byte through an AES-style S-box (8→8 nonlinear bijection; provides byte-level avalanche).
+//! 1. **SUBSTITUTE** — each state byte thru an AES-style S-box (8→8 nonlinear bijection; provides byte-level avalanche).
 //! 2. **MIX** — ARX-style across buckets: each bucket = `add + rotate ^ rotate` of its near (`+1`) and far (`+11`) neighbors. Rotation amount is data-dependent (5 bits of path entropy per bucket per round).
 //! 3. **INTERLEAVE** — pair-wise swap of upper/lower halves between buckets `i` and `i+8`; spreads bit influence across the bucket array.
 //! 4. **LOSE** — one bucket per round (rotated by `round_idx`) gets the popcount treatment: 6 bits of `popcount(v ^ neighbor)` replace the upper 6 bits of `v`. **Provably destroys 6 bits per use; 72 bits over 12 rounds.** Irrecoverable.
@@ -58,7 +58,7 @@ const ROUND_CONSTS: [u32; ROUNDS] = [
     0x457b8fd0, 0xd9abdd9e, 0xeaf22790, 0x17b72570,
 ];
 
-/// SUBSTITUTE: each byte through the S-box.
+/// SUBSTITUTE: each byte thru the S-box.
 #[inline]
 fn substitute(state: &mut ChaosState) {
     for bucket in state.iter_mut() {
@@ -123,7 +123,7 @@ fn round(state: &mut ChaosState, round_idx: usize) {
     season(state, round_idx);
 }
 
-/// Mix a 64-byte input through the chaos amp and return the 16-bucket state.
+/// Mix a 64-byte input thru the chaos amp and return the 16-bucket state.
 ///
 /// Input absorption: bytes [4*i .. 4*i+4] form bucket `i` (little-endian).
 pub fn chaos_amp(input: &[u8; 64]) -> ChaosState {
