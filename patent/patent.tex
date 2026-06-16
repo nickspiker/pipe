@@ -912,7 +912,7 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 
 % per-side pull-down at each pin (symmetric)
 \foreach \n/\dir in {wj/1, wjh/-1} {
-  \draw[thick] (\n) -- ++(0.55,0) coordinate (r\n t);
+  \draw[thick] (\n) -- ++(1.1,0) coordinate (r\n t);
   \draw[thick] (r\n t) -- ++(0.09,0.11) -- ++(0.18,-0.22) -- ++(0.18,0.22) -- ++(0.18,-0.22) -- ++(0.09,0.11) coordinate (r\n b);
   \draw[thick] (r\n b) -- ++(0.28,0) coordinate (g\n);
   \draw[thick] ($(g\n)+(0,-0.11)$) -- ++(0,0.22);
