@@ -882,8 +882,8 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 % chip endpoint (top row)
 \node[note, align=right] (inc) at (0,0) {own\_idle = 1\\own\_data\\other\_last\_data};
 \node[blk, right=0.4cm of inc]  (xorc) {XOR};
-\node[blk, right=1.1cm of xorc] (andc) {AND};
-\node[blk, right=1.1cm of andc] (tric) {tristate\\driver};
+\node[blk, right=1.9cm of xorc] (andc) {AND};
+\node[blk, right=1.9cm of andc] (tric) {tristate\\driver};
 \draw[arrow] (inc)  -- (xorc);
 \draw[arrow] (xorc) -- node[lbl, above] {wire\_out} (andc);
 \draw[arrow] (andc) -- node[lbl, above] {drive\_en} (tric);
@@ -893,8 +893,8 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 
 % host endpoint (bottom row, mirrored)
 \node[blk, below=2.7cm of tric] (trih) {tristate\\driver};
-\node[blk, left=1.1cm of trih]  (andh) {AND};
-\node[blk, left=1.1cm of andh]  (xorh) {XOR};
+\node[blk, left=1.9cm of trih]  (andh) {AND};
+\node[blk, left=1.9cm of andh]  (xorh) {XOR};
 \node[note, align=right, left=0.4cm of xorh] (inh) {own\_idle = 0\\own\_data\\other\_last\_data};
 \draw[arrow] (inh)  -- (xorh);
 \draw[arrow] (xorh) -- node[lbl, above] {wire\_out} (andh);
@@ -908,7 +908,7 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \coordinate[right=0.9cm of trih] (wjh);
 \draw[thick] (tric) -- (wj);
 \draw[thick] (trih) -- (wjh);
-\draw[thick] (wj) -- node[lbl, right=1pt] {single conductor} (wjh);
+\draw[thick] (wj) -- node[lbl, left=2pt] {single\\conductor} (wjh);
 
 % per-side pull-down at each pin (symmetric)
 \foreach \n/\dir in {wj/1, wjh/-1} {
@@ -920,7 +920,6 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 }
 \node[lbl, above=0.04cm of rwjt] {pull-down};
 \node[lbl, above=0.04cm of rwjht] {pull-down};
-\node[lbl, align=center] at ($(wj)!0.5!(wjh)$) [xshift=2.6cm] {a respective pull-down\\at each endpoint\\(one shared resistor\\is equivalent)};
 \end{tikzpicture}
 
 \vspace{0.4em}
