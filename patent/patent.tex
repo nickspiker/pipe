@@ -22,7 +22,7 @@
 \usepackage{textcomp}
 \usepackage{etoolbox}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, calc, decorations.pathmorphing, decorations.pathreplacing, backgrounds, shapes.geometric}
+\usetikzlibrary{arrows.meta, positioning, calc, decorations.pathmorphing, decorations.pathreplacing, backgrounds, shapes.geometric, fit}
 \usepackage{hyperref}
 
 \hypersetup{
@@ -780,90 +780,114 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \begin{center}
 \textbf{\figref{states}}
 
-\vspace{0.6em}
+\vspace{1.2em}
+{\footnotesize\itshape The provisioning lifecycle: the chip's birth.}
+
+\vspace{1.0em}
+\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
   font=\small,
-  persist/.style={draw, very thick, rounded corners=2pt, minimum width=4.0em, minimum height=2.6em, align=center},
-  trans/.style={draw, rounded corners=2pt, minimum width=3.4em, minimum height=2.2em, align=center, fill=black!7},
+  persist/.style={draw, very thick, rounded corners=2pt, minimum width=4.4em, minimum height=2.8em, align=center},
+  trans/.style={draw, rounded corners=2pt, minimum width=3.4em, minimum height=2.2em, align=center},
   arrow/.style={-{Stealth[length=2mm]}, thick},
   revert/.style={-{Stealth[length=2mm]}, thick, dashed},
   note/.style={font=\footnotesize, align=center},
   lbl/.style={font=\scriptsize, align=center},
-  node distance=0.4cm and 0.4cm]
+  node distance=0.45cm and 0.5cm]
 
-% --- persistent state: KORE (left, the only pre-burn externally visible state) ---
+% KORE (persistent, left)
 \node[persist] (kore) at (0,0) {KORE\\\scriptsize 00};
-\node[lbl, below=0.1cm of kore] {persistent};
+\node[lbl, below=0.12cm of kore] {persistent};
 
-% --- owner button-press trigger crossing into the transient band ---
-\draw[thick] (1.05,1.25) circle (0.32);
-\node[lbl] at (1.05,1.25) {\textbf{ihi}};
-\node[lbl, above=0.0cm of {(1.05,1.6)}] {owner press};
-\draw[arrow] (1.05,0.93) -- (1.05,0.42) -- (1.55,0.42);
+% owner press -> ihi trigger
+\node[lbl, align=center] at (0,2.05) {owner press};
+\draw[thick] (0,1.55) circle (0.3);
+\node[font=\scriptsize\bfseries] at (0,1.55) {ihi};
+\draw[arrow] (0,1.25) -- (0,0.55);
 
-% --- transient provisioning band (shaded) ---
-\begin{scope}[on background layer]
-\fill[black!4, rounded corners=3pt] (1.45,-1.55) rectangle (9.75,1.0);
-\end{scope}
-\node[lbl, align=center] at (5.5,0.78) {transient sub-states --- volatile registers only};
-
-\node[trans] (kohi)   at (2.35,-0.35) {KOHI};
+% transient sub-states, dashed enclosure (no grey fill -- B&W)
+\node[trans] (kohi)   at (2.2,0) {KOHI};
 \node[trans, right=of kohi]   (horo)   {HORO};
 \node[trans, right=of horo]   (blake)  {BLAKE3};
 \node[trans, right=of blake]  (tatari) {TATARI};
 \node[trans, right=of tatari] (tahu)   {TAHU};
-
 \draw[arrow] (kore.east) -- (kohi.west);
 \draw[arrow] (kohi) -- (horo);
 \draw[arrow] (horo) -- (blake);
 \draw[arrow] (blake) -- (tatari);
 \draw[arrow] (tatari) -- (tahu);
 
-% revert-on-interrupt: every transient sub-state collapses back to KORE
-\draw[revert] (3.5,-1.2) -- (3.5,-1.45) -- (0,-1.45) -- (kore.south);
-\node[lbl, below=0.02cm of {(1.6,-1.45)}] {power interruption $\rightarrow$ KORE at next reset};
+\node[draw, dashed, rounded corners=3pt, fit=(kohi)(tahu), inner sep=7pt] (band) {};
+\node[lbl, above=1pt of band] {transient sub-states --- volatile registers only};
 
-% --- the atomic commit wall ---
-\draw[very thick] (9.95,1.3) -- (9.95,-2.4);
-\draw[very thick] (10.05,1.3) -- (10.05,-2.4);
-\node[lbl, align=center, rotate=90] at (10.4,-0.55) {atomic commit wall};
+% revert on interrupt
+\draw[revert] (band.south) -- ++(0,-0.55) -| (kore.south);
+\node[lbl, below=0.62cm of band.south] {power interruption $\rightarrow$ KORE at next reset};
 
-% TAHU crosses the wall under energy-gated burn
-\node[lbl, align=center] at (11.05,1.05) {TAHU burn: energy-gated, isolated supply};
-\draw[arrow, very thick] (tahu.east) -- (12.0,-0.35);
+% ORA (persistent, right)
+\node[persist] (ora) at (14.2,0) {ORA\\\scriptsize 11};
+\node[lbl, below=0.12cm of ora] {persistent};
 
-% --- persistent state: ORA and the vitality ladder below it ---
-\node[persist] (ora) at (12.8,-0.35) {ORA\\\scriptsize 11};
-\node[lbl, right=0.1cm of ora] {persistent};
-\node[lbl, above=0.05cm of ora] {4/4 pairs};
+% atomic commit wall, centered between the dashed-band right edge and ORA's left edge
+\coordinate (wallx) at ($(band.east)!0.5!(ora.west)$);
+\draw[very thick] ([xshift=-0.06cm,yshift=1.4cm]wallx) -- ([xshift=-0.06cm,yshift=-1.4cm]wallx);
+\draw[very thick] ([xshift=0.06cm,yshift=1.4cm]wallx) -- ([xshift=0.06cm,yshift=-1.4cm]wallx);
+\node[lbl, align=center] at ([yshift=1.85cm]wallx) {atomic\\commit wall};
+\node[lbl, align=center, anchor=north] at ([yshift=-1.5cm]wallx) {TAHU burn:\\energy-gated,\\isolated supply};
 
-\node[persist, below=0.95cm of ora] (hara)  {HARA\\\scriptsize 10};
-\node[lbl, right=0.1cm of hara] {3/4 pairs};
-\node[persist, below=0.95cm of hara] (whara) {WHARA\\\scriptsize 01};
-\node[lbl, right=0.1cm of whara] {2/4 pairs};
+% TAHU burn crossing the wall
+\draw[arrow, very thick] (tahu.east) -- (ora.west);
+\end{tikzpicture}%
+}
 
-\draw[arrow] (ora)  -- node[lbl, left=1pt] {pair loss} (hara);
-\draw[arrow] (hara) -- node[lbl, left=1pt] {pair loss} (whara);
+\vspace{0.5em}
+\begin{minipage}{0.86\textwidth}
+\footnotesize Exactly two states ever persist across a reset during provisioning: KORE before commit and ORA after. The dashed sub-states (KOHI thru TAHU) run on volatile registers only and leave no trace if interrupted; the energy-gated TAHU burn is the single irreversible crossing of the commit wall.
+\end{minipage}
 
-% vitality scale arrow
-\draw[-{Stealth[length=2mm]}] (15.0,0.5) -- node[lbl, right, rotate=-90, anchor=south] {decreasing vitality} (15.0,-3.6);
+\vspace{1.6em}
+{\footnotesize\itshape The operational degradation ladder: the chip's aging.}
 
-% NGARO drops off the bottom into silence
-\node[draw, dashed, rounded corners=2pt, minimum width=4.0em, minimum height=2.6em, align=center, below=0.95cm of whara] (ngaro) {NGARO\\\scriptsize (no code)};
-\draw[arrow] (whara) -- node[lbl, left=1pt] {quorum fail} (ngaro);
-\draw[revert] (kohi.south) ..controls (4,-4.3) and (9,-4.6).. (ngaro.south west);
-\node[lbl, align=center] at (6.6,-4.55) {entropy / TRNG / verify failure $\rightarrow$ NGARO};
+\vspace{0.7em}
+\begin{tikzpicture}[
+  font=\small,
+  persist/.style={draw, very thick, rounded corners=2pt, minimum width=4.8em, minimum height=2.0em, align=center},
+  sink/.style={draw, dashed, rounded corners=2pt, minimum width=4.8em, minimum height=2.0em, align=center},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+  note/.style={font=\footnotesize, align=center},
+  lbl/.style={font=\scriptsize, align=center},
+  node distance=1.0cm]
 
-\node[note, align=center, below=0.3cm of ngaro] {silent zone: no wire output;\\indistinguishable from an absent chip};
+\node[persist] (ora)   at (0,0)    {ORA \scriptsize 11};
+\node[persist] (hara)  at (0,-1.45) {HARA \scriptsize 10};
+\node[persist] (whara) at (0,-2.9) {WHARA \scriptsize 01};
+\node[sink]    (ngaro) at (0,-4.35) {NGARO \scriptsize (no code)};
 
+\draw[arrow] (ora)   -- node[lbl, right=2pt] {one pair lost} (hara);
+\draw[arrow] (hara)  -- node[lbl, right=2pt] {one pair lost} (whara);
+\draw[arrow] (whara) -- node[lbl, right=2pt] {quorum fail ($<2$ valid)} (ngaro);
+
+% pair-count annotations on the left
+\node[lbl, left=0.5cm of ora]   {4 of 4 pairs valid};
+\node[lbl, left=0.5cm of hara]  {3 of 4 pairs valid};
+\node[lbl, left=0.5cm of whara] {2 of 4 pairs valid};
+\node[lbl, left=0.5cm of ngaro] {below quorum};
+
+% other failure conditions feeding NGARO directly
+\node[lbl, align=left, right=2.6cm of whara] (fail)
+  {also enters NGARO on:\\$\cdot$ cryptographic verify failure\\$\cdot$ TRNG health failure\\$\cdot$ FSM non-operational};
+\draw[arrow] (fail.south) |- (ngaro.east);
+
+% decreasing-vitality scale
+\draw[arrow] (2.9,0.3) -- node[lbl, right, rotate=-90, anchor=south] {decreasing vitality} (2.9,-3.2);
+
+\node[note, align=center, below=0.4cm of ngaro] {silent zone: no wire output; indistinguishable from an absent chip};
 \end{tikzpicture}
 
-\vspace{0.4em}
-\begin{center}
+\vspace{0.5em}
 \begin{minipage}{0.86\textwidth}
-\footnotesize Only KORE and an operational state (ORA / HARA / WHARA) ever persist across reset; the shaded provisioning sub-states are transient and leave no trace if interrupted. The two-bit code equals the chip's vitality (count of valid storage pairs); NGARO carries no code because the chip is silent. NGARO is recoverable only by power-on reset, and only if the underlying failure has cleared.
+\footnotesize After provisioning, corruption of the inverted-pair storage degrades the chip down the vitality ladder, the two-bit code equalling the count of valid pairs. Below byzantine quorum, or on any verify / TRNG / FSM failure, the chip enters NGARO and goes silent. NGARO is recoverable only by power-on reset, and only once the underlying failure has cleared.
 \end{minipage}
-\end{center}
 \end{center}
 
 \newpage
