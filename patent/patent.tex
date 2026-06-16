@@ -1018,33 +1018,26 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
   note/.style={font=\footnotesize, align=center},
   lbl/.style={font=\scriptsize, align=center}]
 
-% callouts, left-to-right in the same order as their targets (no crossing arrows)
-\node[lbl, draw, rounded corners=2pt, minimum height=2.4em] (f1) at (0.9,3.0)  {frame\\leading edge};
-\node[lbl, draw, rounded corners=2pt, minimum height=2.4em] (f2) at (3.1,3.0)  {key\\transport};
-\node[lbl, draw, rounded corners=2pt, minimum height=2.4em] (f3) at (5.3,3.0)  {decryption\\authority};
-\node[lbl, draw, rounded corners=2pt, minimum height=2.4em] (f4) at (7.5,3.0)  {message\\authentication};
-\node[lbl, draw, rounded corners=2pt, minimum height=2.4em] (f5) at (9.7,3.0)  {DC\\balance};
+% message strip: itty-bitty frame bit, small pubkey, WAY longer ciphertext, dashed trailing zeros
+% leading frame bit (1)
+\draw[thick] (0,0) rectangle ++(0.35,1.0);
+\node[font=\scriptsize] at (0.175,0.5) {1};
+% ephemeral session public key (smaller)
+\draw[thick] (0.35,0) rectangle ++(2.4,1.0);
+\node[align=center] at (1.55,0.5) {ephemeral session\\public key\\\footnotesize 256 bits};
+% ciphertext (WAY longer)
+\draw[thick] (2.75,0) rectangle ++(8.4,1.0);
+\node at (6.95,0.5) {ciphertext};
+% trailing zeros (dashed)
+\draw[thick, dashed] (11.15,0) rectangle ++(1.6,1.0);
 
-\node[note] at (5.3,4.1) {five protocol functions, one transmitted field};
+% leading frame bit caption
+\node[lbl, align=center] (lfb) at (0.175,-1.0) {leading\\frame bit};
+\draw[arrow] (lfb) -- (0.175,-0.05);
 
-% message strip
-\draw[thick] (0,0) rectangle ++(0.8,1.0);
-\node at (0.4,0.5) {1};
-\draw[thick] (0.8,0) rectangle ++(4.6,1.0);
-\node[align=center] at (3.1,0.5) {ephemeral session public key\\\footnotesize 256 bits};
-\draw[thick] (5.4,0) rectangle ++(3.4,1.0);
-\node at (7.1,0.5) {ciphertext};
-\draw[thick, dashed] (8.8,0) rectangle ++(2.4,1.0);
-\node[lbl] at (10.0,0.5) {trailing zeros\\not driven};
-
-\node[lbl, below=0.15cm of {(0.4,0)}] {leading\\frame bit};
-\node[lbl, below=0.15cm of {(10.0,0)}] {reconstructed by\\slot-counting};
-
-\draw[arrow] (f1) -- (0.5,1.05);
-\draw[arrow] (f2) -- (1.9,1.05);
-\draw[arrow] (f3) -- (2.9,1.05);
-\draw[arrow] (f4) -- (3.9,1.05);
-\draw[arrow] (f5) -- (4.9,1.05);
+% trailing zeros caption with arrow pointing up to the dashed box
+\node[lbl, align=center] (tz) at (11.95,-1.2) {trailing zeros not driven;\\reconstructed by slot-counting};
+\draw[arrow] (tz) -- (11.95,-0.05);
 \end{tikzpicture}
 \end{center}
 
