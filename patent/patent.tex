@@ -1098,7 +1098,7 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 
 % two received fields from the host message, top
 \node[blk] (x1) at (0,0) {received $X_1$};
-\node[blk, right=2.6cm of x1] (x2) {received $X_2$};
+\node[blk] (x2) at (6.0,-0.9) {received $X_2$};
 \node[lbl, above=0.05cm of x1] {(host message, over the wire)};
 
 % recover m_req then K
@@ -1111,7 +1111,7 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \node[dec, below=1.0cm of k] (cmp) {which equals $X_2$?\\$K \oplus H_{\mathit{resp}}$\ \ or\ \ $\overline{K} \oplus H_{\mathit{resp}}$};
 \draw[arrow] (k) -- (cmp);
 % X2 drops straight down its own clear lane into the diamond's top-right edge
-\draw[arrow] (x2) -- ++(0,-3.55) -| (cmp.north east);
+\draw[arrow] (x2) -- ++(0,-2.75) -| (cmp.north east);
 
 % two outcomes
 \node[blk, below left=1.6cm and -0.6cm of cmp] (sess) {SESSION mode\\$\Rightarrow$ active key = \emph{wairua}};
