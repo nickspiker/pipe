@@ -686,93 +686,77 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \begin{center}
 \textbf{\figref{whakairasnap}}
 
-\vspace{1em}
+\vspace{1.4em}
+\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
   font=\small,
-  blk/.style={draw, minimum width=5em, minimum height=2.2em, align=center},
+  blk/.style={draw, minimum width=6em, minimum height=2.4em, align=center},
+  store/.style={draw, minimum width=6em, minimum height=2.4em, align=center},
   arrow/.style={-{Stealth[length=2mm]}, thick},
   note/.style={font=\footnotesize, align=center},
   lbl/.style={font=\scriptsize, align=center},
-  wavy/.style={decorate, decoration={snake, amplitude=0.6mm, segment length=2.5mm, post length=1.5mm}, -{Stealth[length=1.8mm]}, thick}]
+  wavy/.style={decorate, decoration={snake, amplitude=0.7mm, segment length=2.8mm, post length=1.6mm}, -{Stealth[length=2mm]}, thick}]
 
 % package boundary
-\draw[very thick, rounded corners=6pt] (3.0,0) rectangle (15.4,-9.6);
-\node[lbl, anchor=west] at (7.2,-9.35) {package boundary: physical isolation domain};
+\draw[very thick, rounded corners=8pt] (0,0) rectangle (18,-12);
+\node[lbl, anchor=north west] at (0.3,-1.35) {package boundary --- physical isolation domain};
 
-% ambient physics crossing the wall as wavy arrows
-\node[lbl] (em)   at (7.0,0.9)  {ambient EM};
-\node[lbl] (temp) at (8.6,0.9)  {temperature};
-\node[lbl] (vib)  at (10.2,0.9) {vibration};
-\draw[wavy] (em)   -- (7.0,-0.95);
-\draw[wavy] (temp) -- (8.6,-0.95);
-\draw[wavy] (vib)  -- (10.2,-0.95);
-\node[lbl] at (13.7,0.9) {physics couples thru the wall;\\data cannot};
+% ===== top: ambient physics couples in as wavy arrows (carry no data) =====
+\node[lbl] (em)   at (5.5,1.0)  {ambient EM};
+\node[lbl] (temp) at (7.5,1.0)  {temperature};
+\node[lbl] (vib)  at (9.5,1.0)  {vibration};
+\draw[wavy] (em)   -- (5.5,-0.95);
+\draw[wavy] (temp) -- (7.5,-0.95);
+\draw[wavy] (vib)  -- (9.5,-0.95);
+\node[note, anchor=west] at (11.6,1.0) {physics couples thru the wall;\\data cannot};
 
-% single pin: trigger in, commitments out
-\draw[arrow] (0.3,-2.4) -- node[lbl, above] {owner's trigger\\(single bit, chosen moment)} (3.0,-2.4);
-\draw[arrow] (3.0,-3.3) -- node[lbl, below] {domain-separated\\commitments only} (0.3,-3.3);
+% ===== protocol FSM (left), behind the single pin =====
+\node[blk, minimum width=6em] (fsm) at (2.6,-3.7) {protocol FSM};
 
-% protocol FSM
-\node[blk] (fsm) at (4.6,-2.85) {protocol\\FSM};
+% ===== single pin (left): one bidirectional port =====
+\draw[{Stealth[length=2mm]}-{Stealth[length=2mm]}, thick] (-3.4,-3.7) -- (fsm.west);
+\node[lbl, anchor=east, align=right] at (-3.6,-3.35) {owner's trigger in\\(single bit, chosen moment)};
+\node[lbl, anchor=east, align=right] at (-3.6,-4.1) {domain-separated\\commitments out};
 
-% noise sources fed by the wavy physics
-\node[blk, minimum width=8em, minimum height=4.2em] (noise) at (8.5,-2.3)
-  {ring oscillators\\TERO\\subthreshold shot-noise\\metastable arbiters};
-\node[lbl, above=0.05cm of noise] {noise-detection circuits};
-\draw[arrow] (fsm) -- node[lbl, below] {start} (noise.west |- fsm);
+% ===== entropy -> conditioner -> store, left to right across the top =====
+\node[blk, minimum width=7em, minimum height=3.0em] (noise) at (6.6,-3.0)
+  {noise-detection\\circuits};
+\node[blk, minimum width=7em] (cond) at (12.4,-3.0) {HORO + BLAKE3\\conditioner};
+\draw[arrow] (noise) -- node[lbl, above] {entropy} (cond);
+\draw[arrow] (fsm.north) |- node[lbl, above, pos=0.75] {start} (noise.west);
 
-% conditioner cascade
-\node[blk] (horo) at (11.6,-2.85) {HORO};
-\node[blk] (blake) at (13.8,-2.85) {BLAKE3};
-\draw[arrow] (noise.east |- horo) -- (horo);
-\draw[arrow] (horo) -- (blake);
+% ===== isolated identity store (lower right), two labelled sub-stores =====
+\draw[double, double distance=1.6pt, thick, rounded corners=4pt] (9.4,-6.0) rectangle (17.2,-10.4);
+\node[lbl, anchor=north] at (13.3,-6.2) {isolated identity store --- no plaintext path out};
+\node[store, very thick] (ira) at (11.6,-8.4) {\emph{ira}\\write-once\\4 inverted pairs};
+\node[lbl, anchor=north] at (11.6,-9.5) {burning now};
+\node[store, dashed] (wairua) at (15.0,-8.4) {\emph{wairua}\\volatile\\4 inverted pairs};
+\node[lbl, anchor=north] at (15.0,-9.5) {lost on power-off};
 
-% isolated identity store (double border)
-\draw[double, double distance=1.6pt, thick, rounded corners=3pt] (8.4,-4.9) rectangle (15.0,-8.8);
-\node[lbl] at (11.7,-5.2) {isolated identity store};
+% conditioner feeds the store: burn -> ira (solid), wairua at first handshake (dashed)
+\draw[arrow] (cond.south) -- node[lbl, right=2pt] {burn} (ira.north);
+\draw[arrow, dashed] (cond.south) .. controls (15.0,-5.0) .. node[lbl, right=1pt, pos=0.45] {at first handshake} (wairua.north);
 
-% ira: four inverted pairs, write-once
-\foreach \r in {0,1,2,3} {
-  \draw (8.9,{-6.05-\r*0.52}) rectangle ++(0.7,-0.42);
-  \draw (9.68,{-6.05-\r*0.52}) rectangle ++(0.7,-0.42);
-  \node[lbl] at (9.25,{-6.26-\r*0.52}) {A};
-  \node[lbl] at (10.03,{-6.26-\r*0.52}) {$\overline{\mathrm{A}}$};
+% ===== one-way commitment gate (left), the only path from store to pin =====
+\node[blk, minimum width=6em, minimum height=3.0em] (commit) at (3.0,-8.0) {keyed commitment\\(one-way)};
+\draw[arrow] (ira.west) -- (commit.east);
+\draw[arrow] (commit.north) -- node[lbl, right=2pt, align=left] {derivatives\\only} (fsm.south);
+
+% ===== supply rail (bottom): isolation switch open, energy buffer powers the burn =====
+\node[lbl, anchor=east] at (-2.6,-10.8) {VDD};
+\draw[thick] (-2.4,-10.8) -- (1.2,-10.8);
+\fill (1.2,-10.8) circle (0.06);
+\draw[thick] (1.2,-10.8) -- (2.3,-10.3);   % open switch blade
+\fill (2.5,-10.8) circle (0.06);
+\draw[thick] (2.5,-10.8) -- (4.0,-10.8);
+\node[lbl, anchor=north, align=center] at (1.85,-11.0) {isolation switch:\\open during burn};
+% energy buffer (capacitor)
+\draw[thick] (4.0,-10.5) -- (4.0,-11.1);
+\draw[thick] (4.3,-10.5) -- (4.3,-11.1);
+\node[lbl, anchor=north] at (4.15,-11.15) {energy buffer};
+\draw[arrow] (4.3,-10.8) -- node[lbl, above] {burn energy} (11.6,-10.8) -- (ira.south);
+\end{tikzpicture}%
 }
-\node[lbl] at (9.64,-5.7) {\emph{ira}: write-once};
-\node[lbl] at (9.64,-8.35) {4 inverted pairs\\burning now};
-
-% wairua: four inverted pairs, volatile
-\foreach \r in {0,1,2,3} {
-  \draw[dashed] (12.6,{-6.05-\r*0.52}) rectangle ++(0.7,-0.42);
-  \draw[dashed] (13.38,{-6.05-\r*0.52}) rectangle ++(0.7,-0.42);
-  \node[lbl] at (12.95,{-6.26-\r*0.52}) {W};
-  \node[lbl] at (13.73,{-6.26-\r*0.52}) {$\overline{\mathrm{W}}$};
-}
-\node[lbl] at (13.34,-5.7) {\emph{wairua}: volatile};
-\node[lbl] at (13.34,-8.35) {4 inverted pairs\\lost on power-off};
-
-% burn path and first-handshake path
-\draw[arrow] (blake.south) -- node[lbl, right=2pt, pos=0.4] {burn} (9.9,-5.95);
-\draw[arrow, dashed] (blake.south) -- node[lbl, right=2pt, pos=0.22] {at first handshake} (13.34,-5.95);
-
-% one-way commitment gate
-\node[blk] (commit) at (5.6,-6.8) {keyed\\commitment\\(one-way)};
-\draw[arrow] (8.4,-6.8) -- (commit);
-\draw[arrow] (commit.north) -- node[lbl, left=2pt] {derivatives only} (fsm.south);
-
-% supply rail: isolation switch open, energy buffer carries the burn
-\node[lbl] at (0.7,-8.3) {VDD};
-\draw[thick] (1.1,-8.3) -- (3.6,-8.3);
-\fill (3.6,-8.3) circle (0.05);
-\draw[thick] (3.6,-8.3) -- (4.45,-7.95);
-\fill (4.55,-8.3) circle (0.05);
-\draw[thick] (4.55,-8.3) -- (5.6,-8.3);
-\node[lbl] at (3.9,-8.85) {isolation switch:\\open during burn};
-\draw[thick] (5.6,-8.05) -- (5.6,-8.55);
-\draw[thick] (5.8,-8.05) -- (5.8,-8.55);
-\node[lbl, anchor=west] at (6.0,-8.6) {energy buffer};
-\draw[arrow] (5.8,-8.3) -- node[lbl, above] {burn energy} (8.4,-8.3);
-\end{tikzpicture}
 \end{center}
 
 \newpage
