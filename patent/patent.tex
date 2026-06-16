@@ -1070,7 +1070,9 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 }
 
 \node[blk, minimum height=5em] (quorum) at (8.0,-3.2) {byzantine\\quorum:\\$\geq 2$ valid,\\all agree};
-\foreach \i in {0,1,2,3} \draw[arrow] (x\i.east) -- (quorum.west);
+% land each pair's arrow at a distinct height on the quorum box's left edge
+\foreach \i/\yo in {0/0.9, 1/0.3, 2/-0.3, 3/-0.9}
+  \draw[arrow] (x\i.east) -- ([yshift=\yo cm]quorum.west);
 
 \node[blk, minimum height=3em, right=0.7cm of quorum] (cls) {state:\\ORA / HARA /\\WHARA / NGARO};
 \draw[arrow] (quorum) -- (cls);
