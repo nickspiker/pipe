@@ -162,7 +162,7 @@ The owner's triggering event is depicted as an external well-framed provisioning
 The figure illustrates that the unrepeatability of the entropy derives jointly from the owner's choice of triggering moment and the transient physical state present at and within the chip's silicon at that moment.
 
 \para \figdef{states} is a state-machine diagram presented in two panels: an upper panel depicting the provisioning lifecycle and a lower panel depicting the operational degradation ladder, together showing the chip's complete state set and the forward-only transitions among the states.
-The upper panel depicts the provisioning lifecycle horizontally: the persistent unprovisioned state KORE (write-once storage cells all zero); an owner-press trigger initiating the \emph{whakaira}; a dashed enclosure grouping the transient sub-states KOHI (entropy gathering), HORO (chaotic-dynamical amplification), BLAKE3 (keyed cryptographic hash), and TATARI (randomized pre-burn delay), all operating on volatile registers only; an atomic commit wall depicted as a double vertical stroke; the energy-gated TAHU burn crossing that wall; and the persistent fully-provisioned state ORA.
+The upper panel depicts the provisioning lifecycle horizontally: the persistent unprovisioned state KORE (write-once storage cells all zero); an owner-press trigger initiating the \emph{whakaira}; a dashed enclosure grouping the transient sub-states KOHI (entropy gathering), HORO (chaotic-dynamical amplification), BLAKE3 (keyed cryptographic hash), and TATARI (randomized pre-burn delay), all operating on volatile registers only; an atomic commit wall depicted as a double vertical stroke; the energy-gated TAHU burn sub-state on the committed side of the wall, entry into TAHU being the irreversible crossing; and the persistent fully-provisioned state ORA.
 A dashed revert path from the transient enclosure back to KORE depicts that interruption during any transient sub-state presents KORE at next reset, such that exactly two states persist across a reset during provisioning, KORE before commit and ORA after.
 The lower panel depicts the operational degradation ladder vertically: ORA (four of four pairs valid) descending thru HARA (three of four pairs valid) and WHARA (two of four pairs valid, at byzantine minimum) by single-pair-loss transitions, and thence to the silent failure state NGARO upon quorum failure; a side annotation shows that NGARO is also entered upon cryptographic verification failure, true-random-number-generation health failure, or any non-operational condition of the chip's finite-state machine.
 The diagram annotates the two-bit chip-state encoding (KORE = binary 00, WHARA = binary 01, HARA = binary 10, ORA = binary 11) and indicates that NGARO is not assigned a numeric code because the chip in NGARO state does not transmit on the wire, the NGARO state being recoverable only by power-on reset and only if the underlying failure condition is no longer present.
@@ -802,14 +802,17 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \node[trans, right=of kohi]   (horo)   {HORO};
 \node[trans, right=of horo]   (blake)  {BLAKE3};
 \node[trans, right=of blake]  (tatari) {TATARI};
-\node[trans, right=of tatari] (tahu)   {TAHU};
 \draw[arrow] (kore.east) -- (kohi.west);
 \draw[arrow] (kohi) -- (horo);
 \draw[arrow] (horo) -- (blake);
 \draw[arrow] (blake) -- (tatari);
-\draw[arrow] (tatari) -- (tahu);
 
-\node[draw, dashed, rounded corners=3pt, fit=(kohi)(tahu), inner sep=7pt] (band) {};
+% TAHU sits on the committed (right) side of the wall: once entered, the burn
+% is irreversible, so it is not part of the revertible transient enclosure.
+\node[trans, right=2.6cm of tatari] (tahu) {TAHU};
+
+% dashed enclosure covers only the revertible sub-states (KOHI thru TATARI)
+\node[draw, dashed, rounded corners=3pt, fit=(kohi)(tatari), inner sep=7pt] (band) {};
 \node[lbl, above=1pt of band] {transient sub-states --- volatile registers only};
 
 % revert on interrupt
@@ -817,24 +820,25 @@ A method and apparatus for vendor-free domain-separated cryptographic device att
 \node[lbl, below=0.62cm of band.south] {power interruption $\rightarrow$ KORE at next reset};
 
 % ORA (persistent, right)
-\node[persist] (ora) at (14.2,0) {ORA\\\scriptsize 11};
+\node[persist, right=1.4cm of tahu] (ora) {ORA\\\scriptsize 11};
 \node[lbl, below=0.12cm of ora] {persistent};
 
-% atomic commit wall, centered between the dashed-band right edge and ORA's left edge
-\coordinate (wallx) at ($(band.east)!0.5!(ora.west)$);
+% atomic commit wall, centered between the dashed-band right edge and TAHU's left edge
+\coordinate (wallx) at ($(band.east)!0.5!(tahu.west)$);
 \draw[very thick] ([xshift=-0.06cm,yshift=1.4cm]wallx) -- ([xshift=-0.06cm,yshift=-1.4cm]wallx);
 \draw[very thick] ([xshift=0.06cm,yshift=1.4cm]wallx) -- ([xshift=0.06cm,yshift=-1.4cm]wallx);
 \node[lbl, align=center] at ([yshift=1.85cm]wallx) {atomic\\commit wall};
-\node[lbl, align=center, anchor=north] at ([yshift=-1.5cm]wallx) {TAHU burn:\\energy-gated,\\isolated supply};
+\node[lbl, align=center, anchor=north] at ([yshift=-1.5cm]wallx) {entering TAHU is the\\irreversible commit:\\energy-gated, isolated supply};
 
-% TAHU burn crossing the wall
-\draw[arrow, very thick] (tahu.east) -- (ora.west);
+% TATARI crosses the wall into TAHU (the irreversible burn), then TAHU -> ORA
+\draw[arrow, very thick] (tatari.east) -- (tahu.west);
+\draw[arrow] (tahu.east) -- (ora.west);
 \end{tikzpicture}%
 }
 
 \vspace{0.5em}
 \begin{minipage}{0.86\textwidth}
-\footnotesize Exactly two states ever persist across a reset during provisioning: KORE before commit and ORA after. The dashed sub-states (KOHI thru TAHU) run on volatile registers only and leave no trace if interrupted; the energy-gated TAHU burn is the single irreversible crossing of the commit wall.
+\footnotesize Exactly two states ever persist across a reset during provisioning: KORE before commit and ORA after. The dashed sub-states (KOHI thru TATARI) run on volatile registers only and leave no trace if interrupted. Entering TAHU is the single irreversible crossing of the commit wall: once the energy-gated burn begins, the energy buffer is isolated and the burn runs to completion regardless of any external power interruption, so TAHU lies on the committed side of the wall.
 \end{minipage}
 
 \vspace{1.6em}
