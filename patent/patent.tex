@@ -182,6 +182,9 @@ The five protocol functions simultaneously performed by the ephemeral session pu
 The figure further depicts the per-pair validity check comprising a bitwise exclusive-or of the two cells and an all-ones comparator, the byzantine classifier comprising a count of valid pairs and a minimum-quorum comparator, and a cryptographic-agreement check that all valid pairs recover the same permanent identifier value.
 A fault-injection annotation illustrates a representative failure mode in which a single bit flip in one cell of one pair invalidates that pair while the remaining three pairs satisfy byzantine quorum, such that the chip continues to operate in the HARA state with the permanent identifier intact.
 
+% ===== FIGURES DEFERRED TO THE NON-PROVISIONAL (described but not yet drawn). =====
+% Re-enable by removing the \iffalse ... \fi wrapper once the drawing exists.
+\iffalse
 \para \figdef{package} is a cross-sectional schematic of the chip package showing the physical isolation domain enclosing all internal circuitry, with exactly one bidirectional communication port crossing the boundary.
 The port is depicted in three alternative embodiments along a single drawing for medium-agnostic illustration: an electrical input/output pin coupled to a single conductor; a paired light emitter and detector coupled to an optical fiber; and a coupling coil for magnetic or inductive coupling.
 The figure further depicts, by means of absence markers, the four external interfaces that the chip does not have: no external clock input, no debug port, no firmware update interface, and no externally-triggered destruct command port.
@@ -199,17 +202,21 @@ A side panel illustrates the cryptographic independence property, showing that d
 \para \figdef{handshaketrace} is a wire-trace diagram illustrating the handshake-as-entropy-request mechanism.
 The trace depicts, in time order: a single binary bit transmitted by the host onto the channel; the chip's noise-detection circuitry sampling transient physical phenomena at the moment of receipt; the chip's cryptographic conditioner producing, when the handshake is the first following power-on reset, the chip's per-session secret \emph{wairua}; and the chip's transmission of a response carrying cryptographic-quality entropy derived from said sampling, the entropy response being produced at every handshake whether or not \emph{wairua} is newly established.
 The figure illustrates by annotation that no separate request-random-bytes command exists in the protocol, the handshake itself functioning as the entropy-request mechanism.
+\fi
 
 \para \figdef{keyselect} is a decision-flow diagram of the cryptographic-invariant active-key selection mechanism by which the chip determines whether a given authenticated exchange operates under the permanent identifier \emph{ira} or under the per-session secret \emph{wairua}, without any plaintext mode indicator appearing on the channel.
 The flow proceeds top to bottom: from the received field $X_1$ the chip recovers $m_{\mathit{req}} = X_1 \oplus H_{\mathit{req}}$, computes $K = \mathit{BLAKE3}(m_{\mathit{req}})$, and at a decision node tests the separately received field $X_2$ against the two candidate values $K \oplus H_{\mathit{resp}}$ and $\overline{K} \oplus H_{\mathit{resp}}$; a match on the plain value $K$ selects SESSION mode with \emph{wairua} as the active key, and a match on the complement $\overline{K}$ selects PERMANENT mode with \emph{ira} as the active key.
 The figure includes a selection-rule table stating the two matching cases and a no-match (drop on corruption) case, and an elided binary example showing $K$ above its bitwise complement $\overline{K}$ with the central digits omitted, illustrating that the two candidates differ in every bit so that at most one can match.
 An accompanying note states that the wire carries only $X_1$ and $X_2$, both cryptographically uniform in either mode, so that the mode is the polarity that matches and is recoverable only by an endpoint holding $H_{\mathit{req}}$ and $H_{\mathit{resp}}$ from the session chain.
 
+% ===== FIGURES DEFERRED TO THE NON-PROVISIONAL (described but not yet drawn). =====
+\iffalse
 \para \figdef{sampler} is a receiver-sampling block diagram illustrating the slot-width majority-vote sampling architecture.
 The diagram depicts an up/down counter at the receiving endpoint clocked at a sampling rate substantially higher than the slot rate, an increment input asserted on each sample of the channel at the high logic level, a decrement input asserted on each sample of the channel at the low logic level, a sign-bit register sampling the counter at the slot boundary to decode the slot's bit value, and a counter-reset signal at the slot boundary.
 A timing waveform annotation depicts a noise event of duration less than one half of the slot width injected into the channel, the up/down counter's response thereto, and the unchanged sign of the integrated counter at the slot boundary, illustrating the median-filter equivalence and the resulting noise immunity.
 
 \para \figdef{mesh} is a cross-sectional schematic of the chip's anti-invasive feature stack, depicting from top to bottom: an active top-metal mesh covering the write-once storage cells and the cryptographic conditioner, the mesh routed to a continuity-detection circuit configured to enter the silent failure state of the chip's finite-state machine upon mesh penetration; one or more passive metallization shielding layers configured to obstruct laminographic X-ray imaging; an irradiation-detection circuit configured to enter the silent failure state upon detection of an attempt at invasive analysis using charged-particle or photon-based probes; a plurality of dummy circuit blocks geometrically resembling but not implementing the cryptographic functions of the chip; and a tamper-evident package coating configured to render decapping observable.
+\fi
 
 \section{Detailed Description of the Invention}
 
