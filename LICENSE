@@ -1,10 +1,116 @@
-PIPE License — TBD
-====================
+PIPE Source-Available License (Look, Don't Build)
+=================================================
 
-Copyright (c) 2026 Nick Spiker
+Copyright (c) 2026 Nick Spiker. All rights reserved.
 
-Top-level license for the PIPE project is to be decided by the author. Until then, all rights are reserved.
+Patent pending: U.S. Provisional Application No. 63/093,040, filed
+June 17, 2026, "Method and Apparatus for Vendor-Free Domain-Separated
+Device Attestation via Owner-Initiated Cryptographic Provisioning."
 
-The vendored BLAKE3 compression core in rtl/blake3/ retains its original BSD-3-Clause license — see rtl/blake3/LICENSE. That license is independent of, and unaffected by, whatever license the rest of PIPE ultimately adopts.
 
-Contact: fractaldecoder@proton.me
+SUMMARY (non-binding, for orientation)
+--------------------------------------
+This source is published so you can READ it, AUDIT it, learn from it, and
+evaluate whether you want to work with the author. It is NOT open source.
+You may not build it, ship it, simulate it with intent to implement, or use
+it in a product or service without a separate written agreement. Curiosity
+and partnership inquiries are welcome; implementation is not, until we talk.
+
+
+1. DEFINITIONS
+--------------
+"The Work" means the contents of this repository, including the hardware-
+description-language sources, software, specifications, documentation, and
+the patent materials in patent/, EXCEPT any third-party component that
+carries its own separate license (see Section 6).
+
+"You" means any person or entity accessing the Work.
+
+"Implementation Intent" means any use of the Work, in whole or in part,
+whose purpose is to build, fabricate, deploy, operate, reproduce, port,
+emulate, or simulate the Work or any functional equivalent of it, whether
+for personal, research, evaluation-toward-deployment, commercial, or
+production use. Running or simulating the Work to evaluate it with the
+intent or effect of preparing to implement it is Implementation Intent.
+
+
+2. GRANT (LIMITED)
+------------------
+Subject to this license, the author grants You a non-exclusive,
+non-transferable, revocable permission to:
+
+  (a) view and read the Work;
+  (b) make a local copy solely to read, study, audit, or review it; and
+  (c) quote limited excerpts for commentary, review, education, or
+      academic citation, with attribution.
+
+This is a permission to LOOK, not to USE. No other rights are granted.
+
+
+3. RESTRICTIONS
+---------------
+Except under a separate written agreement signed by the author, You may NOT:
+
+  (a) use the Work, in whole or in part, for any purpose involving
+      Implementation Intent;
+  (b) build, synthesize, fabricate, flash, deploy, operate, or run the
+      Work on any hardware, simulator, or emulator with Implementation
+      Intent;
+  (c) incorporate the Work, or any functional equivalent derived from
+      studying it, into any product, service, or system;
+  (d) distribute, sublicense, sell, or host copies of the Work;
+  (e) create or distribute derivative works; or
+  (f) remove or alter this license, the copyright notice, or the
+      patent notice.
+
+Reading the Work and then building an independent implementation of its
+claimed inventions is not permitted by this license and may infringe the
+patent rights reserved in Section 5.
+
+
+4. NO OPEN-SOURCE LICENSE; NO PATENT LICENSE
+--------------------------------------------
+This is a source-available license, not an open-source license, and it is
+not an OSI-approved license. Nothing in this license grants any right under
+any patent. All patent rights are expressly reserved (Section 5).
+
+
+5. PATENT RIGHTS RESERVED
+-------------------------
+The author has filed, and may further file, patent applications covering
+inventions embodied in the Work. No license, express or implied, to any
+patent or patent application is granted by this license or by the act of
+publishing the Work. Publication is for disclosure, priority, audit, and
+partnership-evaluation purposes only.
+
+
+6. THIRD-PARTY COMPONENTS
+-------------------------
+Components that carry their own license retain it and are not governed by
+this license. In particular, the vendored BLAKE3 compression core in
+rtl/blake3/ is licensed BSD-3-Clause; see rtl/blake3/LICENSE. That license
+is independent of, and unaffected by, this one.
+
+
+7. INQUIRIES AND PARTNERSHIP
+----------------------------
+Implementation rights, commercial licenses, and partnership are available
+by agreement. If you want to build with this, fund it, or work together,
+contact the author. That conversation is the intended path.
+
+  Nick Spiker — fractaldecoder@proton.me
+
+
+8. NO WARRANTY; NO LIABILITY
+----------------------------
+THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE WORK OR ITS USE.
+
+
+9. TERMINATION
+--------------
+Any breach of Sections 3, 4, or 5 terminates the permissions in Section 2
+automatically. The patent reservation in Section 5 survives termination.
