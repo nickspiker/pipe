@@ -1,14 +1,10 @@
 # Measurement-only RTL
 
-This directory holds bringup tools used during Phase B (ring-oscillator
-characterization) and Phase C (BLAKE3 silicon Fmax measurement).
+This directory holds bringup tools used during Phase B (ring-oscillator characterization) and Phase C (BLAKE3 silicon Fmax measurement).
 
-**These files are NEVER synthesized into a production PIPE bitstream.**
-They use the 25 MHz crystal as a measurement reference, which is the entire
-reason they exist — the production design has no governed clock at all.
+**These files are NEVER synthesized into a production PIPE bitstream.** They use the 25 MHz crystal as a measurement reference, which is the entire reason they exist — the production design has no governed clock at all.
 
-`scripts/build_pipe.sh` only reads `rtl/*.v` (excluding `rtl/measure/`).
-`scripts/build_freq_counter.sh` is the only consumer of this directory.
+`scripts/build_pipe.sh` only reads `rtl/*.v` (excluding `rtl/measure/`). `scripts/build_freq_counter.sh` is the only consumer of this directory.
 
 ## Files
 

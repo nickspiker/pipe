@@ -66,9 +66,7 @@ for n in 3 5 7 9 11 13 17 21 25 31; do
 done
 ```
 
-`RING_STAGES` must be odd (script enforces this). The bitstream uses the
-25 MHz crystal as the **measurement reference only** — it is not the
-production PIPE bitstream.
+`RING_STAGES` must be odd (script enforces this). The bitstream uses the 25 MHz crystal as the **measurement reference only** — it is not the production PIPE bitstream.
 
 ## Layout
 
