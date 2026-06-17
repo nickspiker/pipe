@@ -1,5 +1,9 @@
 # PIPE — Physically Isolated Processing Enclave
 
+> **Patent Pending** — U.S. Provisional Application No. 63/093,040, filed June 17, 2026.
+> *Method and Apparatus for Vendor-Free Domain-Separated Device Attestation via Owner-Initiated Cryptographic Provisioning.*
+> The full provisional specification is in [`patent/`](patent/). Published openly: the security model depends on the design being auditable and buildable, not on secrecy.
+
 Single-wire authenticated channel between an FPGA enclave and a host. Idle is a continuous heartbeat; either side initiates with one unexpected bit; data is raw ragu output (chaos-amplified keyed-BLAKE3, random by construction → no encoding, no framing); done returns to heartbeat.
 
 The enclave holds a write-once key, runs on a ring oscillator (no external clock, no PLL, no governed timebase), and exposes exactly one bidirectional IO pin to the outside world.
