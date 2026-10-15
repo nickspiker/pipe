@@ -50,7 +50,7 @@ Disk usage: ~15 GB total (PDK + tool images).
 After install:
 
 ```bash
-cd /mnt/Octopus/Code/pipe
+cd /mnt/Harbor/Code/pipe
 openlane openlane/pipe_digital/config.json
 ```
 

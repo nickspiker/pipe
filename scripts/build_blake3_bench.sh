@@ -9,7 +9,7 @@
 # RING=N, sys_clk = N-stage single-NOT ring oscillator (DCCA-buffered for
 # distribution); without RING, PLL-driven at the requested MHz.
 #
-# Self-contained — no dependency on /mnt/Octopus/Code/spirix.
+# Self-contained — no dependency on /mnt/Harbor/Code/spirix.
 #
 # Usage:
 #   ./build_blake3_bench.sh 100 --program          # PLL @ 100 MHz

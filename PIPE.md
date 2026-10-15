@@ -131,7 +131,7 @@ $ cargo run -p pipe-host --release --bin bridge -- wire_gap_decode 50000
 
 ```bash
 # Flash FPGA (counter / pattern-byte bitstream):
-$ cd /mnt/Octopus/Code/pipe
+$ cd /mnt/Harbor/Code/pipe
 $ openFPGALoader -c ft232 -f build_pipe_counter/pipe_counter.bit
 
 # Bridge firmware is currently in SRAM. If wedged, reload:

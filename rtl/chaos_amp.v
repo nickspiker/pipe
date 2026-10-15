@@ -2,7 +2,7 @@
 // chaos_amp.v — PIPE chaos amplifier v1 (Dragonfly)
 // =============================================================================
 //
-// Bit-exact silicon implementation of `pipe::chaos_amp::chaos_amp`. The Rust crate at /mnt/Octopus/Code/pipe/enclave/src/chaos_amp.rs is the single source of algorithmic truth; this module's outputs MUST match the Rust reference for every input. The testbench at sim/tb_chaos_amp.v validates this against vectors emitted by `cargo run --bin gen-test-vectors`.
+// Bit-exact silicon implementation of `pipe::chaos_amp::chaos_amp`. The Rust crate at /mnt/Harbor/Code/pipe/enclave/src/chaos_amp.rs is the single source of algorithmic truth; this module's outputs MUST match the Rust reference for every input. The testbench at sim/tb_chaos_amp.v validates this against vectors emitted by `cargo run --bin gen-test-vectors`.
 //
 // =============================================================================
 // Algorithm (12 rounds, 5 phases per round)

@@ -1,6 +1,6 @@
 # Keypad — Dozenal 18-key topology
 
-PIPE's debugging input device. Vendored physical layout from the dozenal calculator hardware (`/mnt/Octopus/Code/fpga/`). Measured 2026-05-13 by pin-ID-scanner bitstream at 8× speed.
+PIPE's debugging input device. Vendored physical layout from the dozenal calculator hardware (`/mnt/Harbor/Code/fpga/`). Measured 2026-05-13 by pin-ID-scanner bitstream at 8× speed.
 
 ## Physical wiring
 
@@ -183,4 +183,4 @@ Number keys 0–8 → 9 OLED display modes. Math ops → IRA control actions. Se
 
 ## What this replaces
 
-The `spirix_keypad.v` module at `/mnt/Octopus/Code/fpga/rtl/spirix_keypad.v` was designed for a clean 4-col × 5-row matrix. **It does not match this hardware** — there is no 5th row pin; row 4 keys are wired ad-hoc to 3 separate pin pairs. PIPE's `keypad.v` will be a new module with the hybrid matrix+ad-hoc scanner described above.
+The `spirix_keypad.v` module at `/mnt/Harbor/Code/fpga/rtl/spirix_keypad.v` was designed for a clean 4-col × 5-row matrix. **It does not match this hardware** — there is no 5th row pin; row 4 keys are wired ad-hoc to 3 separate pin pairs. PIPE's `keypad.v` will be a new module with the hybrid matrix+ad-hoc scanner described above.
