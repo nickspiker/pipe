@@ -51,7 +51,7 @@ use portable_atomic::{AtomicU64, Ordering as PaOrdering};
 use static_cell::StaticCell;
 use vsf::file_format::VsfHeader;
 use vsf::schema::{pipe_message_schema, SectionBuilder};
-use vsf::types::{EtType, VsfType, OSCILLATIONS_PER_SECOND};
+use vsf::types::{Ascii, EtType, VsfType, OSCILLATIONS_PER_SECOND};
 use vsf::verification::is_original;
 use vsf::vsf_builder::VsfBuilder;
 use panic_halt as _;
@@ -4463,7 +4463,7 @@ async fn handle_frames<'d, T: embassy_usb::driver::Driver<'d>>(
                 if let Some(err) = stage_err {
                     let err_fields: alloc::vec::Vec<(alloc::string::String, VsfType)> = vec![
                         ("id".to_string(), VsfType::u(id as usize, false)),
-                        ("err".to_string(), VsfType::a(err.to_string())),
+                        ("err".to_string(), VsfType::a(Ascii::lit(err))),
                     ];
                     let mut b = VsfBuilder::new().version(7, 7).provenance_only();
                     if let Some(et) = next_eagle_time() {
@@ -4704,10 +4704,10 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
     let mut pending_action = PostAction::None;
     match op_str {
         "ping" => {
-            fields.push(("op".to_string(), VsfType::a("pong".to_string())));
+            fields.push(("op".to_string(), VsfType::a(Ascii::lit("pong"))));
         }
         "info" => {
-            fields.push(("name".to_string(), VsfType::a("pipe-bridge-rp2040".to_string())));
+            fields.push(("name".to_string(), VsfType::a(Ascii::lit("pipe-bridge-rp2040"))));
             fields.push(("ver".to_string(), VsfType::u(FW_VERSION as usize, false)));
             fields.push(("did".to_string(), VsfType::hp(device_id.to_vec())));
             fields.push((
@@ -4760,7 +4760,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             let samples_req = samples_req.min(TRACE_MAX_SAMPLES as u32);
 
             if samples_req == 0 {
-                fields.push(("err".to_string(), VsfType::a("zero_samples".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("zero_samples"))));
             } else {
                 // Arm: clear response first (so the poll below can wait on a
                 // 0→N transition), publish period, then store samples count.
@@ -4821,7 +4821,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             };
             let samples_req = samples_req.min(TRACE_MAX_SAMPLES as u32);
             if samples_req == 0 {
-                fields.push(("err".to_string(), VsfType::a("zero_samples".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("zero_samples"))));
             } else {
                 COUNT_DRIVE_RESPONSE.store(0, PaOrdering::Relaxed);
                 COUNT_DRIVE_SAMPLES.store(samples_req, PaOrdering::Relaxed);
@@ -4872,7 +4872,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             let samples_req = samples_req.min(STATS_MAX_SAMPLES);
 
             if samples_req == 0 {
-                fields.push(("err".to_string(), VsfType::a("zero_samples".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("zero_samples"))));
             } else {
                 STATS_RESPONSE.store(0, PaOrdering::Relaxed);
                 STATS_REQUEST.store(samples_req, PaOrdering::Release);
@@ -4888,7 +4888,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
 
                 let taken = STATS_RESPONSE.load(PaOrdering::Relaxed);
                 if taken == 0 {
-                    fields.push(("err".to_string(), VsfType::a("stats_timeout".to_string())));
+                    fields.push(("err".to_string(), VsfType::a(Ascii::lit("stats_timeout"))));
                 } else {
                     // Acquire above already published STATS_RESULT.
                     let s = unsafe { STATS_RESULT };
@@ -5007,7 +5007,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
             let iters = SYNC_RESPONSE.load(PaOrdering::Relaxed);
             if iters == 0 {
-                fields.push(("err".to_string(), VsfType::a("sync_timeout".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("sync_timeout"))));
             } else {
                 let s = unsafe { SYNC_RESULT };
                 // Layout (all LE): 24 × u32 + 3 × i64 + 2 × SYNC_HIST_BINS × u16.
@@ -5242,7 +5242,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
 
             let iters = SYNC_RESPONSE.load(PaOrdering::Relaxed);
             if iters == 0 {
-                fields.push(("err".to_string(), VsfType::a("sync_timeout".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("sync_timeout"))));
             } else {
                 // Same payload encoding as wire_sync — host CLI parses both with the
                 // same SyncResult layout, including the tx_words_consumed appendix.
@@ -5501,7 +5501,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 })
                 .unwrap_or_default();
             if data_in.len() < 9 {
-                fields.push(("err".to_string(), VsfType::a("l3_bad_request".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("l3_bad_request"))));
             } else {
                 let tx_count = u16::from_le_bytes([data_in[0], data_in[1]]) as u32;
                 let rx_count = u16::from_le_bytes([data_in[2], data_in[3]]) as u32;
@@ -5510,14 +5510,14 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                 ]);
                 let flags = data_in[8] as u32;
                 if tx_count > L3_MAX_BITS || rx_count > L3_MAX_BITS {
-                    fields.push(("err".to_string(), VsfType::a("l3_count_too_large".to_string())));
+                    fields.push(("err".to_string(), VsfType::a(Ascii::lit("l3_count_too_large"))));
                 } else if flags & !0x3 != 0 {
                     // Reserved flag bits must be zero.
-                    fields.push(("err".to_string(), VsfType::a("l3_bad_flags".to_string())));
+                    fields.push(("err".to_string(), VsfType::a(Ascii::lit("l3_bad_flags"))));
                 } else {
                     let tx_byte_count = (tx_count.div_ceil(8)) as usize;
                     if data_in.len() < 9 + tx_byte_count {
-                        fields.push(("err".to_string(), VsfType::a("l3_short_tx_payload".to_string())));
+                        fields.push(("err".to_string(), VsfType::a(Ascii::lit("l3_short_tx_payload"))));
                     } else {
                         // Pack tx_bits LSB-first byte-stream into the u32 buffer.
                         let mut tx_words = [0u32; L3_BUF_WORDS];
@@ -5550,7 +5550,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                         }
 
                         if L3_RESPONSE.load(PaOrdering::Relaxed) == 0 {
-                            fields.push(("err".to_string(), VsfType::a("l3_timeout".to_string())));
+                            fields.push(("err".to_string(), VsfType::a(Ascii::lit("l3_timeout"))));
                         } else {
                             let r = unsafe { L3_RESULT };
                             let rx_byte_count = (r.rx_actual_count.div_ceil(8)) as usize;
@@ -5614,7 +5614,7 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
             }
             let iters = DECODE_RESPONSE.load(PaOrdering::Relaxed);
             if iters == 0 {
-                fields.push(("err".to_string(), VsfType::a("decode_timeout".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("decode_timeout"))));
             } else {
                 let d = unsafe { DECODE_RESULT };
                 // Layout (all LE), 112 bytes total:
@@ -5663,9 +5663,9 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                     _ => None,
                 });
             if size_u64 == 0 || size_u64 > DEV_IMAGE_MAX_BYTES as u64 {
-                fields.push(("err".to_string(), VsfType::a("bad_size".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("bad_size"))));
             } else if hash_bytes.as_ref().map(|b| b.len()) != Some(32) {
-                fields.push(("err".to_string(), VsfType::a("bad_hash".to_string())));
+                fields.push(("err".to_string(), VsfType::a(Ascii::lit("bad_hash"))));
             } else {
                 LOAD_DEV_SIZE.store(size_u64 as u32, PaOrdering::Relaxed);
                 LOAD_DEV_ID.store(id, PaOrdering::Relaxed);
@@ -5676,11 +5676,11 @@ fn dispatch(input: &[u8], output: &mut [u8], device_id: &[u8; 32]) -> (usize, Po
                     );
                 }
                 pending_action = PostAction::LoadDev;
-                fields.push(("op".to_string(), VsfType::a("load_dev_ready".to_string())));
+                fields.push(("op".to_string(), VsfType::a(Ascii::lit("load_dev_ready"))));
             }
         }
         _ => {
-            fields.push(("err".to_string(), VsfType::a("unknown_op".to_string())));
+            fields.push(("err".to_string(), VsfType::a(Ascii::lit("unknown_op"))));
         }
     }
 

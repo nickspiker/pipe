@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use vsf::file_format::VsfHeader;
 use vsf::schema::{pipe_message_schema, SectionBuilder};
-use vsf::types::VsfType;
+use vsf::types::{Ascii, VsfType};
 use vsf::verification::is_original;
 use vsf::vsf_builder::VsfBuilder;
 
@@ -221,7 +221,8 @@ fn build_cmd_doc(
     extras: Vec<(String, VsfType)>,
 ) -> Result<Vec<u8>, String> {
     let mut fields = Vec::with_capacity(2 + extras.len());
-    fields.push(("op".to_string(), VsfType::a(op.to_string())));
+    let op = Ascii::new(op).map_err(|e| format!("cmd op {op:?}: {e}"))?;
+    fields.push(("op".to_string(), VsfType::a(op)));
     fields.push(("id".to_string(), VsfType::u(id as usize, false)));
     fields.extend(extras);
 
